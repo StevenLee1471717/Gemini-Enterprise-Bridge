@@ -1,0 +1,24 @@
+[project]
+name = "gemini-enterprise-bridge"
+version = "1.0.0"
+description = "Browser-in-the-loop OpenAI-compatible local gateway for Google Cloud Gemini Enterprise (Vertex AI Search / Agentspace)"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "fastapi>=0.110.0",
+    "uvicorn[standard]>=0.27.0",
+    "websockets>=12.0",
+    "pydantic>=2.6.0",
+    "httpx>=0.27.0",
+    "python-dotenv>=1.0.1",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0.0",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["."]
+python_files = ["test_*.py"]
+addopts = "-q"

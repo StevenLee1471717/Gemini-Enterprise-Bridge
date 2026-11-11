@@ -1,0 +1,475 @@
+// ISOLATED world content script bridging chrome.runtime <-> MAIN world page-driver.js
+// Hot-swappable: re-injecting on extension reload cleanly replaces stale listeners without page refresh.
+
+(() => {
+  if (typeof globalThis.__GEB_ISOLATED_CLEANUP__ === "function") {
+    try {
+      globalThis.__GEB_ISOLATED_CLEANUP__();
+    } catch (_) {}
+  }
+
+  const TO_MAIN_CHANNEL = "GEB_ISOLATED_TO_MAIN";
+  const FROM_MAIN_CHANNEL = "GEB_MAIN_TO_ISOLATED";
+  const MAIN_POSTMSG_CHUNK_SIZE = 32768;
+  const pendingRpcCalls = new Map();
+  const msgQueue = [];
+  let mainReady = false;
+  let keepalivePort = null;
+  let portRetryAttempts = 0;
+  let portRetryTimer = null;
+  let hiddenKeepaliveTimer = null;
+  let disposed = false;
+
+  // Guarded Trusted Types policy for ISOLATED world
+  try {
+    if (window.trustedTypes && typeof window.trustedTypes.createPolicy === "function") {
+      window.trustedTypes.createPolicy("geb-bridge-isolated", { createHTML: (s) => String(s || "") });
+    }
+  } catch (_) {}
+
+  class ReassemblyBuffer {
+    constructor() {
+      this._store = new Map();
+    }
+    addChunk(requestId, chunkIndex, totalChunks, data) {
+      let entry = this._store.get(requestId);
+      if (!entry) {
+        entry = { parts: [], total: totalChunks || 0 };
+        this._store.set(requestId, entry);
+      }
+      entry.parts[chunkIndex] = String(data || "");
+      if (totalChunks) entry.total = totalChunks;
+    }
+    assemble(requestId, expectedTotal = 0) {
+      const entry = this._store.get(requestId);
+      this._store.delete(requestId);
+      if (!entry) return "";
+      const total = expectedTotal || entry.total || entry.parts.length;
+      return Array.from({ length: total }, (_, idx) => entry.parts[idx] || "").join("");
+    }
+    clear() {
+      this._store.clear();
+    }
+  }
+
+  const promptReassembly = new ReassemblyBuffer();
+  const replyReassembly = new ReassemblyBuffer();
+
+  function unwrapInlineToolChunks(text) {
+    if (!text || !text.includes("[TOOL_CHUNK:")) return text;
+    return text.replace(/\[TOOL_CHUNK:part_\d+_of_\d+\]([\s\S]*?)\[\/TOOL_CHUNK\]/g, "$1");
+  }
+
+  function dispatchPromptToMain(message) {
+    if (message.driver_config) {
+      postToMain("configure", message.driver_config);
+    }
+    const rawPrompt = message.chunked
+      ? promptReassembly.assemble(message.request_id, message.total_chunks)
+      : String(message.prompt || "");
+    const fullPrompt = unwrapInlineToolChunks(rawPrompt);
+
+    if (fullPrompt.length > MAIN_POSTMSG_CHUNK_SIZE) {
+      const total = Math.ceil(fullPrompt.length / MAIN_POSTMSG_CHUNK_SIZE);
+      for (let i = 0; i < total; i += 1) {
+        postToMain("prompt_chunk", {
+          request_id: message.request_id,
+          chunk_index: i,
+          total_chunks: total,
+          data: fullPrompt.slice(i * MAIN_POSTMSG_CHUNK_SIZE, (i + 1) * MAIN_POSTMSG_CHUNK_SIZE)
+        });
+      }
+      postToMain("execute_prompt", {
+        request_id: message.request_id,
+        prompt: "",
+        chunked: true,
+        total_chunks: total,
+        callback_url: message.callback_url || "",
+        target_model: message.target_model || null,
+        reset_chat: Boolean(message.reset_chat),
+        timeout_ms: message.timeout_ms || 180000
+      });
+    } else {
+      postToMain("execute_prompt", {
+        request_id: message.request_id,
+        prompt: fullPrompt,
+        callback_url: message.callback_url || "",
+        target_model: message.target_model || null,
+        reset_chat: Boolean(message.reset_chat),
+        timeout_ms: message.timeout_ms || 180000
+      });
+    }
+  }
+
+  function postToMain(action, payload = {}, callId = null) {
+    window.postMessage(
+      {
+        channel: TO_MAIN_CHANNEL,
+        action,
+        callId,
+        payload
+      },
+      window.location.origin
+    );
+  }
+
+  function flushQueuedPrompts() {
+    if (disposed || msgQueue.length === 0) return;
+    mainReady = true;
+    while (msgQueue.length > 0) {
+      const queued = msgQueue.shift();
+      dispatchPromptToMain(queued);
+    }
+  }
+
+  function schedulePortReconnect() {
+    if (disposed || !chrome.runtime?.id || portRetryTimer !== null) return;
+    const attempt = portRetryAttempts;
+    portRetryAttempts = Math.min(attempt + 1, 6);
+    const delayMs = Math.min(500 * Math.pow(2, attempt), 10000);
+    portRetryTimer = setTimeout(() => {
+      portRetryTimer = null;
+      ensureKeepalivePort();
+    }, delayMs);
+  }
+
+  function ensureKeepalivePort() {
+    if (disposed || !chrome.runtime?.id || keepalivePort) return;
+    try {
+      keepalivePort = chrome.runtime.connect({ name: "geb-keepalive" });
+      portRetryAttempts = 0;
+      if (portRetryTimer !== null) {
+        clearTimeout(portRetryTimer);
+        portRetryTimer = null;
+      }
+      keepalivePort.onDisconnect.addListener(() => {
+        keepalivePort = null;
+        if (!disposed && chrome.runtime?.id) {
+          schedulePortReconnect();
+        }
+      });
+    } catch (_) {
+      keepalivePort = null;
+      schedulePortReconnect();
+    }
+  }
+
+  function updateVisibilityKeepalive() {
+    if (disposed || !chrome.runtime?.id) return;
+    const isHidden = Boolean(document.hidden || document.visibilityState === "hidden");
+
+    void (async () => {
+      try {
+        await chrome.runtime.sendMessage({
+          type: "GEB_DRIVER_EVENT",
+          payload: {
+            type: "tab_visibility",
+            hidden: isHidden,
+            visibility_state: document.visibilityState || (isHidden ? "hidden" : "visible")
+          }
+        });
+      } catch (_) {}
+    })();
+
+    if (isHidden) {
+      ensureKeepalivePort();
+      if (hiddenKeepaliveTimer === null) {
+        hiddenKeepaliveTimer = setInterval(() => {
+          if (disposed || !chrome.runtime?.id || !document.hidden) {
+            if (hiddenKeepaliveTimer !== null) {
+              clearInterval(hiddenKeepaliveTimer);
+              hiddenKeepaliveTimer = null;
+            }
+            return;
+          }
+          ensureKeepalivePort();
+          if (keepalivePort) {
+            try {
+              keepalivePort.postMessage({ type: "keepalive_ping", ts: Date.now() });
+            } catch (_) {
+              keepalivePort = null;
+            }
+          }
+        }, 15000);
+      }
+    } else {
+      if (hiddenKeepaliveTimer !== null) {
+        clearInterval(hiddenKeepaliveTimer);
+        hiddenKeepaliveTimer = null;
+      }
+      flushQueuedPrompts();
+    }
+  }
+
+  function callMainAsync(action, payload = {}, timeoutMs = 10000) {
+    return new Promise((resolve, reject) => {
+      const callId = "call-" + Math.random().toString(36).slice(2, 10) + "-" + Date.now();
+      const timer = setTimeout(() => {
+        pendingRpcCalls.delete(callId);
+        reject(new Error("MAIN world driver timed out (" + action + ")"));
+      }, timeoutMs);
+      pendingRpcCalls.set(callId, { resolve, reject, timer });
+      postToMain(action, payload, callId);
+    });
+  }
+
+  async function syncDriverConfigFromStorage() {
+    if (disposed || !chrome.runtime?.id) return;
+    try {
+      const cfg = await chrome.storage.local.get([
+        "driverMode",
+        "customModelSelector",
+        "customInputSelector",
+        "customSendSelector",
+        "customReplySelector"
+      ]);
+      postToMain("configure", cfg);
+    } catch (_) {}
+  }
+
+  function onWindowMessage(event) {
+    if (disposed || event.source !== window || event.origin !== window.location.origin) {
+      return;
+    }
+    const data = event.data;
+    if (!data || data.channel !== FROM_MAIN_CHANNEL) {
+      return;
+    }
+
+    if (data.replyTo && pendingRpcCalls.has(data.replyTo)) {
+      const pending = pendingRpcCalls.get(data.replyTo);
+      pendingRpcCalls.delete(data.replyTo);
+      clearTimeout(pending.timer);
+      pending.resolve(data.payload);
+      return;
+    }
+
+    if (data.payload && chrome.runtime?.id) {
+      // Unthrottled MV3 Service Worker sleep relay for hidden/background tabs
+      if (data.payload.type === "sw_sleep") {
+        const sleepId = data.payload.sleep_id;
+        const ms = Math.max(0, Math.min(Number(data.payload.ms) || 0, 10000));
+        void (async () => {
+          try {
+            await chrome.runtime.sendMessage({ type: "GEB_SW_SLEEP", ms });
+          } catch (_) {}
+          postToMain("sw_sleep_done", { sleep_id: sleepId });
+        })();
+        return;
+      }
+
+      if (data.payload.type === "driver_ready") {
+        mainReady = true;
+        flushQueuedPrompts();
+      }
+
+      if (data.payload.type === "reply_chunk") {
+        replyReassembly.addChunk(
+          data.payload.request_id,
+          data.payload.chunk_index,
+          data.payload.total_chunks,
+          data.payload.data
+        );
+        return;
+      }
+
+      let outgoingPayload = data.payload;
+      if (outgoingPayload.type === "request_complete" && outgoingPayload.chunked) {
+        const mergedReply = replyReassembly.assemble(
+          outgoingPayload.request_id,
+          outgoingPayload.total_chunks
+        );
+        outgoingPayload = { ...outgoingPayload, reply: mergedReply, chunked: false };
+      }
+
+      void (async () => {
+        try {
+          // Chunk large replies (>24KB) across chrome.runtime.sendMessage to SW for HTTP callback upload
+          const fullReplyStr = String(outgoingPayload.reply || "");
+          if (outgoingPayload.type === "request_complete" && fullReplyStr.length > 24576) {
+            const swSliceSize = 24576;
+            const totalSwChunks = Math.ceil(fullReplyStr.length / swSliceSize);
+            for (let i = 0; i < totalSwChunks; i += 1) {
+              await chrome.runtime.sendMessage({
+                type: "GEB_DRIVER_EVENT",
+                payload: {
+                  type: "sw_reply_chunk",
+                  request_id: outgoingPayload.request_id,
+                  chunk_index: i,
+                  total_chunks: totalSwChunks,
+                  data: fullReplyStr.slice(i * swSliceSize, (i + 1) * swSliceSize)
+                }
+              });
+            }
+            await chrome.runtime.sendMessage({
+              type: "GEB_DRIVER_EVENT",
+              payload: {
+                ...outgoingPayload,
+                reply: "",
+                chunked: true,
+                total_chunks: totalSwChunks
+              }
+            });
+            return;
+          }
+
+          await chrome.runtime.sendMessage({
+            type: "GEB_DRIVER_EVENT",
+            payload: outgoingPayload
+          });
+        } catch (_) {}
+      })();
+    }
+  }
+
+  window.addEventListener("message", onWindowMessage);
+  document.addEventListener("visibilitychange", updateVisibilityKeepalive);
+
+  chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
+    if (disposed) return false;
+    (async () => {
+      const msgType = message && message.type ? message.type : "";
+
+      if (msgType === "GEB_PROMPT_CHUNK") {
+        promptReassembly.addChunk(
+          message.request_id,
+          message.chunk_index,
+          message.total_chunks,
+          message.data
+        );
+        sendResponse({ ok: true });
+        return;
+      }
+
+      if (msgType === "GEB_EXECUTE_PROMPT") {
+        if (!mainReady && document.readyState === "loading") {
+          msgQueue.push(message);
+          setTimeout(() => flushQueuedPrompts(), 500);
+          sendResponse({ accepted: true, queued: true });
+          return;
+        }
+        mainReady = true;
+        dispatchPromptToMain(message);
+        sendResponse({ accepted: true, queued: false });
+        return;
+      }
+
+      if (msgType === "GEB_GET_VISIBILITY") {
+        sendResponse({
+          ok: true,
+          hidden: Boolean(document.hidden || document.visibilityState === "hidden"),
+          visibilityState: document.visibilityState || "visible"
+        });
+        return;
+      }
+
+      if (msgType === "GEB_CANCEL_REQUEST") {
+        postToMain("cancel_request", { request_id: message.request_id });
+        sendResponse({ cancelled: true });
+        return;
+      }
+
+      if (msgType === "GEB_DIAGNOSE_PAGE") {
+        try {
+          const result = await callMainAsync("diagnose", {}, 6000);
+          sendResponse(result);
+        } catch (err) {
+          sendResponse({ ok: false, error: err.message });
+        }
+        return;
+      }
+
+      if (msgType === "GEB_TRIGGER_NEW_CHAT") {
+        try {
+          const result = await callMainAsync("new_chat", {}, 9000);
+          sendResponse(result);
+        } catch (err) {
+          sendResponse({ ok: false, error: err.message });
+        }
+        return;
+      }
+
+      if (msgType === "GEB_SELECT_MODEL") {
+        try {
+          const result = await callMainAsync(
+            "select_model",
+            { target_model: message.target_model },
+            8000
+          );
+          sendResponse(result);
+        } catch (err) {
+          sendResponse({ ok: false, error: err.message });
+        }
+        return;
+      }
+
+      sendResponse({ ok: true });
+    })();
+    return true;
+  });
+
+  chrome.storage.onChanged.addListener((changes, areaName) => {
+    if (disposed || !chrome.runtime?.id) return;
+    if (areaName === "local") {
+      if (
+        changes.driverMode ||
+        changes.customModelSelector ||
+        changes.customInputSelector ||
+        changes.customSendSelector ||
+        changes.customReplySelector
+      ) {
+        void syncDriverConfigFromStorage();
+      }
+    }
+  });
+
+  const heartbeatTimer = setInterval(() => {
+    if (disposed || !chrome.runtime?.id) {
+      clearInterval(heartbeatTimer);
+      return;
+    }
+    void (async () => {
+      try {
+        await chrome.runtime.sendMessage({
+          type: "GEB_DRIVER_EVENT",
+          payload: { type: "driver_heartbeat" }
+        });
+      } catch (_) {}
+    })();
+  }, 25000);
+
+  globalThis.__GEB_ISOLATED_CLEANUP__ = () => {
+    disposed = true;
+    window.removeEventListener("message", onWindowMessage);
+    document.removeEventListener("visibilitychange", updateVisibilityKeepalive);
+    clearInterval(heartbeatTimer);
+    if (hiddenKeepaliveTimer !== null) {
+      clearInterval(hiddenKeepaliveTimer);
+      hiddenKeepaliveTimer = null;
+    }
+    if (portRetryTimer !== null) {
+      clearTimeout(portRetryTimer);
+      portRetryTimer = null;
+    }
+    if (keepalivePort) {
+      try {
+        keepalivePort.disconnect();
+      } catch (_) {}
+      keepalivePort = null;
+    }
+    for (const [, p] of pendingRpcCalls) {
+      clearTimeout(p.timer);
+    }
+    pendingRpcCalls.clear();
+  };
+
+  // Probe MAIN driver readiness immediately & sync config + visibility state
+  callMainAsync("diagnose", {}, 1500)
+    .then(() => {
+      mainReady = true;
+      flushQueuedPrompts();
+    })
+    .catch(() => {});
+  void syncDriverConfigFromStorage();
+  updateVisibilityKeepalive();
+})();

@@ -1,0 +1,101 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Gemini Enterprise Bridge</title>
+  <link rel="stylesheet" href="popup.css" />
+</head>
+<body>
+  <main class="container">
+    <header class="header">
+      <div>
+        <h1>Gemini Enterprise Bridge</h1>
+        <p class="subtitle">Vertex AI Search / Agentspace 本地网关</p>
+      </div>
+      <label class="switch" title="启用或暂停桥接">
+        <input type="checkbox" id="enabledToggle" checked />
+        <span class="slider"></span>
+      </label>
+    </header>
+
+    <section class="status-card" aria-live="polite">
+      <div class="status-row">
+        <span class="label">本地 FastAPI</span>
+        <span class="pill" id="wsStatusPill">检测中...</span>
+      </div>
+      <div class="status-row">
+        <span class="label">目标企业网页</span>
+        <span class="value truncate" id="tabStatusText">-</span>
+      </div>
+      <div class="status-row">
+        <span class="label">RPC 流与模型</span>
+        <span class="value" id="rpcStatusText">-</span>
+      </div>
+      <p class="error-banner" id="errorBanner" hidden></p>
+    </section>
+
+    <section class="form-section">
+      <label class="field">
+        <span>绑定标签页（支持 /u/3/ 多账号同时打开）</span>
+        <select id="tabSelect">
+          <option value="">自动选择活跃的 Gemini Enterprise 标签页</option>
+        </select>
+      </label>
+
+      <label class="field">
+        <span>执行引擎模式</span>
+        <select id="driverModeSelect">
+          <option value="auto">Auto 混合（推荐：流式嗅探 + Shadow DOM）</option>
+          <option value="dom">DOM 纯网页组件驱动（高兼容）</option>
+          <option value="replay">Replay 页面内 Fetch 重放（需先发 1 条）</option>
+        </select>
+      </label>
+
+      <label class="field">
+        <span>后端 WebSocket 地址</span>
+        <input type="url" id="wsUrlInput" placeholder="ws://127.0.0.1:8000/ws/browser" />
+      </label>
+
+      <details class="advanced">
+        <summary>高级：自定义 Shadow DOM 选择器（可选）</summary>
+        <div class="advanced-fields">
+          <label class="field">
+            <span>模型下拉触发器选择器</span>
+            <input type="text" id="modelSelector" placeholder="默认自动识别 3.1 Pro / 4 Argon / 3.8 Flash" />
+          </label>
+          <label class="field">
+            <span>输入框选择器</span>
+            <input type="text" id="inputSelector" placeholder="默认自动穿透 ProseMirror / contenteditable" />
+          </label>
+          <label class="field">
+            <span>发送按钮选择器</span>
+            <input type="text" id="sendSelector" placeholder="默认自动识别 Send / Enter" />
+          </label>
+          <label class="field">
+            <span>回复容器选择器</span>
+            <input type="text" id="replySelector" placeholder="默认自动识别 ucs-summary / ucs-markdown" />
+          </label>
+        </div>
+      </details>
+    </section>
+
+    <section class="button-grid">
+      <button type="button" id="saveBtn" class="btn primary">保存并重连</button>
+      <button type="button" id="diagnoseBtn" class="btn">检测页面元素</button>
+      <button type="button" id="newChatBtn" class="btn">网页新建对话</button>
+      <button type="button" id="openConsoleBtn" class="btn">打开本地控制台</button>
+    </section>
+
+    <section class="logs-section">
+      <div class="logs-header">
+        <span>诊断与运行日志</span>
+        <button type="button" id="clearLogsBtn" class="link-btn">清空</button>
+      </div>
+      <pre id="diagOutput" class="log-box">就绪</pre>
+    </section>
+  </main>
+
+  <script src="popup.js"></script>
+</body>
+</html>

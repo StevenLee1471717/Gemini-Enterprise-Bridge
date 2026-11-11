@@ -2,7 +2,9 @@
 
 将已登录的 **Google Cloud Gemini Enterprise（Vertex AI Search / Agentspace，`vertexaisearch.cloud.google.com`）** 安全、稳定地包装为标准本地 **OpenAI 兼容接口（`/v1/chat/completions` & `/v1/models`）**，无缝接入 **ChatBox、NextChat、Cursor、Cherry Studio、Open WebUI** 及 OpenAI Python/JS SDK。
 
-> **合规提示**：如拥有企业 GCP 项目 IAM 权限，建议优先启用内置的 **方案一（GCloud 官方 ADC 模式）**；若仅有网页访问权限且用于个人本地开发测试，请使用默认的 **方案二（Chrome/Edge Manifest V3 真实浏览器回路桥接）**。本项目全程仅监听本机 `127.0.0.1`，**绝不提取或落盘任何 Google 账号 Cookie / Token**。
+> **⚠️ 免责声明 (Unofficial / Disclaimer)**：本项目为非官方开源技术研究与个人本地开发工具桥接方案，与 Google LLC / Google Cloud 无任何隶属、合作或官方背书关系。使用者须严格遵守所在企业/机构的 IT 安全与数据合规制度以及 Google 服务条款（Terms of Service）。如拥有企业 GCP 项目 IAM 权限，建议优先启用内置的 **方案一（GCloud 官方 ADC 模式）**。
+>
+> **🔒 安全建议 (Security Note)**：请务必在 `.env` 中保持 `BRIDGE_HOST=127.0.0.1`（仅限本机回环访问，切勿暴露至公网或 `0.0.0.0`），并强烈建议配置非空的强随机 `BRIDGE_API_KEY`（如 `BRIDGE_API_KEY=sk-your-private-random-key`），防止本机其他未授权进程调用本地代理接口。本项目全程**绝不提取、硬编码或落盘任何 Google 账号 Cookie / Token**。
 
 ---
 

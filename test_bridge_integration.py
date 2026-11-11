@@ -280,9 +280,9 @@ sendBtn.addEventListener("click", () => {
 });
 
 const loc = {
-  href: "https://vertexaisearch.cloud.google.com/u/3/home/cid/f8a26a7c?hl=en_US",
+  href: "https://vertexaisearch.cloud.google.com/u/3/home/cid/demo-cid?hl=en_US",
   origin: "https://vertexaisearch.cloud.google.com",
-  pathname: "/u/3/home/cid/f8a26a7c",
+  pathname: "/u/3/home/cid/demo-cid",
   search: "?hl=en_US"
 };
 
@@ -433,7 +433,7 @@ def test_full_chain_client_server_extension_dom_integration(tmp_path: Path) -> N
                 {
                     "type": "tab_status",
                     "tab_id": 301,
-                    "tab_url": "https://vertexaisearch.cloud.google.com/u/3/home/cid/f8a26a7c/r/session/old1?hl=en_US",
+                    "tab_url": "https://vertexaisearch.cloud.google.com/u/3/home/cid/demo-cid/r/session/1000000000000000001?hl=en_US",
                     "ready": True,
                 }
             )

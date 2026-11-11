@@ -277,7 +277,7 @@ class MockElement extends MockNode {
 }
 
 // Construct realistic Gemini Enterprise Shadow DOM tree:
-// URL starts inside an active session `/u/3/home/cid/f8a26a7c/r/session/8765412851?hl=en_US`
+// URL starts inside an active session `/u/3/home/cid/00000000-0000-0000-0000-000000000000/r/session/1000000000000000001?hl=en_US`
 const doc = new MockNode();
 doc.title = "Gemini Enterprise";
 doc.body = new MockElement("body", { rect: { left: 0, top: 0, right: 1440, bottom: 900, width: 1440, height: 900 } });
@@ -423,16 +423,16 @@ modelPillBtn.addEventListener("click", () => {
 
 // Wire New Chat button behavior: clears `/r/session/...` from URL, clears old reply bubbles, and resets model pill to "Auto"!
 const mockLocation = {
-  href: "https://vertexaisearch.cloud.google.com/u/3/home/cid/f8a26a7c-0f51-4098-bf58-52506661472b/r/session/8765412851651517054?hl=en_US",
+  href: "https://vertexaisearch.cloud.google.com/u/3/home/cid/00000000-0000-0000-0000-000000000000/r/session/1000000000000000001?hl=en_US",
   origin: "https://vertexaisearch.cloud.google.com",
-  pathname: "/u/3/home/cid/f8a26a7c-0f51-4098-bf58-52506661472b/r/session/8765412851651517054",
+  pathname: "/u/3/home/cid/00000000-0000-0000-0000-000000000000/r/session/1000000000000000001",
   search: "?hl=en_US"
 };
 
 let newChatClicks = 0;
 newChatBtn.addEventListener("click", () => {
   newChatClicks += 1;
-  mockLocation.pathname = "/u/3/home/cid/f8a26a7c-0f51-4098-bf58-52506661472b";
+  mockLocation.pathname = "/u/3/home/cid/00000000-0000-0000-0000-000000000000";
   mockLocation.href = `${mockLocation.origin}${mockLocation.pathname}${mockLocation.search}`;
   replyBubble1.remove();
   replyBubble2.remove();
@@ -502,7 +502,7 @@ assert.equal(diag0.newChatButtonFound, true, "Must detect New Chat button via <m
 assert.equal(diag0.assistantBlocksCount, 2);
 assert.equal(
   diag0.cleanNewChatUrl,
-  "https://vertexaisearch.cloud.google.com/u/3/home/cid/f8a26a7c-0f51-4098-bf58-52506661472b?hl=en_US"
+  "https://vertexaisearch.cloud.google.com/u/3/home/cid/00000000-0000-0000-0000-000000000000?hl=en_US"
 );
 
 // Test 2: Switch from default "Auto" -> "4-argon" (`4argon`)

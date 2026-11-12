@@ -29,6 +29,19 @@ flowchart LR
 
 ---
 
+## v1.1.x 架构与核心能力速览
+
+当前版本（`v1.1.2`）在本地 OpenAI 兼容网关基础上构建了完整的生产级多会话与自动化运维闭环：
+
+| 能力模块 | 核心实现与运行机制 |
+|---|---|
+| **1M 上下文窗口与客户端上限同步** | `/v1/models` 与 `/v1/models/{model_id}` 全量声明 **`1,048,576` 输入 / `65,536` 输出** Token 上限（覆盖 **Gemini 4 Carbon**、**4 Argon**、**3.1 Pro**、**3.8 Flash** 及 `@会话名` 别名）；启动时自动运行 `sync_client_limits.py` 同步修复本地 GitHub Copilot App (`~/.copilot/data.db`) BYOK 模型的 `128K` 默认回退限制 |
+| **上下文水位监控与官方 API 等价账本 (`6.8` 汇率)** | 实时计算各并行会话在 `1M` 窗口中的占用水位（历史消息 / 工具 Schema / 增量输入），并通过 `usage_stats.py` 按 Google 官方分段定价持久化累计输入/输出 Token 与等价节省费用（默认按 **`1 USD = 6.8 CNY`** 折算，可通过 `BRIDGE_USD_TO_CNY_RATE` 自定义，支持扩展弹窗、Web 控制台与 `/api/usage` 实时查看及重置） |
+| **多标签页真并行池 (`WorkerSlot` Pool)** | 每个已打开的 Gemini Enterprise 标签页作为独立并发工作槽位，支持多客户端同时流式请求、对话前缀自动粘性路由、`@会话名` 显式固定绑定，以及并发繁忙时后台静默新建标签页扩容（`BRIDGE_AUTO_SPAWN_TABS=true`） |
+| **GitHub Releases 双向自动更新** | `.github/workflows/ci-release.yml` 自动测试并发布带 `SHA-256` 清单的插件与后端产物；后端每次启动自动检查更新并保留 `.env` / `usage_stats.json`；MV3 扩展内置 `/health` 静默预检、bfcache 保活端口清理、后台空闲自动重载（`chrome.runtime.reload()`）及跨端版本不一致一键升级提示 |
+
+---
+
 ## 3 分钟快速上手（Windows 一键启动）
 
 ### 第一步：启动本地 FastAPI 代理网关

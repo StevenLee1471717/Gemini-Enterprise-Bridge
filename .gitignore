@@ -28,3 +28,9 @@ usage_stats.json.tmp
 .idea/
 .DS_Store
 Thumbs.db
+
+# Local image artifacts
+generated/
+
+# Local runtime caches
+.cache/

@@ -125,15 +125,17 @@ DASHBOARD_HTML = """<!DOCTYPE html>
       flex-direction: column;
       gap: 10px;
     }
-    textarea {
+    textarea, input[type="password"] {
       width: 100%;
-      min-height: 82px;
       border-radius: 10px;
       border: 1px solid var(--card-border);
       background: var(--code-bg);
       color: var(--text);
       padding: 10px 12px;
       font: inherit;
+    }
+    textarea {
+      min-height: 82px;
       resize: vertical;
     }
     .actions {
@@ -267,7 +269,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
       <section class="card">
         <h2>第三方客户端接入参数 (Cursor / Cline / ChatBox / NextChat)</h2>
         <div class="kv"><span>API Host / Base URL</span><span class="mono" id="baseUrlVal">http://127.0.0.1:8000/v1</span></div>
-        <div class="kv"><span>API Key</span><span class="mono">sk-local-bridge (任意填写或按 .env)</span></div>
+        <div class="kv"><span>API Key</span><span class="mono">填写本机配置中的 API Key</span></div>
         <div class="kv"><span>可选网页模型</span><span class="mono">gemini-3.1-pro · gemini-4-argon · gemini-4-carbon · gemini-3.8-flash</span></div>
         <div class="kv"><span>默认/固定会话</span><span class="mono">gemini-4-argon / gemini-4-carbon / 4carbon@sess1</span></div>
         <div class="kv"><span>能力支持</span><span class="mono">多会话并行池 · Tools · Agentic Loop</span></div>
@@ -336,13 +338,19 @@ DASHBOARD_HTML = """<!DOCTYPE html>
     <section class="card" style="margin-bottom: 18px;">
       <h2>在线流式联调测试 (SSE `/v1/chat/completions`)</h2>
       <div class="chat-box">
-        <textarea id="promptInput" placeholder="输入测试问题，例如：请用三句话总结什么是 Google Cloud Agentspace？"></textarea>
+        <label for="apiKeyInput">本地 API Key</label>
+        <input id="apiKeyInput" type="password" autocomplete="off" spellcheck="false" placeholder="粘贴本机配置中的 API Key；未设置密钥时可留空" />
+        <textarea id="promptInput" placeholder="输入测试问题，可同时附加图片、PDF、Office 文档、音频或视频..."></textarea>
+        <div style="display:flex;align-items:center;gap:10px;flex-wrap:wrap;margin:6px 0;">
+          <input id="fileInput" type="file" multiple style="font:inherit;color:var(--muted);" />
+          <span class="muted" style="font-size:0.82rem;">支持图片、PDF、Word/Excel/PPT、CSV/JSON/TXT、音频、视频多模态附件</span>
+        </div>
         <div class="actions">
           <select id="modelSelect" style="padding:7px 10px;border-radius:8px;border:1px solid var(--card-border);background:var(--code-bg);color:var(--text);font:inherit;">
             <option value="gemini-enterprise-web">gemini-enterprise-web (保持当前模型)</option>
             <option value="gemini-3.1-pro">gemini-3.1-pro (自动切换 3.1 Pro)</option>
             <option value="gemini-4-argon">gemini-4-argon (自动切换 4 Argon)</option>
-            <option value="gemini-4-carbon">gemini-4-carbon (自动切换 4 Carbon)</option>
+            <option value="gemini-4-carbon" selected>gemini-4-carbon (自动切换 4 Carbon)</option>
             <option value="gemini-3.8-flash">gemini-3.8-flash (自动切换 3.8 Flash)</option>
             <option value="gemini-2.5-pro">gemini-2.5-pro (自动切换 2.5 Pro)</option>
             <option value="gemini-2.5-flash">gemini-2.5-flash (自动切换 2.5 Flash)</option>
@@ -471,11 +479,11 @@ DASHBOARD_HTML = """<!DOCTYPE html>
         if (active || slots.length > 0) {
           dot.className = 'dot ok';
           txt.textContent = slots.length > 1
-            ? ('并行池已就绪 (' + slots.length + ' Tabs)')
+            ? ('已连接 ' + slots.length + ' 个工作页 · 最多同时处理 ' + hub.parallel_capacity + ' 个请求')
             : '浏览器已挂载';
           document.getElementById('transportVal').textContent =
             (active ? active.transport + ' (' + active.driver_mode + ')' : 'multi-slot') +
-            (hub.auto_spawn_tabs ? ' · 自动扩容(≤' + (hub.max_parallel_tabs || 4) + ')' : '');
+            ' · 总并发上限 ' + hub.max_parallel_tabs + (hub.auto_spawn_tabs ? ' · 自动开页' : '');
           if (slots.length > 0) {
             const summary = slots.map(function (s) {
               return '#' + (s.tab_id || 'tm') + (s.busy ? '[忙碌]' : '[空闲]') + (s.active_model ? '(' + s.active_model + ')' : '');
@@ -547,17 +555,45 @@ DASHBOARD_HTML = """<!DOCTYPE html>
       btn.disabled = true;
       out.textContent = '';
       const chosenModel = document.getElementById('modelSelect').value || 'gemini-enterprise-web';
+      const authHeader = 'Bearer ' + document.getElementById('apiKeyInput').value.trim();
       try {
+        const fileEl = document.getElementById('fileInput');
+        const picked = fileEl && fileEl.files ? Array.from(fileEl.files) : [];
+        let messageContent = prompt;
+        if (picked.length > 0) {
+          const parts = [{ type: 'text', text: prompt }];
+          for (const f of picked) {
+            const fd = new FormData();
+            fd.append('file', f, f.name);
+            fd.append('purpose', 'user_data');
+            const upRes = await fetch('/v1/files', { method: 'POST', headers: { 'Authorization': authHeader }, body: fd });
+            if (!upRes.ok) {
+              out.textContent = '附件上传失败:\n' + (await upRes.text());
+              return;
+            }
+            const upMeta = await upRes.json();
+            if (upMeta.category === 'image') {
+              parts.push({ type: 'image_url', image_url: { url: upMeta.id } });
+            } else if (upMeta.category === 'audio') {
+              parts.push({ type: 'input_audio', file_id: upMeta.id, filename: upMeta.filename });
+            } else if (upMeta.category === 'video') {
+              parts.push({ type: 'video_url', file_id: upMeta.id, filename: upMeta.filename });
+            } else {
+              parts.push({ type: 'file', file: { file_id: upMeta.id, filename: upMeta.filename, mime_type: upMeta.mime_type } });
+            }
+          }
+          messageContent = parts;
+        }
         const res = await fetch('/v1/chat/completions', {
           method: 'POST',
           headers: {
             'Content-Type': 'application/json',
-            'Authorization': 'Bearer sk-local-bridge'
+            'Authorization': authHeader
           },
           body: JSON.stringify({
             model: chosenModel,
             stream: true,
-            messages: [{ role: 'user', content: prompt }]
+            messages: [{ role: 'user', content: messageContent }]
           })
         });
         if (!res.ok) {

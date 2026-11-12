@@ -84,6 +84,9 @@ class BridgeSettings:
     github_token: str = ""
     usage_stats_path: str = ""
     usd_to_cny_rate: float = 6.8
+    generated_dir: str = ""
+    response_store_dir: str = ""
+    response_store_ttl_seconds: float = 86400.0
 
     # Optional Option-1 (Official GCloud CLI / Vertex AI / Discovery Engine) settings
     gcp_project_id: str = ""
@@ -138,6 +141,13 @@ class BridgeSettings:
             ),
             usage_stats_path=os.getenv("BRIDGE_USAGE_STATS_PATH", "").strip(),
             usd_to_cny_rate=_env_float("BRIDGE_USD_TO_CNY_RATE", 6.8),
+            generated_dir=os.getenv("BRIDGE_GENERATED_DIR", "").strip(),
+            response_store_dir=os.getenv(
+                "BRIDGE_RESPONSE_STORE_DIR", str(root / ".cache" / "response_store")
+            ).strip(),
+            response_store_ttl_seconds=max(
+                60.0, _env_float("BRIDGE_RESPONSE_STORE_TTL", 86400.0)
+            ),
             gcp_project_id=os.getenv("GCP_PROJECT_ID", "").strip(),
             gcp_location=os.getenv("GCP_LOCATION", "global").strip() or "global",
             gcp_vertex_location=os.getenv("GCP_VERTEX_LOCATION", "us-central1").strip()

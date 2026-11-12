@@ -5,15 +5,54 @@ from __future__ import annotations
 import ast
 import json
 import re
+import shlex
 import uuid
+from web_text import WebTextFilter, clean_web_text
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 TOOL_CALL_OPEN = "[TOOL_CALL]"
 TOOL_CALL_CLOSE = "[/TOOL_CALL]"
 
-_PRIMARY_BLOCK_RE = re.compile(r"\[TOOL_CALL\](.*?)\[/TOOL_CALL\]", re.DOTALL | re.IGNORECASE)
-_XML_BLOCK_RE = re.compile(r"<tool_call>(.*?)</tool_call>", re.DOTALL | re.IGNORECASE)
+
+class ToolProtocolError(ValueError):
+    """A tool-enabled reply cannot safely be delivered or executed."""
+
+
+TOOL_OUTPUT_REPAIR_PROMPT = """The previous reply could not be accepted: it contained an incomplete or
+unrecognized tool call, or internal thinking instead of a user-facing response.
+No tool from that reply was executed. Continue the current task from the latest
+real tool results. Reissue the intended call with the EXACT declared tool name
+and a complete valid JSON arguments object inside [TOOL_CALL]...[/TOOL_CALL],
+then stop. If no tool is needed, give the user the actual answer. Do not output
+internal thinking, analysis transcripts, examples of tool calls, or repeat old work."""
+
+_THINKING_PREFIXES = (
+    "thinking process:",
+    "thinking process：",
+    "思考过程:",
+    "思考过程：",
+    "思维过程:",
+    "思维过程：",
+    "内部思考:",
+    "内部思考：",
+    "<think>",
+    "<analysis>",
+)
+_THINKING_HEADER_BOLD_RE = re.compile(
+    r"^((?:thinking process|思考过程|思维过程|内部思考))\*+(?=[:：]|$)",
+    re.IGNORECASE,
+)
+
+
+def _thinking_prefix(text: str) -> str:
+    stripped = clean_web_text(text).lstrip().lstrip("*#>\t ")
+    if stripped.endswith("*"):
+        stripped = stripped.rstrip("*")
+    stripped = _THINKING_HEADER_BOLD_RE.sub(r"\1", stripped)
+    return stripped.lower()
+
+
 _FENCED_TOOL_RE = re.compile(
     r"```(?:tool_call|tool_use)\s*\n?(.*?)\n?```",
     re.DOTALL | re.IGNORECASE,
@@ -128,44 +167,22 @@ def build_tool_system_instructions(
     if not is_tool_generation_enabled(tools, tool_choice):
         return ""
 
-    compact_mode = len(tools) > 12
-
-    def _truncate_desc(text: Any, max_len: int) -> str:
-        if not isinstance(text, str):
-            return ""
-        cleaned = " ".join(text.split())
-        if not compact_mode or len(cleaned) <= max_len:
-            return cleaned if compact_mode else text
-        return cleaned[: max_len - 1].rstrip() + "…"
-
-    def _compact_schema(node: Any) -> Any:
-        if not compact_mode or not isinstance(node, dict):
-            return node
-        out: Dict[str, Any] = {}
-        for k, v in node.items():
-            if k == "description" and isinstance(v, str):
-                out[k] = _truncate_desc(v, 120)
-            elif k == "properties" and isinstance(v, dict):
-                out[k] = {pk: _compact_schema(pv) for pk, pv in v.items()}
-            elif k in ("items", "additionalProperties") and isinstance(v, dict):
-                out[k] = _compact_schema(v)
-            elif k in ("anyOf", "oneOf", "allOf") and isinstance(v, list):
-                out[k] = [_compact_schema(item) for item in v]
-            elif k == "$defs" and isinstance(v, dict):
-                out[k] = {dk: _compact_schema(dv) for dk, dv in v.items()}
-            else:
-                out[k] = v
-        return out
-
     tool_specs: List[Dict[str, Any]] = []
     for t in tools:
         fn = t.get("function") or {}
         raw_params = fn.get("parameters") or {"type": "object", "properties": {}}
         spec: Dict[str, Any] = {
             "name": fn.get("name"),
-            "description": _truncate_desc(fn.get("description", ""), 240),
-            "parameters": _compact_schema(raw_params),
+            "description": fn.get("description", ""),
+            "parameters": raw_params,
         }
+        if fn.get('name') in {'read_thread', 'mcp__codex_app.read_thread'} and 'threadId' in raw_params.get('properties', {}):
+            spec['parameters'] = json.loads(json.dumps(raw_params))
+            for key, limit in [('turnLimit', 10), ('maxOutputCharsPerItem', 20000)]:
+                field = spec['parameters']['properties'].get(key)
+                if isinstance(field, dict):
+                    field['maximum'] = min(field.get('maximum', limit), limit)
+            spec['description'] += '\nRead at most 10 turns and 20000 characters per item. For orientation start with turnLimit=2, maxOutputCharsPerItem=1000 and includeOutputs=false; expand only when needed and use cursor for older turns.'
         tool_specs.append(spec)
 
     # Use compact JSON automatically when tool schemas are large (>8 KB) to save context window
@@ -199,7 +216,8 @@ def build_tool_system_instructions(
     rules.extend(
         [
             "- `arguments` MUST be a valid JSON object matching the tool's `parameters` schema.",
-            "- Never fabricate `[TOOL_RESULT]` yourself; stop immediately after emitting your `[TOOL_CALL]...[/TOOL_CALL]` block(s) so the client can execute the tool and return `[TOOL_RESULT]`.",
+            "- Output only brief user-facing progress, tool calls, or the final answer. Never output an internal thinking transcript or a 'Thinking Process:' / '思考过程：' section.",
+            "- Never fabricate `[TOOL_RESULT]` yourself; stop immediately after emitting your `[TOOL_CALL]...[/TOOL_CALL]` block(s) without stacking extra waiting/submitted status sentences, so the client can execute the tool and return `[TOOL_RESULT]`.",
             "- When no tool call is needed (or once `[TOOL_RESULT]` gives enough information), answer the user normally WITHOUT any `[TOOL_CALL]` tags.",
         ]
     )
@@ -391,15 +409,32 @@ def _try_parse_json_loose(raw_snippet: str) -> Optional[Any]:
     return None
 
 
-def _extract_unclosed_tail_tool_call(text: str) -> Tuple[Optional[str], str]:
-    """Recover a `[TOOL_CALL]{...}` at the end of output if closing `[/TOOL_CALL]` was truncated."""
-    idx = text.upper().rfind("[TOOL_CALL]")
-    if idx == -1:
-        return None, text
-    after = text[idx + len(TOOL_CALL_OPEN) :]
-    if "[/TOOL_CALL]" in after.upper():
-        return None, text
-    return after, text[:idx]
+def _tool_blocks(text: str, opening: str, closing: str):
+    """Find protocol boundaries outside JSON/Python string literals."""
+    marker = re.compile(re.escape(opening), re.IGNORECASE)
+    lower = text.lower()
+    position = 0
+    while match := marker.search(text, position):
+        index = match.end()
+        quote = None
+        escaped = False
+        while index < len(text):
+            char = text[index]
+            if quote:
+                if escaped:
+                    escaped = False
+                elif char == "\\":
+                    escaped = True
+                elif char == quote:
+                    quote = None
+            elif char in ('"', "'"):
+                quote = char
+            elif lower.startswith(closing.lower(), index):
+                break
+            index += 1
+        end = min(index + len(closing), len(text))
+        yield match.start(), end, text[match.end():index]
+        position = end
 
 
 def _candidates_from_parsed_json(
@@ -452,6 +487,11 @@ def _candidates_from_parsed_json(
         return results
 
     canonical_name = allowed_map.get(raw_name.lower())
+    if not canonical_name and "." not in raw_name:
+        # Codex can add a namespace after the web conversation has already started.
+        aliases = [name for key, name in allowed_map.items() if key.rsplit(".", 1)[-1] == raw_name.lower()]
+        if len(aliases) == 1:
+            canonical_name = aliases[0]
     if not canonical_name:
         return results
 
@@ -488,8 +528,11 @@ def parse_assistant_output(
     text = raw_text or ""
     norm_tools = list(tools or [])
 
+    if _thinking_prefix(text).startswith(_THINKING_PREFIXES):
+        raise ToolProtocolError("网页返回了内部思考文字，正在请求实际操作或答复。")
+
     if not is_tool_generation_enabled(norm_tools, tool_choice):
-        cleaned = clean_json_response(text, response_format)
+        cleaned = clean_json_response(text if response_format else clean_web_text(text), response_format)
         return ParsedAssistantTurn(content=cleaned, tool_calls=[])
 
     allowed_map: Dict[str, str] = {}
@@ -503,38 +546,19 @@ def parse_assistant_output(
     extracted_calls: List[Dict[str, Any]] = []
     remaining_text = text
 
-    # Layer 1: Primary `[TOOL_CALL]...[/TOOL_CALL]` sentinel
-    def _replace_primary(match: re.Match[str]) -> str:
-        parsed = _try_parse_json_loose(match.group(1))
-        calls = _candidates_from_parsed_json(parsed, allowed_map, forced_fn)
-        if calls:
-            extracted_calls.extend(calls)
-            return ""
-        return match.group(0)
-
-    remaining_text = _PRIMARY_BLOCK_RE.sub(_replace_primary, remaining_text)
-
-    # Layer 1b: Unclosed trailing `[TOOL_CALL]{...}` recovery
-    if not extracted_calls:
-        tail_snippet, trimmed = _extract_unclosed_tail_tool_call(remaining_text)
-        if tail_snippet:
-            parsed = _try_parse_json_loose(tail_snippet)
+    # A closing tag in a patch or command is data, not a protocol boundary.
+    for opening, closing in ((TOOL_CALL_OPEN, TOOL_CALL_CLOSE), ("<tool_call>", "</tool_call>")):
+        pieces, cursor = [], 0
+        for start, end, snippet in _tool_blocks(remaining_text, opening, closing):
+            pieces.append(remaining_text[cursor:start])
+            parsed = _try_parse_json_loose(snippet)
             calls = _candidates_from_parsed_json(parsed, allowed_map, forced_fn)
             if calls:
                 extracted_calls.extend(calls)
-                remaining_text = trimmed
-
-    # Layer 2: `<tool_call>...</tool_call>` XML fallback
-    if not extracted_calls:
-        def _replace_xml(match: re.Match[str]) -> str:
-            parsed = _try_parse_json_loose(match.group(1))
-            calls = _candidates_from_parsed_json(parsed, allowed_map, forced_fn)
-            if calls:
-                extracted_calls.extend(calls)
-                return ""
-            return match.group(0)
-
-        remaining_text = _XML_BLOCK_RE.sub(_replace_xml, remaining_text)
+            else:
+                pieces.append(remaining_text[start:end])
+            cursor = end
+        remaining_text = "".join(pieces) + remaining_text[cursor:]
 
     # Layer 3: Fenced ```tool_call ... ``` or ```json {"tool_calls": [...]} ```
     if not extracted_calls:
@@ -578,19 +602,69 @@ def parse_assistant_output(
                     extracted_calls.extend(calls)
                     remaining_text = ""
 
+    if re.search(r"\[TOOL_CALL\]|<tool_call>", remaining_text, re.IGNORECASE):
+        raise ToolProtocolError("网页工具请求不完整或名称无法识别，未执行该请求。")
+
     if not extracted_calls:
-        cleaned = clean_json_response(text, response_format)
+        cleaned = clean_json_response(text if response_format else clean_web_text(text), response_format)
         return ParsedAssistantTurn(content=cleaned, tool_calls=[])
 
+    extracted_calls = _normalize_query_calls(extracted_calls)
     if parallel_tool_calls is False and len(extracted_calls) > 1:
         extracted_calls = extracted_calls[:1]
 
     # Clean leftover empty markdown code fences around stripped `[TOOL_CALL]` blocks
-    cleaned_preamble = _EMPTY_CODE_FENCE_RE.sub("", remaining_text).strip()
+    cleaned_preamble = clean_web_text(_EMPTY_CODE_FENCE_RE.sub("", remaining_text)).strip()
     return ParsedAssistantTurn(
         content=cleaned_preamble if cleaned_preamble else None,
         tool_calls=extracted_calls,
     )
+
+
+def _is_read_query(call: dict) -> bool:
+    fn = call['function']
+    name = fn['name'].rsplit('.', 1)[-1]
+    if name in {'read_thread', 'read_file', 'read_text_file'}:
+        return True
+    if name != 'exec_command':
+        return False
+    args = json.loads(fn['arguments'])
+    if not isinstance(args, dict):
+        return False
+    cmd = args.get('cmd', '')
+    if not isinstance(cmd, str) or re.search(r'[;&<>`$\n]', cmd):
+        return False
+    try:
+        tokens = shlex.split(cmd)
+    except ValueError:
+        return False
+    # Only plain file reads and the common numbered-line pipeline are unambiguous.
+    if tokens and tokens[0] == 'cat' and '|' not in tokens:
+        return True
+    return (len(tokens) == 7 and tokens[:2] == ['nl', '-ba'] and tokens[3:6] == ['|', 'sed', '-n']
+            and bool(re.fullmatch(r'\d+(?:,\d+)?p', tokens[6])))
+
+
+def _normalize_query_calls(calls: list[dict]) -> list[dict]:
+    for call in calls:
+        fn = call['function']
+        if fn['name'] in {'read_thread', 'mcp__codex_app.read_thread'}:
+            args = json.loads(fn['arguments'])
+            if isinstance(args, dict) and 'threadId' in args:
+                for key, limit in [('turnLimit', 10), ('maxOutputCharsPerItem', 20000)]:
+                    if type(args.get(key)) is int and args[key] > limit:
+                        args[key] = limit
+                fn['arguments'] = json.dumps(args, ensure_ascii=False)
+    if not all(_is_read_query(call) for call in calls):
+        return calls
+    seen, unique = set(), []
+    for call in calls:
+        fn = call['function']
+        key = (fn['name'], json.dumps(json.loads(fn['arguments']), sort_keys=True, ensure_ascii=False))
+        if key not in seen:
+            unique.append(call)
+            seen.add(key)
+    return unique
 
 
 def clean_json_response(text: str, response_format: Optional[Dict[str, Any]]) -> str:
@@ -658,16 +732,41 @@ class ToolStreamProcessor:
             response_format.get("type") or ""
         ).lower() in {"json_object", "json_schema"}
 
+        self._web_text = WebTextFilter()
         self._raw_parts: List[str] = []
         self._pending: str = ""
         self._capturing_tool: bool = False
         self._emitted_text_len: int = 0
+        self._preamble_buffer = ""
+        self._preamble_checked = False
+        self._suppress_thinking = False
+        self._emitted_parts: List[str] = []
 
     def feed(self, delta: str) -> List[str]:
+        pieces = self._feed(delta)
+        self._emitted_parts.extend(pieces)
+        return pieces
+
+    def _feed(self, delta: str) -> List[str]:
         """Process incoming chunk and return safe `delta.content` strings to emit right now."""
         if not delta:
             return []
         self._raw_parts.append(delta)
+        delta = self._web_text.feed(delta)
+        if not delta:
+            return []
+        if self._suppress_thinking:
+            return []
+        if not self._preamble_checked:
+            self._preamble_buffer += delta
+            prefix = _thinking_prefix(self._preamble_buffer)
+            if prefix.startswith(_THINKING_PREFIXES):
+                self._suppress_thinking = True
+                return []
+            if not prefix or any(marker.startswith(prefix) for marker in _THINKING_PREFIXES):
+                return []
+            self._preamble_checked = True
+            delta, self._preamble_buffer = self._preamble_buffer, ""
 
         # If neither tools nor JSON-unwrapping mode is active, pass through with zero buffering
         if not self.tools_enabled and not self.json_mode:
@@ -755,7 +854,18 @@ class ToolStreamProcessor:
         return None
 
     def finalize(self) -> Tuple[List[str], ParsedAssistantTurn]:
+        tail, parsed = self._finalize()
+        emitted = ''.join(self._emitted_parts)
+        if parsed.has_tool_calls and not self.forced_mode and parsed.content and parsed.content.startswith(emitted):
+            tail = [parsed.content[len(emitted):]]
+        # History must reflect the text delivered to the client, including held preambles.
+        parsed.content = (emitted + ''.join(tail)).strip() or (None if parsed.has_tool_calls else '')
+        return tail, parsed
+
+    def _finalize(self) -> Tuple[List[str], ParsedAssistantTurn]:
         """Finalize stream, returning `(remaining_content_deltas, parsed_turn)`."""
+        self._pending += self._preamble_buffer + self._web_text.finish()
+        self._preamble_buffer = ""
         full_raw = "".join(self._raw_parts)
         parsed = parse_assistant_output(
             full_raw,

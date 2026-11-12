@@ -3,7 +3,10 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 import contextlib
+import hashlib
+from pathlib import Path
 import logging
 import re
 import secrets
@@ -200,6 +203,7 @@ class BrowserBridgeHub:
         self._pending_spawns: Dict[str, asyncio.Future[Dict[str, Any]]] = {}
         self._staged_attachments: Dict[str, StagedAttachment] = {}
         self._routing_lock = asyncio.Lock()
+        self._parallel_limit = asyncio.Semaphore(self.max_parallel_tabs)
         self._total_requests = 0
         self._total_errors = 0
         self._recent_logs: List[Dict[str, Any]] = []
@@ -577,11 +581,12 @@ class BrowserBridgeHub:
             "active_client": active.to_public_dict() if active else None,
             "clients": clients,
             "worker_slots": [s.to_public_dict() for s in slots],
-            "parallel_capacity": len(slots),
+            "parallel_capacity": min(len(slots), self.max_parallel_tabs),
+            "connected_tabs": len(slots),
             "max_parallel_tabs": self.max_parallel_tabs,
             "auto_spawn_tabs": self.auto_spawn_tabs,
             "active_slots_busy": busy_slots,
-            "busy": len(slots) > 0 and busy_slots >= len(slots) and len(slots) >= self.max_parallel_tabs,
+            "busy": len(self._pending) >= min(len(slots), self.max_parallel_tabs) > 0,
             "queued_requests": waiting_total,
             "in_flight_requests": len(self._pending),
             "total_requests": self._total_requests,
@@ -711,6 +716,14 @@ class BrowserBridgeHub:
         inflight = self._pending.get(req_id)
         if inflight is None:
             return None
+        if inflight.client_id != client_id:
+            return None
+        if data.get("tab_id") is not None:
+            try:
+                if int(data["tab_id"]) != inflight.tab_id:
+                    return None
+            except (TypeError, ValueError):
+                return None
 
         inflight.last_activity_at = time.time()
 
@@ -751,13 +764,17 @@ class BrowserBridgeHub:
             return None
 
         if msg_type == "request_complete" or "reply" in data:
-            if data.get("chunked") and inflight.reply_chunks:
+            if data.get("chunked"):
                 total_c = int(
                     data.get("total_chunks")
                     or inflight.expected_reply_chunks
                     or len(inflight.reply_chunks)
                 )
-                reply = "".join(inflight.reply_chunks.get(i, "") for i in range(total_c))
+                if total_c <= 0 or len(inflight.reply_chunks) != total_c or any(i not in inflight.reply_chunks for i in range(total_c)):
+                    self._total_errors += 1
+                    await inflight.events.put({"type": "error", "message": "网页回复分段缺失，未将不完整内容标为完成。"})
+                    return None
+                reply = "".join(inflight.reply_chunks[i] for i in range(total_c))
                 inflight.reply_chunks.clear()
             else:
                 reply = str(data.get("reply") or "")
@@ -778,6 +795,8 @@ class BrowserBridgeHub:
                 {
                     "type": "done",
                     "reply": reply,
+                    "output_images": data.get("output_images") or [],
+                    "output_files": data.get("output_files") or [],
                     "citations": citations,
                     "source": source,
                 }
@@ -798,6 +817,8 @@ class BrowserBridgeHub:
     def _find_spawnable_client(self, ready_slots: Sequence[WorkerSlot]) -> Optional[tuple[BrowserClientState, str]]:
         """Find a connected WS extension client capable of spawning another background Vertex tab."""
         if not self.auto_spawn_tabs:
+            return None
+        if len(ready_slots) + sum(c.spawning_count for c in self._clients.values()) >= self.max_parallel_tabs:
             return None
         now = time.time()
         for client in self._clients.values():
@@ -840,7 +861,7 @@ class BrowserBridgeHub:
             return None
 
         try:
-            res = await asyncio.wait_for(fut, timeout=16.0)
+            res = await asyncio.wait_for(fut, timeout=30.0)
         except asyncio.TimeoutError:
             self.add_log("warn", f"Auto-spawn tab timed out ({spawn_id}); falling back to existing pool", client.client_id)
             return None
@@ -870,7 +891,12 @@ class BrowserBridgeHub:
     def get_affinity_slot_key(self, explicit_session_id: Optional[str]) -> Optional[str]:
         if not explicit_session_id:
             return None
-        return self._session_affinity.get(explicit_session_id)
+        key = self._session_affinity.get(explicit_session_id)
+        slot = self._slots.get(key)
+        if slot is not None and slot.pinned_session_id == explicit_session_id:
+            return key
+        self._session_affinity.pop(explicit_session_id, None)
+        return None
 
     def _is_slot_holding_protected_session(
         self,
@@ -896,6 +922,7 @@ class BrowserBridgeHub:
         ephemeral_aux: bool = False,
     ) -> AsyncIterator[WorkerSlot]:
         """Atomically select/spawn and lock an isolated `WorkerSlot` for parallel execution."""
+        queue_deadline = asyncio.get_running_loop().time() + queue_timeout
         chosen: Optional[WorkerSlot] = None
         spawn_target: Optional[tuple[BrowserClientState, str]] = None
         effective_session_id = None if ephemeral_aux else explicit_session_id
@@ -929,10 +956,9 @@ class BrowserBridgeHub:
             now = time.time()
 
             # 1) Explicit session_id affinity (`X-Session-Id` / `session_id` / `model@session`)
-            if effective_session_id and effective_session_id in self._session_affinity:
-                aff_key = self._session_affinity[effective_session_id]
-                if aff_key in ready_map:
-                    chosen = ready_map[aff_key]
+            aff_key = self.get_affinity_slot_key(effective_session_id)
+            if aff_key in ready_map:
+                chosen = ready_map[aff_key]
 
             # 2) Multi-turn conversation history prefix affinity (`matching_slot_keys`)
             if chosen is None and matching_slot_keys:
@@ -977,47 +1003,63 @@ class BrowserBridgeHub:
         # Perform async tab auto-spawn outside `_routing_lock` so other parallel requests aren't stalled!
         if spawn_target is not None:
             spawn_client, spawn_url = spawn_target
+            spawned_slot = None
             try:
                 spawned_slot = await self._spawn_worker_tab(spawn_client, spawn_url)
             finally:
                 async with self._routing_lock:
                     spawn_client.spawning_count = max(0, spawn_client.spawning_count - 1)
-                    if spawned_slot is not None:
-                        chosen = spawned_slot
-                    else:
-                        fallback_slots = self._get_alive_ready_slots()
-                        if not fallback_slots:
-                            self._total_errors += 1
-                            raise BridgeUnavailableError("浏览器标签页池不可用，自动扩容失败。")
-                        chosen = self._select_fallback_slot(
-                            fallback_slots, effective_session_id, time.time()
-                        )
-                    chosen.waiting_count += 1
-                    if effective_session_id:
-                        self._session_affinity[effective_session_id] = chosen.slot_key
-                        chosen.pinned_session_id = effective_session_id
+            # Cancellation must not reserve a slot after the caller has left.
+            async with self._routing_lock:
+                if spawned_slot is not None:
+                    chosen = spawned_slot
+                else:
+                    fallback_slots = self._get_alive_ready_slots()
+                    if not fallback_slots:
+                        self._total_errors += 1
+                        raise BridgeUnavailableError("浏览器标签页池不可用，自动扩容失败。")
+                    chosen = self._select_fallback_slot(
+                        fallback_slots, effective_session_id, time.time()
+                    )
+                chosen.waiting_count += 1
+                if effective_session_id:
+                    self._session_affinity[effective_session_id] = chosen.slot_key
+                    chosen.pinned_session_id = effective_session_id
 
         assert chosen is not None
-        acquired = False
+        acquired = permit_acquired = False
+        waiting = True
         try:
             try:
-                await asyncio.wait_for(chosen.lock.acquire(), timeout=queue_timeout)
+                await asyncio.wait_for(
+                    chosen.lock.acquire(),
+                    timeout=max(0, queue_deadline - asyncio.get_running_loop().time()),
+                )
                 acquired = True
+                await asyncio.wait_for(
+                    self._parallel_limit.acquire(),
+                    timeout=max(0, queue_deadline - asyncio.get_running_loop().time()),
+                )
+                permit_acquired = True
             except asyncio.TimeoutError as exc:
                 self._total_errors += 1
                 raise BridgeTimeoutError(
-                    f"等待浏览器工作标签页超时（>{queue_timeout:.0f}s），所有并行会话槽位均繁忙。"
+                    f"等待浏览器工作标签页超时（>{queue_timeout:.0f}s），并行会话槽位繁忙。"
                 ) from exc
-        finally:
+            if self._slots.get(chosen.slot_key) is not chosen or not chosen.tab_ready:
+                raise BridgeUnavailableError("排队期间工作页面已关闭或连接已重建，请重试。")
             chosen.waiting_count = max(0, chosen.waiting_count - 1)
-
-        try:
+            waiting = False
             yield chosen
         finally:
-            chosen.last_used_at = time.time()
-            chosen.in_flight_request_id = None
+            if waiting:
+                chosen.waiting_count = max(0, chosen.waiting_count - 1)
             if acquired:
+                chosen.last_used_at = time.time()
+                chosen.in_flight_request_id = None
                 chosen.lock.release()
+            if permit_acquired:
+                self._parallel_limit.release()
 
     @staticmethod
     def _select_fallback_slot(
@@ -1052,10 +1094,9 @@ class BrowserBridgeHub:
 
     async def stage_attachments(
         self,
-        attachments: Sequence[NormalizedAttachment],
+        attachments: Sequence[Any],
         ttl_seconds: float = ATTACHMENT_STAGE_TTL_SECONDS,
     ) -> List[Dict[str, Any]]:
-        """Resolve attachment bytes (including remote HTTP URLs) and stage on token-guarded URLs."""
         self.prune_expired_attachments()
         if not attachments:
             return []
@@ -1063,38 +1104,68 @@ class BrowserBridgeHub:
         expires_at = now + max(60.0, ttl_seconds)
         staged_list: List[Dict[str, Any]] = []
         for att in attachments:
-            try:
-                raw_bytes = await att.async_resolve_bytes()
-            except Exception as exc:
-                raise BridgeExecutionError(f"无法读取或下载多模态附件 '{att.filename}': {exc}") from exc
+            if isinstance(att, dict):
+                fname = str(att.get("name") or att.get("filename") or "attachment.bin")
+                mime = str(att.get("mime_type") or "application/octet-stream")
+                cat = str(att.get("category") or att.get("kind") or att.get("media_kind") or "file")
+                data_url = str(att.get("data_url") or "")
+                if data_url and "," in data_url:
+                    raw_bytes = base64.b64decode(data_url.split(",", 1)[1])
+                elif att.get("_path") and Path(str(att["_path"])).is_file():
+                    raw_bytes = Path(str(att["_path"])).read_bytes()
+                else:
+                    raw_bytes = b""
+                sha = hashlib.sha256(raw_bytes).hexdigest()
+            else:
+                try:
+                    raw_bytes = await att.async_resolve_bytes()
+                except Exception as exc:
+                    raise BridgeExecutionError(f"无法读取或下载多模态附件 '{att.filename}': {exc}") from exc
+                fname = att.filename
+                mime = att.mime_type
+                cat = att.kind
+                sha = att.sha256
+                data_url = (
+                    f"data:{mime};base64,{base64.b64encode(raw_bytes).decode('ascii')}"
+                    if len(raw_bytes) <= 1024 * 1024
+                    else ""
+                )
             att_id = uuid.uuid4().hex
             token = secrets.token_urlsafe(24)
             record = StagedAttachment(
                 attachment_id=att_id,
                 token=token,
-                filename=att.filename,
-                mime_type=att.mime_type,
+                filename=fname,
+                mime_type=mime,
                 data=raw_bytes,
-                sha256=att.sha256,
+                sha256=sha,
                 created_at=now,
                 expires_at=expires_at,
             )
             self._staged_attachments[att_id] = record
             rel_path = f"/api/bridge/attachments/{att_id}?token={urllib.parse.quote(token, safe='')}"
             full_url = f"{self.callback_base_url}{rel_path}" if self.callback_base_url else rel_path
-            staged_list.append(
-                {
-                    "id": att_id,
-                    "filename": att.filename,
-                    "mime_type": att.mime_type,
-                    "kind": att.kind,
-                    "media_kind": att.kind,
-                    "size_bytes": len(raw_bytes),
-                    "sha256": att.sha256,
-                    "url": full_url,
-                    "path": rel_path,
-                }
-            )
+            entry: Dict[str, Any] = {
+                "id": att_id,
+                "name": fname,
+                "filename": fname,
+                "mime_type": mime,
+                "category": cat,
+                "kind": cat,
+                "media_kind": cat,
+                "size_bytes": len(raw_bytes),
+                "sha256": sha,
+                "url": full_url,
+                "path": rel_path,
+            }
+            if data_url:
+                entry["data_url"] = data_url
+            if isinstance(att, dict):
+                if "file_id" in att:
+                    entry["file_id"] = att["file_id"]
+                if "fetch_url" in att:
+                    entry["fetch_url"] = att["fetch_url"]
+            staged_list.append(entry)
         return staged_list
 
     def verify_staged_attachment(self, attachment_id: str, token: str) -> tuple[Optional[StagedAttachment], str]:
@@ -1121,13 +1192,16 @@ class BrowserBridgeHub:
         reset_chat: bool = False,
         suppress_citations: bool = False,
         request_timeout: float = 600.0,
-        attachments: Optional[Sequence[NormalizedAttachment]] = None,
+        attachments: Optional[Sequence[Any]] = None,
+        image_generation: bool = False,
+        video_generation: bool = False,
+        output_images: Optional[List[Dict[str, Any]]] = None,
+        output_files: Optional[List[Dict[str, Any]]] = None,
     ) -> AsyncIterator[str]:
         """Execute a prompt on an already-acquired `WorkerSlot` without blocking other slots."""
         self._total_requests += 1
         sanitized_prompt = prompt.replace("\x00", "")
         req_id = uuid.uuid4().hex
-
         client = self._clients.get(slot.client_id)
         if client is None or not client.is_alive():
             self._total_errors += 1
@@ -1136,6 +1210,7 @@ class BrowserBridgeHub:
         slot.in_flight_request_id = req_id
         completed_normally = False
         staged_ids: List[str] = []
+
         try:
             staged_attachments = (
                 await self.stage_attachments(attachments, ttl_seconds=max(request_timeout, ATTACHMENT_STAGE_TTL_SECONDS))
@@ -1143,6 +1218,7 @@ class BrowserBridgeHub:
                 else []
             )
             staged_ids = [item["id"] for item in staged_attachments]
+
             inflight = InFlightRequest(
                 request_id=req_id,
                 client_id=client.client_id,
@@ -1154,6 +1230,7 @@ class BrowserBridgeHub:
                 target_model=target_model,
             )
             self._pending[req_id] = inflight
+
             callback_url = (
                 f"{self.callback_base_url}/api/bridge/callback"
                 if self.callback_base_url
@@ -1201,14 +1278,17 @@ class BrowserBridgeHub:
                     "timeout_ms": int(request_timeout * 1000),
                     "callback_url": callback_url,
                 }
-            if staged_attachments:
-                command["attachments"] = staged_attachments
+            command["attachments"] = staged_attachments
+            command["image_generation"] = image_generation
+            command["video_generation"] = video_generation
             if slot.tab_id is not None:
                 command["tab_id"] = slot.tab_id
+
             await self._send_command_to_client(client, command)
 
             emitted_parts: List[str] = []
-            sliding_window = max(request_timeout, 180.0)
+            sliding_window = request_timeout
+            progress_dom = progress_net = 0
             deadline = time.monotonic() + request_timeout
 
             while True:
@@ -1223,13 +1303,17 @@ class BrowserBridgeHub:
                         timeout=min(remaining, 15.0),
                     )
                 except asyncio.TimeoutError:
-                    # Yield empty string heartbeat so SSE streams can emit `: keepalive` comments
                     yield ""
                     continue
 
                 ev_type = event.get("type")
                 if ev_type == "progress":
-                    deadline = max(deadline, time.monotonic() + sliding_window)
+                    dom_len = max(0, int(event.get("dom_len") or 0))
+                    net_len = max(0, int(event.get("net_len") or 0))
+                    if dom_len > progress_dom or net_len > progress_net:
+                        deadline = max(deadline, time.monotonic() + sliding_window)
+                    progress_dom = max(progress_dom, dom_len)
+                    progress_net = max(progress_net, net_len)
                     yield ""
                     continue
                 if ev_type == "chunk":
@@ -1238,11 +1322,16 @@ class BrowserBridgeHub:
                         emitted_parts.append(delta)
                         yield delta
                     deadline = max(deadline, time.monotonic() + sliding_window)
+
                 elif ev_type == "error":
                     raise BridgeExecutionError(str(event.get("message") or "网页端执行失败"))
 
                 elif ev_type == "done":
                     completed_normally = True
+                    if output_images is not None:
+                        output_images.extend(event.get("output_images") or [])
+                    if output_files is not None:
+                        output_files.extend(event.get("output_files") or [])
                     final_reply = str(event.get("reply") or "")
                     emitted_so_far = "".join(emitted_parts)
 
@@ -1253,6 +1342,8 @@ class BrowserBridgeHub:
                         tail = final_reply[len(emitted_so_far) :]
                         if tail:
                             yield tail
+                    elif final_reply and final_reply != emitted_so_far:
+                        raise BridgeExecutionError("网页最终回复与已接收内容不一致，未将截断内容标为完成。")
 
                     citations = event.get("citations") or []
                     if self.include_citations and not suppress_citations and citations:
@@ -1260,7 +1351,6 @@ class BrowserBridgeHub:
                         if formatted_refs:
                             yield formatted_refs
                     break
-
         finally:
             self._pending.pop(req_id, None)
             slot.in_flight_request_id = None
@@ -1281,7 +1371,11 @@ class BrowserBridgeHub:
         reset_chat: bool = False,
         suppress_citations: bool = False,
         request_timeout: float = 600.0,
-        attachments: Optional[Sequence[NormalizedAttachment]] = None,
+        attachments: Optional[Sequence[Any]] = None,
+        image_generation: bool = False,
+        video_generation: bool = False,
+        output_images: Optional[List[Dict[str, Any]]] = None,
+        output_files: Optional[List[Dict[str, Any]]] = None,
     ) -> str:
         chunks: List[str] = []
         async for delta in self.dispatch_stream_on_slot(
@@ -1292,6 +1386,10 @@ class BrowserBridgeHub:
             suppress_citations=suppress_citations,
             request_timeout=request_timeout,
             attachments=attachments,
+            image_generation=image_generation,
+            video_generation=video_generation,
+            output_images=output_images,
+            output_files=output_files,
         ):
             if delta:
                 chunks.append(delta)

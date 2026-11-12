@@ -5,7 +5,7 @@
 //   3) Optional in-page fetch replay once a chat RPC template is observed
 
 (() => {
-  const DRIVER_VERSION = "2.6.0";
+  const DRIVER_VERSION = "2.6.5";
 
   // Optional Trusted Types policy (gracefully guarded if CSP `trusted-types` header restricts custom policy names;
   // all DOM mutations below strictly use `replaceChildren` + `createElement` + `textContent` and ZERO `innerHTML`!)
@@ -202,6 +202,8 @@
     if (!node || typeof node !== "object") {
       return;
     }
+    // A thought flag applies to its entire subtree, not just its direct text field.
+    if (node.thought === true || node.isThought === true || node.role === "thought" || node.type === "thought") return;
     if (Array.isArray(node)) {
       for (const item of node) {
         extractStructuredPieces(item, outTexts, outCitations);
@@ -213,21 +215,21 @@
     if (node.groundedContent && node.groundedContent.content) {
       const contentObj = node.groundedContent.content;
       if (!contentObj.thought && typeof contentObj.text === "string" && contentObj.text) {
-        outTexts.push(contentObj.text);
+        outTexts.push({ text: contentObj.text, snapshot: false });
       }
     } else if (
       typeof node.summaryText === "string" &&
       node.summaryText &&
       !node.thought
     ) {
-      outTexts.push(node.summaryText);
+      outTexts.push({ text: node.summaryText, snapshot: true });
     } else if (
       node.role === "model" &&
       Array.isArray(node.parts)
     ) {
       for (const p of node.parts) {
         if (p && !p.thought && typeof p.text === "string" && p.text) {
-          outTexts.push(p.text);
+          outTexts.push({ text: p.text, snapshot: false });
         }
       }
     }
@@ -247,6 +249,7 @@
     }
 
     for (const key of Object.keys(node)) {
+      if (["suggestedQuestions", "suggested_questions", "relatedQuestions"].includes(key)) continue;
       if (key === "groundedContent") {
         // Still inspect grounding metadata siblings, skip re-adding content.text
         const gc = node.groundedContent;
@@ -260,6 +263,51 @@
         extractStructuredPieces(child, outTexts, outCitations);
       }
     }
+  }
+
+  function stripExplicitWebDecorations(text) {
+    return String(text || "")
+      .replace(/^[ \t]*\[\[(?:suggested_questions|section:suggested_questions)\]\][\s\S]*$/im, "")
+      .replace(/\[\[section:[^\]]*\]\]/gi, "\n\n");
+  }
+
+  function replyFingerprint(text) {
+    const stable = (value) => {
+      if (Array.isArray(value)) return value.map(stable);
+      if (value && typeof value === "object") {
+        return Object.fromEntries(Object.keys(value).sort().map((key) => [key, stable(value[key])]));
+      }
+      return value;
+    };
+    // Formatting outside JSON strings may change in a final snapshot; commands may not.
+    return stripExplicitWebDecorations(text).trim().replace(/\[TOOL_CALL\]((?:"(?:\\[\s\S]|[^"\\])*"|[^"])*?)\[\/TOOL_CALL\]/gi, (block, json) => {
+      try { return "[TOOL_CALL]" + JSON.stringify(stable(JSON.parse(json))) + "[/TOOL_CALL]"; }
+      catch (_) { return block; }
+    });
+  }
+
+  function extractSnapshotSuffix(snapshotText, existingText) {
+    const fpExisting = replyFingerprint(existingText);
+    if (!fpExisting) return null;
+    const fpSnapshot = replyFingerprint(snapshotText);
+    if (fpSnapshot === fpExisting) return "";
+    if (!fpSnapshot.startsWith(fpExisting)) return null;
+    const closeTag = "[/TOOL_CALL]";
+    const candidates = [];
+    let pos = 0;
+    while ((pos = snapshotText.indexOf(closeTag, pos)) !== -1) {
+      pos += closeTag.length;
+      candidates.push(pos);
+    }
+    for (let i = 0; i < snapshotText.length; i += 1) {
+      if (snapshotText[i] === "\n") candidates.push(i);
+    }
+    for (const cut of candidates) {
+      if (replyFingerprint(snapshotText.slice(0, cut)) === fpExisting) {
+        return snapshotText.slice(cut);
+      }
+    }
+    return null;
   }
 
   function parseJsonPacketIntoJob(jsonObj, job) {
@@ -276,9 +324,19 @@
       }
     }
 
-    if (texts.length > 0) {
-      const combined = texts.join("");
+    for (const piece of texts) {
+      const combined = piece.text;
       if (combined) {
+        if (piece.snapshot && job.networkText) {
+          const snapshotSuffix = extractSnapshotSuffix(combined, job.networkText);
+          if (snapshotSuffix !== null) {
+            if (snapshotSuffix && stripExplicitWebDecorations(snapshotSuffix).trim()) {
+              job.networkText += snapshotSuffix;
+              job.onNetworkDelta(snapshotSuffix);
+            }
+            continue;
+          }
+        }
         // Distinguish cumulative full-text snapshots from incremental token deltas
         const isCumulativeGrowth =
           job.networkText.length >= 4 &&
@@ -288,7 +346,7 @@
           combined === job.networkText && combined.length >= 16;
 
         if (isFinalEchoDuplicate) {
-          return;
+          continue;
         }
         if (isCumulativeGrowth) {
           const suffix = combined.slice(job.networkText.length);
@@ -310,18 +368,24 @@
    */
   async function consumeRpcReadableStream(readableStream, job) {
     const reader = readableStream.getReader();
+    const cancelStream = () => { void reader.cancel().catch(() => {}); };
+    job.cancelStream = cancelStream;
     const decoder = new TextDecoder("utf-8");
     let buffer = "";
     let cursor = 0;
     let inString = false;
     let escaped = false;
     let objDepth = 0;
+    let arrayDepth = 0;
+    let invalidPacket = false;
     let objStart = -1;
+    let streamEnded = false;
 
     try {
       while (true) {
         const { value, done } = await reader.read();
         if (done) {
+          streamEnded = true;
           break;
         }
         buffer += decoder.decode(value, { stream: true });
@@ -353,9 +417,13 @@
                   try {
                     const parsed = JSON.parse(candidate);
                     parseJsonPacketIntoJob(parsed, job);
-                  } catch (_) {}
+                  } catch (_) { invalidPacket = true; }
                 }
               }
+            } else if (ch === "[") {
+              arrayDepth += 1;
+            } else if (ch === "]") {
+              arrayDepth = Math.max(0, arrayDepth - 1);
             }
           }
           cursor += 1;
@@ -368,12 +436,19 @@
         }
       }
     } catch (_) {
-      // Page aborted or stream closed
+      streamEnded = false;
     } finally {
-      if (job && !job.cancelled && job.networkText) {
-        job.networkDone = true;
-        job.onNetworkDone();
+      if (job && !job.cancelled) {
+        if (streamEnded && objDepth === 0 && arrayDepth === 0 && !inString && !invalidPacket && job.networkText) {
+          job.networkDone = true;
+          job.onNetworkDone();
+        } else if (!streamEnded || objDepth > 0 || arrayDepth > 0 || inString || invalidPacket) {
+          job.networkError = "网页响应流中断或数据不完整。";
+          logDriver("warn", job.networkError);
+        }
       }
+      reader.releaseLock();
+      if (job.cancelStream === cancelStream) delete job.cancelStream;
     }
   }
 
@@ -386,8 +461,9 @@
     emitToIsolated({ type: "driver_ready", captured_rpc: true });
   };
 
-  if (!sharedState.networkPatched) {
+  if (!sharedState.networkPatched || sharedState.networkPatchVersion !== DRIVER_VERSION) {
     sharedState.networkPatched = true;
+    sharedState.networkPatchVersion = DRIVER_VERSION;
 
     window.fetch = async function patchedFetch(input, init) {
       let url = "";
@@ -439,8 +515,21 @@
         }
       }
 
-      const response = await sharedState.nativeFetch(input, init);
+      // Bind before awaiting headers so a late response cannot attach to the next job.
       const curJob = sharedState.getActiveJob ? sharedState.getActiveJob() : null;
+      if (matchedRpc && curJob && !curJob.cancelled) curJob.submissionStarted = true;
+      let response;
+      try {
+        response = await sharedState.nativeFetch(input, init);
+      } catch (error) {
+        if (matchedRpc && curJob && !curJob.cancelled) {
+          curJob.networkError = "网页请求失败，连接已中断。";
+        }
+        throw error;
+      }
+      if (matchedRpc && curJob && !curJob.cancelled && response && response.ok === false) {
+        curJob.networkError = `网页请求失败 (HTTP ${response.status})。`;
+      }
 
       if (matchedRpc && curJob && !curJob.cancelled && response && response.body) {
         try {
@@ -469,6 +558,7 @@
         curJob
       ) {
         const jobRef = curJob;
+        jobRef.submissionStarted = true;
         let lastProcessedIdx = 0;
         this.addEventListener("readystatechange", () => {
           if (this.readyState >= 3 && typeof this.responseText === "string") {
@@ -1261,12 +1351,14 @@
     return dispatched;
   }
 
-  async function waitForComposerAttachmentsReady(inputEl, totalBytes = 0) {
+  async function waitForComposerAttachmentsReady(inputEl, totalBytes = 0, onProgress = null) {
     await sleep(120);
     const maxWaitMs = Math.min(60000, Math.max(8000, Math.ceil(totalBytes / 2048)));
     const deadline = Date.now() + maxWaitMs;
+    let lastProgress = Date.now();
     let quietChecks = 0;
     while (Date.now() < deadline) {
+      if (onProgress && Date.now() - lastProgress >= 7500) { lastProgress = Date.now(); onProgress(); }
       const liveInput = findComposerInput() || inputEl;
       const uploading = isComposerUploadingFiles(liveInput);
       if (!uploading) {
@@ -1281,7 +1373,7 @@
     }
   }
 
-  async function uploadAttachmentsToComposer(inputEl, attachmentSpecs) {
+  async function uploadAttachmentsToComposer(inputEl, attachmentSpecs, onProgress = null) {
     if (!Array.isArray(attachmentSpecs) || attachmentSpecs.length === 0) {
       return { uploaded: 0, method: "none" };
     }
@@ -1366,7 +1458,7 @@
       uploadMethod = "paste_drop_fallback";
     }
 
-    await waitForComposerAttachmentsReady(inputEl, totalBytes);
+    await waitForComposerAttachmentsReady(inputEl, totalBytes, onProgress);
     logDriver(
       "info",
       `已注入 ${files.length} 个多模态附件 (${uploadMethod}, bytes=${totalBytes}): ${files
@@ -1380,32 +1472,21 @@
     };
   }
 
-  async function submitComposerWithVerification(
-    inputEl,
-    promptText,
-    job = null,
-    baselineCount = 0,
-    options = {}
-  ) {
+
+  async function submitComposerWithVerification(inputEl, promptText, job = null, baselineCount = 0, options = {}) {
     const promptTrimLen = String(promptText || "").trim().length;
     const hadAttachments = Boolean(options && options.hadAttachments);
     const preSubmitChipCount = Number((options && options.preSubmitChipCount) || 0);
-
     const hasSubmissionStarted = () => {
-      if (job && (job.networkText.length > 0 || job.networkDone)) return true;
+      if (job && (job.submissionStarted || job.networkText.length > 0 || job.networkDone)) return true;
       if (isPageStillGenerating()) return true;
       if (collectAssistantReplyTexts().length > baselineCount) return true;
       const liveInput = findComposerInput() || inputEl;
       const curText = readComposerCurrentText(liveInput);
       if (promptTrimLen > 0 && curText.length === 0) return true;
+      if (!hadAttachments && curText.length === 0) return true;
       if (promptTrimLen > 10 && curText.length < Math.min(20, promptTrimLen * 0.2)) return true;
-      if (
-        hadAttachments &&
-        preSubmitChipCount > 0 &&
-        countComposerAttachmentIndicators(liveInput) === 0
-      ) {
-        return true;
-      }
+      if (hadAttachments && preSubmitChipCount > 0 && countComposerAttachmentIndicators(liveInput) === 0) return true;
       return false;
     };
 
@@ -1413,12 +1494,14 @@
     await nextAnimationFrame();
     let sendBtn = null;
     for (let i = 0; i < 12; i += 1) {
+      assertJobActive(job);
       sendBtn = findSendButton(inputEl);
       if (sendBtn) break;
       await sleep(80);
     }
 
     // Step A: Primary click or Enter keydown
+    assertJobActive(job);
     let method = "enter_keypress";
     if (sendBtn) {
       sendBtn.click();
@@ -1429,27 +1512,29 @@
 
     for (let i = 0; i < 6; i += 1) {
       await sleep(90);
+      assertJobActive(job);
       if (hasSubmissionStarted()) {
         return method;
       }
     }
 
-    // Step B: Realistic pointer/mouse click sequence + form requestSubmit + Enter keydown
+    // Try one submission method at a time, then wait for acknowledgement.
     sendBtn = findSendButton(inputEl) || sendBtn;
     if (sendBtn) {
       dispatchRealisticClick(sendBtn);
       method = "realistic_button_click";
-    }
-    try {
+    } else {
       const form = inputEl.closest ? inputEl.closest("form") : null;
       if (form && typeof form.requestSubmit === "function") {
         form.requestSubmit();
+      } else {
+        dispatchEnterKeySequence(inputEl);
       }
-    } catch (_) {}
-    dispatchEnterKeySequence(inputEl);
+    }
 
     for (let i = 0; i < 7; i += 1) {
       await sleep(95);
+      assertJobActive(job);
       if (hasSubmissionStarted()) {
         return method;
       }
@@ -1459,6 +1544,8 @@
     logDriver("warn", "检测到后台/并行标签页首次提交未触发，正在短暂激活标签页以完成发送...");
     await requestBriefTabActivation(240);
     await sleep(180);
+    assertJobActive(job);
+    if (hasSubmissionStarted()) return method;
 
     const activeInput = findComposerInput() || inputEl;
     if (promptTrimLen > 0 && !readComposerCurrentText(activeInput) && !hasSubmissionStarted()) {
@@ -1466,6 +1553,7 @@
       await sleep(100);
     }
     const healedBtn = findSendButton(activeInput);
+    assertJobActive(job);
     if (healedBtn) {
       dispatchRealisticClick(healedBtn);
       method = "tab_activated_button_click";
@@ -1476,11 +1564,12 @@
 
     for (let i = 0; i < 8; i += 1) {
       await sleep(100);
+      assertJobActive(job);
       if (hasSubmissionStarted()) {
-        break;
+        return method;
       }
     }
-    return method;
+    throw new Error("网页未确认发送成功，已停止重复提交，请重试。");
   }
 
   // =========================================================================
@@ -2506,17 +2595,32 @@
       .filter((txt) => txt.length > 0);
   }
 
-  function isPageStillGenerating() {
-    const stopBtns = querySelectorAllDeep(
+  function findGenerationStopButton() {
+    return querySelectorAllDeep(
       'button, md-icon-button, md-filled-icon-button, ucs-icon-button, [role="button"]'
-    ).filter((btn) => {
+    ).find((btn) => {
       if (!isElementVisible(btn)) return false;
       const label = readButtonIconAndLabelText(btn);
       return /\b(stop generating|stop response|cancel generation|stop_circle|stop_generating|^stop$)\b|停止生成|停止回答|停止/i.test(
         label.trim()
       );
     });
-    if (stopBtns.length > 0) {
+  }
+
+  function stopJob(job) {
+    job.cancelled = true;
+    if (job.cancelStream) job.cancelStream();
+    const stopButton = findGenerationStopButton();
+    if (stopButton) stopButton.click();
+  }
+
+  function assertJobActive(job) {
+    if (job && job.cancelled) throw new Error("任务已取消。");
+    if (job && job.networkError) throw new Error(job.networkError);
+  }
+
+  function isPageStillGenerating() {
+    if (findGenerationStopButton()) {
       return true;
     }
     const spinners = querySelectorAllDeep(
@@ -2581,8 +2685,8 @@
         throw new Error("Replay HTTP " + res.status);
       }
       await consumeRpcReadableStream(res.body, job);
-      if (!job.networkText.trim()) {
-        throw new Error("Replay 返回内容为空");
+      if (!job.networkDone || !job.networkText.trim()) {
+        throw new Error("Replay 回复不完整或返回内容为空");
       }
       return job.networkText;
     } finally {
@@ -2594,10 +2698,338 @@
   // 5. Unified Prompt Execution Orchestrator
   // =========================================================================
 
+  async function selectComposerTool(toolPattern, errorMissingTrigger, errorMissingTool) {
+    const alreadyActive = querySelectorAllDeep('button, md-filter-chip, mat-chip, [role="button"]').some((el) => {
+      if (!isElementVisible(el)) return false;
+      const label = readButtonIconAndLabelText(el);
+      return toolPattern.test(label) && (/close|cancel|remove|selected|active|已选/i.test(label) || el.getAttribute("aria-pressed") === "true");
+    });
+    if (alreadyActive) return;
+    const trigger = querySelectorAllDeep('button, md-icon-button, ucs-icon-button, [role="button"]').find((el) => {
+      if (!isElementVisible(el)) return false;
+      const aria = `${el.getAttribute("aria-label") || ""} ${el.getAttribute("title") || ""} ${getElementTooltipOrLabel(el)}`.trim();
+      return /\b(select tools|tools)\b|选择工具|工具/i.test(aria);
+    });
+    if (!trigger) throw new Error(errorMissingTrigger);
+    trigger.click();
+    await sleep(220);
+    let item = querySelectorAllDeep('[role="menuitem"],[role="menuitemcheckbox"],[role="option"],md-menu-item,button,span,div').find((el) =>
+      toolPattern.test(stripIconLigatures(String(el.textContent || "").trim())) && isElementVisible(el));
+    if (!item) {
+      dispatchRealisticClick(trigger);
+      await sleep(250);
+      item = querySelectorAllDeep('[role="menuitem"],[role="menuitemcheckbox"],[role="option"],md-menu-item,button,span,div').find((el) =>
+        toolPattern.test(stripIconLigatures(String(el.textContent || "").trim())) && isElementVisible(el));
+    }
+    if (!item) {
+      await dismissTransientOverlays(null);
+      throw new Error(errorMissingTool);
+    }
+    item.click();
+    await sleep(250);
+  }
+
+  async function selectImageGenerationTool() {
+    await selectComposerTool(
+      /^(create images|generate images|image generation|生成图片|创建图片)$/i,
+      "网页没有可用的生图工具入口。",
+      "当前账号没有 Create images 工具。"
+    );
+  }
+
+  async function selectVideoGenerationTool() {
+    await selectComposerTool(
+      /^(create videos?|generate videos?|video generation|生成视频|创建视频)$/i,
+      "网页没有可用的视频生成工具入口。",
+      "当前账号没有 Create videos 工具。"
+    );
+  }
+
+  function isAllowedArtifactUrl(rawSrc) {
+    try {
+      const url = new URL(rawSrc, location.href);
+      if (['blob:', 'data:'].includes(url.protocol)) return true;
+      if (url.origin === location.origin) return true;
+      if (/(^|\.)(googleusercontent|googleapis|gstatic|cloud\.google)\.com$/i.test(url.hostname)) return true;
+    } catch (_) {}
+    return false;
+  }
+
+  const B64_ALPHABET = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+
+  function encodeBytesBase64(bytes) {
+    if (typeof btoa === "function") {
+      const parts = [];
+      for (let i = 0; i < bytes.length; i += 0x8000) {
+        parts.push(String.fromCharCode.apply(null, bytes.subarray(i, i + 0x8000)));
+      }
+      return btoa(parts.join(""));
+    }
+    let out = "";
+    for (let i = 0; i < bytes.length; i += 3) {
+      const b0 = bytes[i];
+      const b1 = i + 1 < bytes.length ? bytes[i + 1] : 0;
+      const b2 = i + 2 < bytes.length ? bytes[i + 2] : 0;
+      const trip = (b0 << 16) | (b1 << 8) | b2;
+      out += B64_ALPHABET[(trip >> 18) & 63];
+      out += B64_ALPHABET[(trip >> 12) & 63];
+      out += i + 1 < bytes.length ? B64_ALPHABET[(trip >> 6) & 63] : "=";
+      out += i + 2 < bytes.length ? B64_ALPHABET[trip & 63] : "=";
+    }
+    return out;
+  }
+
+  function decodeBase64Bytes(b64) {
+    const clean = String(b64 || "").replace(/[^A-Za-z0-9+/=]/g, "");
+    if (typeof atob === "function") {
+      const bin = atob(clean);
+      const bytes = new Uint8Array(bin.length);
+      for (let i = 0; i < bin.length; i += 1) bytes[i] = bin.charCodeAt(i);
+      return bytes;
+    }
+    const lookup = new Int16Array(256).fill(-1);
+    for (let i = 0; i < B64_ALPHABET.length; i += 1) lookup[B64_ALPHABET.charCodeAt(i)] = i;
+    const pad = clean.endsWith("==") ? 2 : clean.endsWith("=") ? 1 : 0;
+    const outLen = Math.max(0, Math.floor((clean.length * 3) / 4) - pad);
+    const out = new Uint8Array(outLen);
+    let pos = 0;
+    for (let i = 0; i < clean.length; i += 4) {
+      const c0 = lookup[clean.charCodeAt(i)];
+      const c1 = lookup[clean.charCodeAt(i + 1)];
+      const c2 = clean[i + 2] === "=" ? 0 : lookup[clean.charCodeAt(i + 2)];
+      const c3 = clean[i + 3] === "=" ? 0 : lookup[clean.charCodeAt(i + 3)];
+      if (c0 < 0 || c1 < 0 || c2 < 0 || c3 < 0) throw new Error("附件 base64 内容无效。");
+      const trip = (c0 << 18) | (c1 << 12) | (c2 << 6) | c3;
+      if (pos < outLen) out[pos++] = (trip >> 16) & 255;
+      if (pos < outLen) out[pos++] = (trip >> 8) & 255;
+      if (pos < outLen) out[pos++] = trip & 255;
+    }
+    return out;
+  }
+
+  function blobToDataUrl(blob) {
+    if (typeof FileReader === "function") {
+      return new Promise((resolve, reject) => {
+        const reader = new FileReader();
+        reader.onload = () => resolve(reader.result);
+        reader.onerror = () => reject(new Error("无法读取媒体文件。"));
+        reader.readAsDataURL(blob);
+      });
+    }
+    return blob.arrayBuffer().then((buf) => {
+      const b64 = encodeBytesBase64(new Uint8Array(buf));
+      return `data:${blob.type || "application/octet-stream"};base64,${b64}`;
+    });
+  }
+
+  function dataUrlToFile(dataUrl, fallbackName, fallbackMime) {
+    if (!/^data:[^,]+;base64,/i.test(dataUrl || "")) {
+      throw new Error("附件内容格式无效（需要 base64 data URL）。");
+    }
+    const commaIdx = dataUrl.indexOf(",");
+    const header = dataUrl.slice(5, commaIdx);
+    const mime = fallbackMime || header.split(";")[0] || "application/octet-stream";
+    const bytes = decodeBase64Bytes(dataUrl.slice(commaIdx + 1));
+    return constructBrowserFile(bytes, fallbackName || "attachment.bin", mime);
+  }
+
+  function generatedImageNodes(baseline) {
+    return querySelectorAllDeep('img').filter((img) => img.complete && img.naturalWidth >= 128 &&
+      img.naturalHeight >= 128 && !/^https:\/\/www\.gstatic\.com\/vertexaisearch\/images\//i.test(img.currentSrc || img.src) &&
+      !baseline.has(img.currentSrc || img.src) && isElementVisible(img));
+  }
+
+  async function readGeneratedImages(nodes) {
+    const images = [];
+    const seen = new Set();
+    for (const img of nodes) {
+      const src = img.currentSrc || img.src;
+      if (!src || seen.has(src) || !isAllowedArtifactUrl(src)) continue;
+      seen.add(src);
+      let dataUrl = "";
+      let mime = "image/png";
+      if (src.startsWith("data:image/")) {
+        dataUrl = src;
+        mime = src.slice(5).split(";")[0] || "image/png";
+      } else {
+        const response = await nativeFetch(src, { credentials: "include" });
+        if (!response.ok) throw new Error("生成图片下载失败：HTTP " + response.status);
+        const blob = await response.blob();
+        if (!/^image\/(png|jpeg|webp|gif|bmp|svg\+xml|avif)$/i.test(blob.type) || blob.size === 0 || blob.size > 20 * 1024 * 1024) continue;
+        mime = blob.type;
+        dataUrl = await blobToDataUrl(blob);
+      }
+      images.push({ data_url: dataUrl, mime_type: mime, width: img.naturalWidth, height: img.naturalHeight });
+      if (images.length >= 6) break;
+    }
+    return images;
+  }
+
+  function collectMediaAndDownloadCandidates(baselineMedia, baselineLinks) {
+    const candidates = [];
+    for (const el of querySelectorAllDeep('video, audio')) {
+      if (!isElementVisible(el) && el.tagName.toLowerCase() !== 'audio') continue;
+      const src = el.currentSrc || el.src || (el.querySelector && el.querySelector('source') ? el.querySelector('source').src : "");
+      if (src && !baselineMedia.has(src)) {
+        const kind = el.tagName.toLowerCase();
+        candidates.push({ url: src, name: `generated-${kind}.${kind === 'video' ? 'mp4' : 'wav'}`, category: kind });
+      }
+    }
+    for (const a of querySelectorAllDeep('a[download], a[href^="blob:"], a[href^="data:"]')) {
+      if (!isElementVisible(a)) continue;
+      const href = a.href || a.getAttribute("href") || "";
+      if (!href || baselineLinks.has(href)) continue;
+      const dlName = (a.getAttribute("download") || a.textContent || "").trim().slice(0, 100) || "generated-file";
+      candidates.push({ url: href, name: dlName, category: "file" });
+    }
+    return candidates;
+  }
+
+  async function readGeneratedFiles(candidates) {
+    const out = [];
+    const seen = new Set();
+    for (const item of candidates) {
+      if (!item.url || seen.has(item.url) || !isAllowedArtifactUrl(item.url)) continue;
+      seen.add(item.url);
+      try {
+        if (item.url.startsWith("data:")) {
+          const mime = item.url.slice(5).split(";")[0] || "application/octet-stream";
+          out.push({ data_url: item.url, mime_type: mime, name: item.name });
+        } else {
+          const response = await nativeFetch(item.url, { credentials: "include" });
+          if (!response.ok) continue;
+          const blob = await response.blob();
+          if (!blob || blob.size === 0 || blob.size > 80 * 1024 * 1024) continue;
+          if (/^text\/html/i.test(blob.type) && item.category !== "file") continue;
+          const dataUrl = await blobToDataUrl(blob);
+          out.push({ data_url: dataUrl, mime_type: blob.type || "application/octet-stream", name: item.name });
+        }
+      } catch (_) {}
+      if (out.length >= 6) break;
+    }
+    return out;
+  }
+
+  const mainAttachmentReassembly = new Map();
+
+  function findSuitableFileInput(files) {
+    const inputs = querySelectorAllDeep('input[type="file"]').filter((el) => !el.disabled);
+    if (inputs.length === 0) return null;
+    const needsNonImage = files.some((f) => !String(f.type || "").startsWith("image/"));
+    if (!needsNonImage) return inputs[0];
+    const unrestricted = inputs.find((el) => {
+      const accept = String(el.getAttribute("accept") || "").trim().toLowerCase();
+      return !accept || accept.includes("*/*") || accept.includes("pdf") || !/^image\/\*$/.test(accept);
+    });
+    return unrestricted || inputs[0];
+  }
+
+  async function attachFilesToComposer(attachments, onProgress = null) {
+    if (!attachments || attachments.length === 0) return;
+    const files = [];
+    for (const att of attachments) {
+      let dataUrl = att.data_url || "";
+      if (!dataUrl && att.chunked_att_key) {
+        const entry = mainAttachmentReassembly.get(att.chunked_att_key);
+        mainAttachmentReassembly.delete(att.chunked_att_key);
+        const total = att.total_chunks || (entry ? entry.total : 0);
+        dataUrl = assembleChunks(entry, total);
+      }
+      files.push(dataUrlToFile(dataUrl, att.name || "attachment.bin", att.mime_type || "application/octet-stream"));
+    }
+    let input = findSuitableFileInput(files);
+    if (!input) {
+      const composerInput = findComposerInput();
+      const composerHost = composerInput ? getComposerRootHost(composerInput) : null;
+      const addButton = querySelectorAllDeep('button, md-icon-button, ucs-icon-button, [role="button"]').find((el) => {
+        if (!isElementVisible(el) || el.disabled) return false;
+        const meta = `${el.getAttribute("aria-label") || ""} ${el.getAttribute("title") || ""} ${getElementTooltipOrLabel(el)} ${readButtonIconAndLabelText(el)}`;
+        if (/\b(add files|add files or sources|attach|upload files|add_circle)\b|添加文件|添加来源|上传文件|上传附件/i.test(meta)) {
+          return true;
+        }
+        return Boolean(composerHost && containsDeep(composerHost, el) && /^\s*(add|\+|attach_file)\s*$/i.test((el.textContent || "").trim()));
+      });
+      if (!addButton) throw new Error("当前网页没有文件上传入口。");
+      addButton.click();
+      await sleep(250);
+      input = findSuitableFileInput(files);
+      if (!input) {
+        const upload = querySelectorAllDeep('[role="menuitem"],md-menu-item,button,span,div').find((el) =>
+          /^(upload files?|upload from computer|upload|from computer|local files?|上传文件|从电脑上传|本地上传)$/i.test(stripIconLigatures(String(el.textContent || "").trim())) && isElementVisible(el));
+        if (upload) upload.click();
+      }
+      for (let attempt = 0; attempt < 25 && !input; attempt += 1) {
+        await sleep(200);
+        input = findSuitableFileInput(files);
+      }
+    }
+    if (!input) throw new Error("没有找到网页的文件输入框，附件未上传。");
+
+    const countRemovable = () => querySelectorAllDeep('button, md-icon-button, ucs-icon-button, [role="button"]').filter((el) =>
+      /remove file|remove attachment|delete file|delete attachment|cancel upload|删除附件|移除文件|移除附件/i.test(readButtonIconAndLabelText(el))).length;
+    const countAttachmentChips = () => querySelectorAllDeep('ucs-file-chip, ucs-attachment, ucs-context-chip, mat-chip, md-input-chip, [data-file-name]').filter(isElementVisible).length;
+    const composerInputForScope = findComposerInput();
+    const composerScope = (composerInputForScope && getComposerRootHost(composerInputForScope)) || document;
+    const readComposerScopedText = () =>
+      querySelectorAllDeep('*', composerScope)
+        .map((el) => (el.shadowRoot ? "" : (el.textContent || "")))
+        .join("\n");
+    const baselineScopedText = readComposerScopedText();
+    const baselineRemovable = countRemovable();
+    const baselineChips = countAttachmentChips();
+    const baselineImgs = querySelectorAllDeep('img', composerScope).length;
+
+    await assignFilesToInputElement(input, files);
+
+    const startedAt = Date.now();
+    let lastKeepalive = startedAt;
+    let sawUploadActivity = false;
+    while (Date.now() - startedAt < 120000) {
+      await sleep(350);
+      if (onProgress && Date.now() - lastKeepalive >= 7500) {
+        lastKeepalive = Date.now();
+        onProgress();
+      }
+      const scopedText = readComposerScopedText();
+      const errors = querySelectorAllDeep('[role="alert"], .mat-mdc-snack-bar-label, md-dialog').map((el) => el.textContent || "").join(" ");
+      if (/failed|unsupported|too large|cannot upload|not supported|exceeds|无法上传|上传失败|不支持|超过限制|过大/i.test(errors)) {
+        throw new Error("网页拒绝附件：" + errors.trim().slice(0, 240));
+      }
+      const pending = querySelectorAllDeep('[role="progressbar"],md-circular-progress,mat-progress-spinner,mat-spinner').some(isElementVisible);
+      if (pending) sawUploadActivity = true;
+      const chipAppeared =
+        countRemovable() >= baselineRemovable + files.length ||
+        countAttachmentChips() >= baselineChips + files.length ||
+        querySelectorAllDeep('img', composerScope).length >= baselineImgs + files.length ||
+        files.every((file) => !baselineScopedText.includes(file.name) && scopedText.includes(file.name));
+      if (chipAppeared) sawUploadActivity = true;
+      if (chipAppeared && !pending && (Date.now() - startedAt > 200 || typeof File === "undefined")) {
+        logDriver("info", `已上传 ${files.length} 个多模态附件 (${files.map((f) => f.name).join(", ")})。`);
+        return;
+      }
+      if (!sawUploadActivity && !pending && Date.now() - startedAt > 25000) {
+        throw new Error(`网页未响应附件上传 (${files.map((f) => f.name).join(", ")})，该文件格式可能不受当前网页输入框支持。`);
+      }
+    }
+    throw new Error("附件上传在时限内未完成，已停止发送，避免模型在缺失附件的情况下回答。");
+  }
+
+  const attachImagesToComposer = attachFilesToComposer;
+
   const REPLY_POSTMSG_CHUNK_THRESHOLD = 32768;
   const REPLY_POSTMSG_CHUNK_SIZE = 24576;
+  function assembleChunks(entry, total) {
+    if (!entry || !Number.isInteger(total) || total < 1 || total > 10000 || entry.total !== total || entry.parts.length !== total) {
+      throw new Error("传输分段缺失或数量不一致，已停止处理不完整内容。");
+    }
+    const parts = Array.from({length: total}, (_, index) => entry.parts[index]);
+    if (parts.some(part => typeof part !== "string")) {
+      throw new Error("传输分段缺失，已停止处理不完整内容。");
+    }
+    return parts.join("");
+  }
+
   const mainPromptReassembly = new Map();
-  const mainAttachmentReassembly = new Map();
 
   function cleanupRequestAttachments(requestId) {
     if (!requestId) return;
@@ -2617,6 +3049,28 @@
     const resolved = [];
     for (let i = 0; i < rawAttachments.length; i += 1) {
       const item = rawAttachments[i] || {};
+      const fname = String(item.filename || item.name || `attachment-${i + 1}.bin`);
+      const mime = String(item.mime_type || "application/octet-stream");
+      let dataUrl = String(item.data_url || "");
+      if (!dataUrl && item.chunked_att_key) {
+        const entry = mainAttachmentReassembly.get(item.chunked_att_key);
+        mainAttachmentReassembly.delete(item.chunked_att_key);
+        const total = item.total_chunks || (entry ? entry.total : 0);
+        dataUrl = assembleChunks(entry, total);
+      }
+      if (dataUrl) {
+        const b64Part = dataUrl.includes(",") ? dataUrl.split(",")[1] : dataUrl;
+        resolved.push({
+          id: String(item.id || `att-${i}`),
+          filename: fname,
+          name: fname,
+          mime_type: mime,
+          kind: String(item.kind || item.category || "file"),
+          data_url: dataUrl.startsWith("data:") ? dataUrl : `data:${mime};base64,${b64Part}`,
+          bytes: decodeBase64ToUint8Array(b64Part)
+        });
+        continue;
+      }
       const attId = String(item.id || `att-${i}`);
       const key = `${requestId}:${attId}`;
       const entry = mainAttachmentReassembly.get(key);
@@ -2626,19 +3080,23 @@
         dataB64 = item.data_b64;
       } else if (entry) {
         const total = item.total_chunks || entry.total || entry.parts.length;
-        dataB64 = Array.from({ length: total }, (_, idx) => entry.parts[idx] || "").join("");
+        dataB64 = assembleChunks(entry, total);
       }
       resolved.push({
         id: attId,
-        filename: String(item.filename || `attachment-${i + 1}.bin`),
-        mime_type: String(item.mime_type || "application/octet-stream"),
-        kind: String(item.kind || "file"),
+        filename: fname,
+        name: fname,
+        mime_type: mime,
+        kind: String(item.kind || item.category || "file"),
+        data_b64: dataB64,
+        data_url: `data:${mime};base64,${dataB64}`,
         bytes: item.bytes instanceof Uint8Array ? item.bytes : decodeBase64ToUint8Array(dataB64)
       });
     }
     cleanupRequestAttachments(requestId);
     return resolved;
   }
+
 
   function emitRequestComplete(payload) {
     const fullReply = String(payload.reply || "");
@@ -2668,13 +3126,16 @@
     request_id: requestId,
     prompt,
     attachments,
+    image_generation: imageGeneration,
+    video_generation: videoGeneration,
     callback_url: callbackUrl,
     target_model: targetModel,
     reset_chat: resetChat,
     timeout_ms: timeoutMs
   }) {
+    const mediaGenerationMode = Boolean(imageGeneration || videoGeneration);
     if (activeJob && !activeJob.cancelled) {
-      activeJob.cancelled = true;
+      stopJob(activeJob);
     }
 
     let domEmittedLen = 0;
@@ -2730,11 +3191,13 @@
       if (targetModel) {
         await ensureWebModelSelected(targetModel);
       }
+      assertJobActive(job);
 
-      // Optional Replay path if explicitly selected (bypassed when binary/file attachments are present)
-      if (!hasAttachments && driverConfig.driverMode === "replay" && sharedState.lastCapturedRpc) {
+      // Optional Replay path if explicitly selected
+      if (driverConfig.driverMode === "replay" && sharedState.lastCapturedRpc && !(attachments || []).length && !mediaGenerationMode) {
         try {
           const replayReply = await tryDirectFetchReplay(prompt, job, timeoutMs || 180000);
+          assertJobActive(job);
           emitRequestComplete({
             type: "request_complete",
             request_id: requestId,
@@ -2747,6 +3210,7 @@
           });
           return;
         } catch (replayErr) {
+          assertJobActive(job);
           logDriver("warn", "Replay 回退至 DOM 混合驱动: " + replayErr.message);
         }
       }
@@ -2765,25 +3229,56 @@
         );
       }
 
+      if (imageGeneration) await selectImageGenerationTool();
+      if (videoGeneration) await selectVideoGenerationTool();
+      const baselineImageSources = new Set(querySelectorAllDeep("img").map((img) => img.currentSrc || img.src).filter(Boolean));
+      const baselineMediaSources = new Set(querySelectorAllDeep("video, audio, source").map((m) => m.currentSrc || m.src).filter(Boolean));
+      const baselineDownloadLinks = new Set(querySelectorAllDeep('a[download], a[href^="blob:"], a[href^="data:"]').map((a) => a.href || a.getAttribute("href")).filter(Boolean));
       const baselineReplies = collectAssistantReplyTexts();
       const baselineCount = baselineReplies.length;
       const baselineLastText = baselineCount > 0 ? baselineReplies[baselineCount - 1] : "";
 
       let preSubmitChipCount = 0;
       if (hasAttachments) {
-        const uploadRes = await uploadAttachmentsToComposer(inputEl, resolvedAttachments);
+        const uploadRes = await uploadAttachmentsToComposer(inputEl, resolvedAttachments, () => {
+          lastActivityAt = Date.now();
+          emitToIsolated({ type: "request_progress", request_id: requestId, generating: true, dom_len: 0, net_len: 0 });
+        });
         preSubmitChipCount = Number(uploadRes.chipCount || 0);
         inputEl = findComposerInput() || inputEl;
       }
+      assertJobActive(job);
+      for (const img of querySelectorAllDeep("img")) {
+        const s = img.currentSrc || img.src;
+        if (s) baselineImageSources.add(s);
+      }
+      for (const m of querySelectorAllDeep("video, audio, source")) {
+        const s = m.currentSrc || m.src;
+        if (s) baselineMediaSources.add(s);
+      }
 
+      const collectNewTurnArtifacts = async (allowBriefWait = false) => {
+        if (allowBriefWait) {
+          const hasPendingImg = querySelectorAllDeep("img").some(
+            (img) => !baselineImageSources.has(img.currentSrc || img.src) && !img.complete && isElementVisible(img)
+          );
+          if (hasPendingImg) await sleep(600);
+        }
+        const imgNodes = generatedImageNodes(baselineImageSources);
+        const fileCandidates = collectMediaAndDownloadCandidates(baselineMediaSources, baselineDownloadLinks);
+        const outImages = imgNodes.length > 0 ? await readGeneratedImages(imgNodes) : [];
+        const outFiles = fileCandidates.length > 0 ? await readGeneratedFiles(fileCandidates) : [];
+        return { outImages, outFiles };
+      };
+      inputEl = findComposerInput() || inputEl;
       let effectivePrompt = promptText;
       if (promptText.trim().length > 0) {
         await fillInputWithPrompt(inputEl, promptText);
       } else if (hasAttachments && !findSendButton(inputEl)) {
-        // Some composer versions keep Send disabled unless at least a single space/period is typed
         await fillInputWithPrompt(inputEl, " ");
         effectivePrompt = " ";
       }
+      assertJobActive(job);
       const sendMethod = await submitComposerWithVerification(
         inputEl,
         effectivePrompt,
@@ -2791,13 +3286,13 @@
         baselineCount,
         { hadAttachments: hasAttachments, preSubmitChipCount }
       );
-
-      logDriver(
-        "info",
-        `已提交问题 (${sendMethod}, len=${promptText.length}, files=${resolvedAttachments.length})，等待响应流...`
-      );
+      logDriver("info", `已提交问题 (${sendMethod}, len=${prompt.length})，等待响应流...`);
 
       const startedAt = Date.now();
+      let lastDiagnosticAt = startedAt;
+      const toolLabels = querySelectorAllDeep('button,[role="button"]').map(readButtonIconAndLabelText)
+        .filter((label) => /create images|create videos?|select tools|生成图片|创建图片|生成视频|创建视频/i.test(label)).map((label) => label.slice(0, 120));
+      logDriver("info", "当前工具状态: " + JSON.stringify(toolLabels));
       lastActivityAt = Date.now();
       const idleTimeoutMs = Math.max(Number(timeoutMs) || 600000, 180000);
       const hardCapMs = 45 * 60 * 1000;
@@ -2810,12 +3305,16 @@
         Date.now() - lastActivityAt < idleTimeoutMs &&
         Date.now() - startedAt < hardCapMs
       ) {
+        assertJobActive(job);
         // Fast path: if passive network stream sniffer captured and completed the RPC!
-        if (driverConfig.driverMode !== "dom" && job.networkDone && job.networkText.trim()) {
+        if (!mediaGenerationMode && driverConfig.driverMode !== "dom" && job.networkDone && job.networkText.trim()) {
+          const { outImages, outFiles } = await collectNewTurnArtifacts(true);
           emitRequestComplete({
             type: "request_complete",
             request_id: requestId,
             reply: job.networkText,
+            output_images: outImages,
+            output_files: outFiles,
             callback_url: callbackUrl || "",
             citations: job.citations,
             source: "network_stream",
@@ -2826,13 +3325,17 @@
         }
 
         // Wait a short tick or immediate network completion
-        await Promise.race([networkCompletePromise, sleep(220)]);
+        await (job.networkDone ? sleep(220) : Promise.race([networkCompletePromise, sleep(220)]));
+        assertJobActive(job);
 
-        if (driverConfig.driverMode !== "dom" && job.networkDone && job.networkText.trim()) {
+        if (!mediaGenerationMode && driverConfig.driverMode !== "dom" && job.networkDone && job.networkText.trim()) {
+          const { outImages, outFiles } = await collectNewTurnArtifacts(true);
           emitRequestComplete({
             type: "request_complete",
             request_id: requestId,
             reply: job.networkText,
+            output_images: outImages,
+            output_files: outFiles,
             callback_url: callbackUrl || "",
             citations: job.citations,
             source: "network_stream",
@@ -2892,23 +3395,64 @@
           });
         }
         const idleMs = Date.now() - lastDomChangeAt;
+        if (Date.now() - lastDiagnosticAt >= 45000) {
+          lastDiagnosticAt = Date.now();
+          logDriver("info", "回复进度: " + JSON.stringify({ generating, dom: latestDomCandidate.length,
+            network: job.networkText.length, blocks: currentReplies.length, baseline: baselineCount }));
+        }
+        if (mediaGenerationMode && !generating && Date.now() - startedAt > 2000) {
+          const { outImages, outFiles } = await collectNewTurnArtifacts(false);
+          if (imageGeneration && outImages.length > 0) {
+            emitRequestComplete({
+              type: "request_complete",
+              request_id: requestId,
+              reply: job.networkText || latestDomCandidate || "",
+              output_images: outImages,
+              output_files: outFiles,
+              callback_url: callbackUrl || "",
+              source: "image_generation",
+              active_model: readDetectedWebModel() || sharedState.lastSelectedModel
+            });
+            return;
+          }
+          if (videoGeneration && (outFiles.length > 0 || outImages.length > 0)) {
+            emitRequestComplete({
+              type: "request_complete",
+              request_id: requestId,
+              reply: job.networkText || latestDomCandidate || "",
+              output_images: outImages,
+              output_files: outFiles,
+              callback_url: callbackUrl || "",
+              source: "video_generation",
+              active_model: readDetectedWebModel() || sharedState.lastSelectedModel
+            });
+            return;
+          }
+        }
 
-        if (sawDomGrowth && latestDomCandidate && !generating && idleMs >= 1500) {
-          const bestReply =
-            usingNetworkStream && job.networkText.trim().length >= latestDomCandidate.length
-              ? job.networkText
-              : latestDomCandidate;
-          emitRequestComplete({
-            type: "request_complete",
-            request_id: requestId,
-            reply: bestReply,
-            callback_url: callbackUrl || "",
-            citations: job.citations,
-            source: usingNetworkStream ? "hybrid_network_dom" : "shadow_dom",
-            captured_rpc: Boolean(sharedState.lastCapturedRpc),
-            active_model: readDetectedWebModel() || sharedState.lastSelectedModel
-          });
-          return;
+        if (!mediaGenerationMode && !generating && idleMs >= 1500) {
+          const { outImages, outFiles } = (sawDomGrowth || Date.now() - startedAt > 2500)
+            ? await collectNewTurnArtifacts(false)
+            : { outImages: [], outFiles: [] };
+          if ((sawDomGrowth && latestDomCandidate) || outImages.length > 0 || outFiles.length > 0) {
+            const bestReply =
+              usingNetworkStream && job.networkText.trim().length >= latestDomCandidate.length
+                ? job.networkText
+                : latestDomCandidate;
+            emitRequestComplete({
+              type: "request_complete",
+              request_id: requestId,
+              reply: bestReply,
+              output_images: outImages,
+              output_files: outFiles,
+              callback_url: callbackUrl || "",
+              citations: job.citations,
+              source: usingNetworkStream ? "hybrid_network_dom" : "shadow_dom",
+              captured_rpc: Boolean(sharedState.lastCapturedRpc),
+              active_model: readDetectedWebModel() || sharedState.lastSelectedModel
+            });
+            return;
+          }
         }
       }
 
@@ -2916,19 +3460,10 @@
         return;
       }
 
-      const fallbackText = (job.networkText || latestDomCandidate || "").trim();
-      if (fallbackText) {
-        emitRequestComplete({
-          type: "request_complete",
-          request_id: requestId,
-          reply: fallbackText,
-          callback_url: callbackUrl || "",
-          citations: job.citations,
-          source: "partial_timeout_recovery",
-          captured_rpc: Boolean(sharedState.lastCapturedRpc),
-          active_model: readDetectedWebModel() || sharedState.lastSelectedModel
-        });
-        return;
+      if (imageGeneration) throw new Error("网页没有返回可下载的真实图片。");
+      if (videoGeneration) throw new Error("网页没有返回可下载的真实视频。");
+      if ((job.networkText || latestDomCandidate || "").trim()) {
+        throw new Error("网页回复在时限内未完成，已停止返回不完整结果，请重试。");
       }
 
       throw new Error("等待 Gemini Enterprise 页面回复超时，请确认页面未处于重登录或验证码状态。");
@@ -2939,9 +3474,9 @@
           request_id: requestId,
           error: err && err.message ? err.message : String(err)
         });
+        stopJob(job);
       }
     } finally {
-      cleanupRequestAttachments(requestId);
       if (activeJob === job) {
         activeJob = null;
       }
@@ -3041,7 +3576,7 @@
     }
 
     if (action === "attachment_chunk") {
-      const key = `${payload.request_id}:${payload.attachment_id}`;
+      const key = payload.att_key || `${payload.request_id}:${payload.attachment_id}`;
       let entry = mainAttachmentReassembly.get(key);
       if (!entry) {
         entry = { parts: [], total: payload.total_chunks || 0 };
@@ -3069,9 +3604,12 @@
         const entry = mainPromptReassembly.get(payload.request_id);
         mainPromptReassembly.delete(payload.request_id);
         const total = payload.total_chunks || (entry ? entry.total : 0);
-        finalPrompt = entry
-          ? Array.from({ length: total }, (_, idx) => entry.parts[idx] || "").join("")
-          : "";
+        try {
+          finalPrompt = assembleChunks(entry, total);
+        } catch (error) {
+          emitToIsolated({type: "request_error", request_id: payload.request_id, error: error.message});
+          return;
+        }
       }
       void executePromptJob({ ...payload, prompt: finalPrompt, trustedPolicyReady: Boolean(trustedPolicy) });
       return;
@@ -3079,7 +3617,7 @@
 
     if (action === "cancel_request") {
       if (activeJob && (!payload.request_id || activeJob.requestId === payload.request_id)) {
-        activeJob.cancelled = true;
+        stopJob(activeJob);
       }
       return;
     }
@@ -3122,6 +3660,8 @@
     findComposerAttachButton,
     uploadAttachmentsToComposer,
     fillInputWithPrompt,
+    attachImagesToComposer,
+    attachFilesToComposer,
     submitComposer,
     submitComposerWithVerification,
     isPageStillGenerating,

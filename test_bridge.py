@@ -2697,3 +2697,27 @@ def test_sync_copilot_provider_limits_updates_only_gemini_bridge_models(tmp_path
     second = sync_copilot_provider_limits(db_path=db_file)
     assert second["ok"] is True
     assert second["models_updated"] == []
+
+
+def test_extension_github_release_cors_preflight_guard() -> None:
+    import fnmatch
+
+    repo_root = Path(__file__).resolve().parent
+    manifest_data = json.loads((repo_root / "manifest.json").read_text(encoding="utf-8"))
+    host_perms = manifest_data.get("host_permissions", [])
+
+    target_cdn_url = (
+        "https://release-assets.githubusercontent.com/github-production-release-asset/1/release-manifest.json"
+    )
+    assert any(fnmatch.fnmatch(target_cdn_url, pat) for pat in host_perms), (
+        f"manifest.json host_permissions {host_perms} must cover release-assets.githubusercontent.com"
+    )
+
+    bg_source = (repo_root / "background.js").read_text(encoding="utf-8")
+    assert "Cache-Control" not in bg_source, (
+        "background.js must not send non-CORS-safelisted Cache-Control request headers"
+    )
+    assert bg_source.index("api.github.com/repos/") < bg_source.index(
+        "releases/latest/download/release-manifest.json"
+    )
+    assert "if (!backendReturnedRemoteVersion)" in bg_source

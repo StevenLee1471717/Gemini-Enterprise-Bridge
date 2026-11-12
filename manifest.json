@@ -15,7 +15,7 @@
     "http://localhost/*",
     "https://api.github.com/*",
     "https://github.com/*",
-    "https://objects.githubusercontent.com/*"
+    "https://*.githubusercontent.com/*"
   ],
   "background": {
     "service_worker": "background.js"

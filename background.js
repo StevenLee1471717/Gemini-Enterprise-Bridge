@@ -879,30 +879,19 @@ async function syncExtensionDiskAndReload(targetVersionHint = "", forceManual = 
 
 async function checkGitHubReleaseDirectly(repo = DEFAULT_GITHUB_REPO) {
   const cleanRepo = String(repo || DEFAULT_GITHUB_REPO).trim().replace(/^\/+|\/+$/g, "");
-  const manifestUrl = `https://github.com/${cleanRepo}/releases/latest/download/release-manifest.json`;
   const latestApiUrl = `https://api.github.com/repos/${cleanRepo}/releases/latest`;
+  const manifestUrl = `https://github.com/${cleanRepo}/releases/latest/download/release-manifest.json`;
+  let apiErrMessage = "";
 
-  try {
-    const mfRes = await fetchJsonWithTimeout(
-      manifestUrl,
-      { headers: { Accept: "application/json", "Cache-Control": "no-cache" } },
-      7000
-    );
-    if (mfRes.ok && mfRes.data && mfRes.data.version) {
-      const ver = normalizeVersion(mfRes.data.version);
-      return {
-        ok: true,
-        version: ver,
-        releaseUrl:
-          mfRes.data.release_url || `https://github.com/${cleanRepo}/releases/tag/v${ver}`
-      };
-    }
-  } catch (_) {}
-
+  // 1. Prefer GitHub REST API first (native CORS support, zero cross-domain 302 redirects)
   try {
     const apiRes = await fetchJsonWithTimeout(
       latestApiUrl,
-      { headers: { Accept: "application/vnd.github+json" } },
+      {
+        cache: "no-store",
+        credentials: "omit",
+        headers: { Accept: "application/vnd.github+json" }
+      },
       7000
     );
     if (apiRes.ok && apiRes.data && apiRes.data.tag_name) {
@@ -915,9 +904,34 @@ async function checkGitHubReleaseDirectly(repo = DEFAULT_GITHUB_REPO) {
       };
     }
   } catch (err) {
-    return { ok: false, version: "", error: err.message };
+    apiErrMessage = err && err.message ? err.message : String(err || "");
   }
-  return { ok: false, version: "", error: "no_github_release" };
+
+  // 2. Fallback to release-manifest.json as a strict CORS-simple GET (no custom headers -> zero OPTIONS preflight)
+  try {
+    const mfRes = await fetchJsonWithTimeout(
+      manifestUrl,
+      { cache: "no-store" },
+      7000
+    );
+    if (mfRes.ok && mfRes.data && mfRes.data.version) {
+      const ver = normalizeVersion(mfRes.data.version);
+      return {
+        ok: true,
+        version: ver,
+        releaseUrl:
+          mfRes.data.release_url || `https://github.com/${cleanRepo}/releases/tag/v${ver}`
+      };
+    }
+  } catch (err) {
+    return {
+      ok: false,
+      version: "",
+      error: (err && err.message) || apiErrMessage || "github_release_unreachable"
+    };
+  }
+
+  return { ok: false, version: "", error: apiErrMessage || "no_github_release" };
 }
 
 async function checkUpdatesAndAutoSync(force = false) {
@@ -939,10 +953,11 @@ async function checkUpdatesAndAutoSync(force = false) {
     let lastCheckError = "";
 
     // Path A: Query local backend /api/update/status (supports private repos via gh CLI / token)
+    let backendReturnedRemoteVersion = false;
     try {
       const bRes = await fetchJsonWithTimeout(
         `${httpBase}/api/update/status?force=${force ? "true" : "false"}`,
-        { method: "GET" },
+        { method: "GET", cache: "no-store" },
         8500
       );
       if (bRes.ok && bRes.data) {
@@ -952,23 +967,28 @@ async function checkUpdatesAndAutoSync(force = false) {
         }
         if (bRes.data.latest_github_version) {
           const bRemote = normalizeVersion(bRes.data.latest_github_version);
-          if (!latestGitHubVer || compareSemver(bRemote, latestGitHubVer) >= 0) {
-            latestGitHubVer = bRemote;
+          if (bRemote) {
+            backendReturnedRemoteVersion = true;
+            if (!latestGitHubVer || compareSemver(bRemote, latestGitHubVer) >= 0) {
+              latestGitHubVer = bRemote;
+            }
           }
         }
         if (bRes.data.release_url) releaseUrl = bRes.data.release_url;
       }
     } catch (_) {}
 
-    // Path B: Directly poll GitHub Releases from MV3 Service Worker (works even when backend is offline/old)
-    const direct = await checkGitHubReleaseDirectly(githubRepo);
-    if (direct.ok && direct.version) {
-      if (!latestGitHubVer || compareSemver(direct.version, latestGitHubVer) >= 0) {
-        latestGitHubVer = direct.version;
-        if (direct.releaseUrl) releaseUrl = direct.releaseUrl;
+    // Path B: Only poll GitHub Releases directly from MV3 Service Worker when local backend is offline or omitted remote version
+    if (!backendReturnedRemoteVersion) {
+      const direct = await checkGitHubReleaseDirectly(githubRepo);
+      if (direct.ok && direct.version) {
+        if (!latestGitHubVer || compareSemver(direct.version, latestGitHubVer) >= 0) {
+          latestGitHubVer = direct.version;
+          if (direct.releaseUrl) releaseUrl = direct.releaseUrl;
+        }
+      } else if (!latestGitHubVer && direct.error) {
+        lastCheckError = direct.error;
       }
-    } else if (!latestGitHubVer && direct.error) {
-      lastCheckError = direct.error;
     }
 
     const extNewerThanBackend = Boolean(backendVer && compareSemver(extVer, backendVer) > 0);

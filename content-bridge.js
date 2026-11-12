@@ -53,6 +53,7 @@
   }
 
   const promptReassembly = new ReassemblyBuffer();
+  const attachmentReassembly = new ReassemblyBuffer();
   const replyReassembly = new ReassemblyBuffer();
 
   function unwrapInlineToolChunks(text) {
@@ -64,6 +65,35 @@
     if (message.driver_config) {
       postToMain("configure", message.driver_config);
     }
+    const rawAttachments = Array.isArray(message.attachments) ? message.attachments : [];
+    const mainAttachments = [];
+    for (const att of rawAttachments) {
+      if (!att || !att.id) continue;
+      const attKey = `${message.request_id}:${att.id}`;
+      const fullB64 =
+        typeof att.data_b64 === "string" && att.data_b64.length > 0
+          ? att.data_b64
+          : attachmentReassembly.assemble(attKey, att.total_chunks || 0);
+      const totalAttChunks = Math.max(1, Math.ceil(fullB64.length / MAIN_POSTMSG_CHUNK_SIZE));
+      for (let i = 0; i < totalAttChunks; i += 1) {
+        postToMain("attachment_chunk", {
+          request_id: message.request_id,
+          attachment_id: att.id,
+          chunk_index: i,
+          total_chunks: totalAttChunks,
+          data: fullB64.slice(i * MAIN_POSTMSG_CHUNK_SIZE, (i + 1) * MAIN_POSTMSG_CHUNK_SIZE)
+        });
+      }
+      mainAttachments.push({
+        id: att.id,
+        filename: att.filename || "attachment.bin",
+        mime_type: att.mime_type || "application/octet-stream",
+        kind: att.kind || "file",
+        size_bytes: Number(att.size_bytes || 0),
+        total_chunks: totalAttChunks
+      });
+    }
+
     const rawPrompt = message.chunked
       ? promptReassembly.assemble(message.request_id, message.total_chunks)
       : String(message.prompt || "");
@@ -84,6 +114,7 @@
         prompt: "",
         chunked: true,
         total_chunks: total,
+        attachments: mainAttachments,
         callback_url: message.callback_url || "",
         target_model: message.target_model || null,
         reset_chat: Boolean(message.reset_chat),
@@ -93,6 +124,7 @@
       postToMain("execute_prompt", {
         request_id: message.request_id,
         prompt: fullPrompt,
+        attachments: mainAttachments,
         callback_url: message.callback_url || "",
         target_model: message.target_model || null,
         reset_chat: Boolean(message.reset_chat),
@@ -346,6 +378,17 @@
     (async () => {
       const msgType = message && message.type ? message.type : "";
 
+      if (msgType === "GEB_ATTACHMENT_CHUNK") {
+        attachmentReassembly.addChunk(
+          `${message.request_id}:${message.attachment_id}`,
+          message.chunk_index,
+          message.total_chunks,
+          message.data
+        );
+        sendResponse({ ok: true });
+        return;
+      }
+
       if (msgType === "GEB_PROMPT_CHUNK") {
         promptReassembly.addChunk(
           message.request_id,
@@ -473,6 +516,9 @@
       } catch (_) {}
       keepalivePort = null;
     }
+    promptReassembly.clear();
+    attachmentReassembly.clear();
+    replyReassembly.clear();
     for (const [, p] of pendingRpcCalls) {
       clearTimeout(p.timer);
     }

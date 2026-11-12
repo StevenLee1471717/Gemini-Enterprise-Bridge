@@ -560,7 +560,7 @@ async function prepareTabForBackgroundExecution(tab) {
     await reloadWait;
     await new Promise((r) => setTimeout(r, 650));
     await ensureScriptsInjected(freshTab.id);
-    injectedTabVersions.set(freshTab.id, "2.5");
+    injectedTabVersions.set(freshTab.id, "2.6.0");
     try {
       freshTab = await chrome.tabs.get(freshTab.id);
     } catch (_) {}
@@ -603,7 +603,7 @@ async function spawnParallelWorkerTab(baseUrlHint = "") {
   await waitForTabComplete(created.id, 14000);
   await new Promise((r) => setTimeout(r, 600));
   await ensureScriptsInjected(created.id);
-  injectedTabVersions.set(created.id, "2.5");
+  injectedTabVersions.set(created.id, "2.6.0");
 
   let latest = created;
   try {
@@ -690,6 +690,51 @@ function deriveHttpBaseFromWs(wsUrl) {
 
 function deriveCallbackUrlFromWs(wsUrl) {
   return `${deriveHttpBaseFromWs(wsUrl)}/api/bridge/callback`;
+}
+
+function uint8ArrayToBase64(bytes) {
+  const chunkSize = 0x8000;
+  const parts = [];
+  for (let i = 0; i < bytes.length; i += chunkSize) {
+    const sub = bytes.subarray(i, i + chunkSize);
+    parts.push(String.fromCharCode.apply(null, sub));
+  }
+  return btoa(parts.join(""));
+}
+
+function resolveAttachmentUrl(att, wsUrl) {
+  const rawUrl = String((att && att.url) || "").trim();
+  if (/^https?:\/\//i.test(rawUrl)) {
+    return rawUrl;
+  }
+  const relPath = String((att && (att.path || att.url)) || "").trim();
+  if (!relPath) {
+    return "";
+  }
+  const base = deriveHttpBaseFromWs(wsUrl).replace(/\/+$/, "");
+  return relPath.startsWith("/") ? `${base}${relPath}` : `${base}/${relPath}`;
+}
+
+async function fetchAttachmentAsBase64(att, wsUrl, timeoutMs = 60000) {
+  if (att && typeof att.data_b64 === "string" && att.data_b64.length > 0) {
+    return att.data_b64;
+  }
+  const targetUrl = resolveAttachmentUrl(att, wsUrl);
+  if (!targetUrl) {
+    throw new Error(`附件 ${att && att.filename ? att.filename : ""} 缺少下载地址`);
+  }
+  const ctrl = new AbortController();
+  const timer = setTimeout(() => ctrl.abort(), timeoutMs);
+  try {
+    const resp = await fetch(targetUrl, { method: "GET", signal: ctrl.signal });
+    if (!resp.ok) {
+      throw new Error(`HTTP ${resp.status}`);
+    }
+    const buf = await resp.arrayBuffer();
+    return uint8ArrayToBase64(new Uint8Array(buf));
+  } finally {
+    clearTimeout(timer);
+  }
 }
 
 async function fetchJsonWithTimeout(url, options = {}, timeoutMs = 8000) {
@@ -1092,21 +1137,23 @@ async function handleBackendCommand(msg) {
     const reqTtlMs = Math.max(60000, Number(msg.timeout_ms) || 600000) + 15000;
     activeInFlightRequests.set(requestId, Date.now() + reqTtlMs);
     sendWsJson({ type: "request_ack", request_id: requestId, tab_id: rawTab.id });
+    const rawAttachments = Array.isArray(msg.attachments) ? msg.attachments : [];
     const tab = await prepareTabForBackgroundExecution(rawTab);
 
     await appendLog(
       "info",
       `Dispatching request ${String(requestId).slice(0, 8)} to tab #${tab.id}` +
         ` [len=${assembledPrompt.length}]` +
+        (rawAttachments.length > 0 ? ` [files=${rawAttachments.length}]` : "") +
         (tab.active ? "" : " [bg]") +
         (msg.target_model ? ` [model=${msg.target_model}]` : "") +
         (msg.reset_chat ? " [new_chat]" : "")
     );
 
     // Ensure hot-swapped latest page-driver.js & content-bridge.js are active on this tab (race-free per-tab map)
-    if (injectedTabVersions.get(tab.id) !== "2.5") {
+    if (injectedTabVersions.get(tab.id) !== "2.6.0") {
       await ensureScriptsInjected(tab.id);
-      injectedTabVersions.set(tab.id, "2.5");
+      injectedTabVersions.set(tab.id, "2.6.0");
     }
 
     let remainingResetChat = Boolean(msg.reset_chat);
@@ -1120,7 +1167,69 @@ async function handleBackendCommand(msg) {
     const settings = await getSettings();
     const callbackUrl = msg.callback_url || deriveCallbackUrlFromWs(settings.wsUrl);
 
+    const preparedAttachments = [];
+    if (rawAttachments.length > 0) {
+      try {
+        for (let idx = 0; idx < rawAttachments.length; idx += 1) {
+          const att = rawAttachments[idx] || {};
+          const attId = String(att.id || `att-${idx}`);
+          const dataB64 = await fetchAttachmentAsBase64(att, settings.wsUrl, 60000);
+          preparedAttachments.push({
+            id: attId,
+            filename: String(att.filename || `attachment-${idx + 1}.bin`),
+            mime_type: String(att.mime_type || "application/octet-stream"),
+            kind: String(att.kind || "file"),
+            size_bytes: Number(att.size_bytes || 0),
+            data_b64: dataB64
+          });
+        }
+      } catch (attErr) {
+        activeInFlightRequests.delete(requestId);
+        sendWsJson({
+          type: "request_error",
+          request_id: requestId,
+          error:
+            "下载本地暂存多模态附件失败: " +
+            (attErr && attErr.message ? attErr.message : String(attErr))
+        });
+        await maybeReloadPendingExtensionUpdate();
+        return;
+      }
+    }
+
     const dispatchToReadyTab = async () => {
+      const attachmentMetaList = [];
+      for (const att of preparedAttachments) {
+        const b64 = att.data_b64 || "";
+        const totalAttChunks = Math.max(1, Math.ceil(b64.length / TAB_IPC_CHUNK_SIZE));
+        for (let c = 0; c < totalAttChunks; c += 1) {
+          await chrome.tabs.sendMessage(tab.id, {
+            type: "GEB_ATTACHMENT_CHUNK",
+            request_id: requestId,
+            attachment_id: att.id,
+            chunk_index: c,
+            total_chunks: totalAttChunks,
+            data: b64.slice(c * TAB_IPC_CHUNK_SIZE, (c + 1) * TAB_IPC_CHUNK_SIZE)
+          });
+        }
+        attachmentMetaList.push({
+          id: att.id,
+          filename: att.filename,
+          mime_type: att.mime_type,
+          kind: att.kind,
+          size_bytes: att.size_bytes,
+          total_chunks: totalAttChunks
+        });
+      }
+
+      const driverConfigPayload = {
+        driverMode: settings.driverMode,
+        customModelSelector: settings.customModelSelector,
+        customInputSelector: settings.customInputSelector,
+        customSendSelector: settings.customSendSelector,
+        customReplySelector: settings.customReplySelector
+      };
+
       if (assembledPrompt.length > TAB_IPC_CHUNK_SIZE) {
         const totalChunks = Math.ceil(assembledPrompt.length / TAB_IPC_CHUNK_SIZE);
         for (let i = 0; i < totalChunks; i += 1) {
@@ -1138,17 +1247,12 @@ async function handleBackendCommand(msg) {
           prompt: "",
           chunked: true,
           total_chunks: totalChunks,
+          attachments: attachmentMetaList,
           callback_url: callbackUrl,
           target_model: msg.target_model || null,
           reset_chat: remainingResetChat,
           timeout_ms: msg.timeout_ms || 600000,
-          driver_config: {
-            driverMode: settings.driverMode,
-            customModelSelector: settings.customModelSelector,
-            customInputSelector: settings.customInputSelector,
-            customSendSelector: settings.customSendSelector,
-            customReplySelector: settings.customReplySelector
-          }
+          driver_config: driverConfigPayload
         });
       } else {
         await chrome.tabs.sendMessage(tab.id, {
@@ -1157,17 +1261,12 @@ async function handleBackendCommand(msg) {
           prompt: assembledPrompt,
           chunked: false,
           total_chunks: 0,
+          attachments: attachmentMetaList,
           callback_url: callbackUrl,
           target_model: msg.target_model || null,
           reset_chat: remainingResetChat,
           timeout_ms: msg.timeout_ms || 600000,
-          driver_config: {
-            driverMode: settings.driverMode,
-            customModelSelector: settings.customModelSelector,
-            customInputSelector: settings.customInputSelector,
-            customSendSelector: settings.customSendSelector,
-            customReplySelector: settings.customReplySelector
-          }
+          driver_config: driverConfigPayload
         });
       }
     };

@@ -7,7 +7,10 @@ import re
 import time
 import uuid
 from typing import Any, Dict, List, Optional, Union
+
 from pydantic import BaseModel, Field
+
+from multimodal import NormalizedAttachment, extract_attachments_from_content
 
 try:
     from pydantic import ConfigDict
@@ -39,9 +42,26 @@ class ChatMessage(_FlexibleModel):
     tool_calls: Optional[List[Dict[str, Any]]] = None
     function_call: Optional[Dict[str, Any]] = None
     tool_call_id: Optional[str] = None
+    images: Optional[List[Any]] = None
+    files: Optional[List[Any]] = None
+    attachments: Optional[List[Any]] = None
+    audio: Optional[Dict[str, Any]] = None
 
     def text_content(self) -> str:
         return extract_text_content(self.content)
+
+    def extract_attachments(self) -> List[NormalizedAttachment]:
+        extra_files: List[Any] = []
+        if isinstance(self.files, list):
+            extra_files.extend(self.files)
+        if isinstance(self.attachments, list):
+            extra_files.extend(self.attachments)
+        return extract_attachments_from_content(
+            self.content,
+            extra_images=self.images,
+            extra_files=extra_files or None,
+            extra_audio=self.audio if isinstance(self.audio, dict) else None,
+        )
 
     def normalized_tool_calls(self) -> List[Dict[str, Any]]:
         """Return normalized OpenAI tool_calls from `tool_calls`, legacy `function_call`, or `tool_use` blocks."""
@@ -201,10 +221,10 @@ def extract_text_content(content: Optional[Union[str, List[Any]]]) -> str:
             elif part_type == "tool_result":
                 call_id = str(item.get("tool_use_id") or item.get("tool_call_id") or "")
                 inner = extract_text_content(item.get("content"))
+                if not inner and extract_attachments_from_content(item.get("content")):
+                    inner = "[Attached file(s) in tool result]"
                 header = f'[TOOL_RESULT call_id="{call_id}"]' if call_id else "[TOOL_RESULT]"
                 parts.append(f"{header}\n{inner}\n[/TOOL_RESULT]")
-            elif part_type == "image_url":
-                parts.append("[Image attachment omitted in text bridge]")
         return "\n".join(p for p in parts if p)
     return str(content)
 

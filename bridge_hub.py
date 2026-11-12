@@ -6,13 +6,16 @@ import asyncio
 import contextlib
 import logging
 import re
+import secrets
 import time
+import urllib.parse
 import uuid
 from dataclasses import dataclass, field
 from typing import Any, AsyncIterator, Callable, Dict, List, Optional, Sequence, Set
 
 from fastapi import WebSocket
 
+from multimodal import NormalizedAttachment
 from updater import compare_semver, normalize_version
 from version import APP_VERSION
 
@@ -157,6 +160,19 @@ class InFlightRequest:
 
 PROMPT_CHUNK_THRESHOLD = 32768
 PROMPT_CHUNK_SIZE = 24576
+ATTACHMENT_STAGE_TTL_SECONDS = 900.0
+
+
+@dataclass
+class StagedAttachment:
+    attachment_id: str
+    token: str
+    filename: str
+    mime_type: str
+    data: bytes
+    sha256: str
+    created_at: float = field(default_factory=time.time)
+    expires_at: float = 0.0
 
 
 class BrowserBridgeHub:
@@ -182,6 +198,7 @@ class BrowserBridgeHub:
         self._session_affinity: Dict[str, str] = {}  # explicit_session_id -> slot_key
         self._pending: Dict[str, InFlightRequest] = {}
         self._pending_spawns: Dict[str, asyncio.Future[Dict[str, Any]]] = {}
+        self._staged_attachments: Dict[str, StagedAttachment] = {}
         self._routing_lock = asyncio.Lock()
         self._total_requests = 0
         self._total_errors = 0
@@ -1025,9 +1042,77 @@ class BrowserBridgeHub:
         return ranked[0]
 
     # ------------------------------------------------------------------
+    # Multimodal Attachment Staging (Token-Guarded Local Binary Store)
+    # ------------------------------------------------------------------
+    def prune_expired_attachments(self) -> None:
+        now = time.time()
+        for att_id, item in list(self._staged_attachments.items()):
+            if item.expires_at <= now:
+                self._staged_attachments.pop(att_id, None)
+
+    async def stage_attachments(
+        self,
+        attachments: Sequence[NormalizedAttachment],
+        ttl_seconds: float = ATTACHMENT_STAGE_TTL_SECONDS,
+    ) -> List[Dict[str, Any]]:
+        """Resolve attachment bytes (including remote HTTP URLs) and stage on token-guarded URLs."""
+        self.prune_expired_attachments()
+        if not attachments:
+            return []
+        now = time.time()
+        expires_at = now + max(60.0, ttl_seconds)
+        staged_list: List[Dict[str, Any]] = []
+        for att in attachments:
+            try:
+                raw_bytes = await att.async_resolve_bytes()
+            except Exception as exc:
+                raise BridgeExecutionError(f"无法读取或下载多模态附件 '{att.filename}': {exc}") from exc
+            att_id = uuid.uuid4().hex
+            token = secrets.token_urlsafe(24)
+            record = StagedAttachment(
+                attachment_id=att_id,
+                token=token,
+                filename=att.filename,
+                mime_type=att.mime_type,
+                data=raw_bytes,
+                sha256=att.sha256,
+                created_at=now,
+                expires_at=expires_at,
+            )
+            self._staged_attachments[att_id] = record
+            rel_path = f"/api/bridge/attachments/{att_id}?token={urllib.parse.quote(token, safe='')}"
+            full_url = f"{self.callback_base_url}{rel_path}" if self.callback_base_url else rel_path
+            staged_list.append(
+                {
+                    "id": att_id,
+                    "filename": att.filename,
+                    "mime_type": att.mime_type,
+                    "kind": att.kind,
+                    "media_kind": att.kind,
+                    "size_bytes": len(raw_bytes),
+                    "sha256": att.sha256,
+                    "url": full_url,
+                    "path": rel_path,
+                }
+            )
+        return staged_list
+
+    def verify_staged_attachment(self, attachment_id: str, token: str) -> tuple[Optional[StagedAttachment], str]:
+        self.prune_expired_attachments()
+        item = self._staged_attachments.get(attachment_id)
+        if item is None:
+            return None, "not_found"
+        if not token or not secrets.compare_digest(item.token, token):
+            return None, "forbidden"
+        return item, "ok"
+
+    def get_staged_attachment(self, attachment_id: str, token: str) -> Optional[StagedAttachment]:
+        item, _ = self.verify_staged_attachment(attachment_id, token)
+        return item
+
+    # ------------------------------------------------------------------
     # Prompt Dispatch & Streaming Pipeline (Per-Slot Parallel Execution)
     # ------------------------------------------------------------------
-
     async def dispatch_stream_on_slot(
         self,
         slot: WorkerSlot,
@@ -1036,11 +1121,13 @@ class BrowserBridgeHub:
         reset_chat: bool = False,
         suppress_citations: bool = False,
         request_timeout: float = 600.0,
+        attachments: Optional[Sequence[NormalizedAttachment]] = None,
     ) -> AsyncIterator[str]:
         """Execute a prompt on an already-acquired `WorkerSlot` without blocking other slots."""
         self._total_requests += 1
         sanitized_prompt = prompt.replace("\x00", "")
         req_id = uuid.uuid4().hex
+
         client = self._clients.get(slot.client_id)
         if client is None or not client.is_alive():
             self._total_errors += 1
@@ -1048,8 +1135,14 @@ class BrowserBridgeHub:
 
         slot.in_flight_request_id = req_id
         completed_normally = False
-
+        staged_ids: List[str] = []
         try:
+            staged_attachments = (
+                await self.stage_attachments(attachments, ttl_seconds=max(request_timeout, ATTACHMENT_STAGE_TTL_SECONDS))
+                if attachments
+                else []
+            )
+            staged_ids = [item["id"] for item in staged_attachments]
             inflight = InFlightRequest(
                 request_id=req_id,
                 client_id=client.client_id,
@@ -1061,7 +1154,6 @@ class BrowserBridgeHub:
                 target_model=target_model,
             )
             self._pending[req_id] = inflight
-
             callback_url = (
                 f"{self.callback_base_url}/api/bridge/callback"
                 if self.callback_base_url
@@ -1109,9 +1201,10 @@ class BrowserBridgeHub:
                     "timeout_ms": int(request_timeout * 1000),
                     "callback_url": callback_url,
                 }
+            if staged_attachments:
+                command["attachments"] = staged_attachments
             if slot.tab_id is not None:
                 command["tab_id"] = slot.tab_id
-
             await self._send_command_to_client(client, command)
 
             emitted_parts: List[str] = []
@@ -1171,6 +1264,12 @@ class BrowserBridgeHub:
         finally:
             self._pending.pop(req_id, None)
             slot.in_flight_request_id = None
+            grace_exp = time.time() + 45.0
+            for sid in staged_ids:
+                st = self._staged_attachments.get(sid)
+                if st is not None:
+                    st.expires_at = min(st.expires_at, grace_exp)
+            self.prune_expired_attachments()
             if not completed_normally and client is not None:
                 await self._send_cancel_safely(client, req_id, tab_id=slot.tab_id)
 
@@ -1182,6 +1281,7 @@ class BrowserBridgeHub:
         reset_chat: bool = False,
         suppress_citations: bool = False,
         request_timeout: float = 600.0,
+        attachments: Optional[Sequence[NormalizedAttachment]] = None,
     ) -> str:
         chunks: List[str] = []
         async for delta in self.dispatch_stream_on_slot(
@@ -1191,6 +1291,7 @@ class BrowserBridgeHub:
             reset_chat=reset_chat,
             suppress_citations=suppress_citations,
             request_timeout=request_timeout,
+            attachments=attachments,
         ):
             if delta:
                 chunks.append(delta)
@@ -1206,6 +1307,7 @@ class BrowserBridgeHub:
         queue_timeout: float = 300.0,
         explicit_session_id: Optional[str] = None,
         matching_slot_keys: Optional[Sequence[str]] = None,
+        attachments: Optional[Sequence[NormalizedAttachment]] = None,
     ) -> AsyncIterator[str]:
         """Acquire a parallel worker slot and stream chunks."""
         async with self.acquire_slot(
@@ -1220,6 +1322,7 @@ class BrowserBridgeHub:
                 reset_chat=reset_chat,
                 suppress_citations=suppress_citations,
                 request_timeout=request_timeout,
+                attachments=attachments,
             ):
                 yield delta
 
@@ -1233,6 +1336,7 @@ class BrowserBridgeHub:
         queue_timeout: float = 300.0,
         explicit_session_id: Optional[str] = None,
         matching_slot_keys: Optional[Sequence[str]] = None,
+        attachments: Optional[Sequence[NormalizedAttachment]] = None,
     ) -> str:
         chunks: List[str] = []
         async for delta in self.dispatch_stream(
@@ -1244,6 +1348,7 @@ class BrowserBridgeHub:
             queue_timeout=queue_timeout,
             explicit_session_id=explicit_session_id,
             matching_slot_keys=matching_slot_keys,
+            attachments=attachments,
         ):
             if delta:
                 chunks.append(delta)

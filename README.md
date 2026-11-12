@@ -130,6 +130,15 @@ resp = client.chat.completions.create(
 print(resp.choices[0].message.tool_calls)
 ```
 
+### 2.5 全类型多模态文件与媒体直传（图片 / 视频 / 音频 / PDF / Office / 代码文档）
+
+原生兼容 OpenAI / Cursor / NextChat / Cherry Studio / Anthropic 风格的多模态消息结构（`image_url`、`input_audio`、`audio_url`、`video_url`、`file`、`input_file`、`document`、Data URL、Base64、HTTP(S) 链接、`gs://` URI 与本机文件路径）：
+
+- **全模态文件覆盖与魔数自动嗅探 (`multimodal.py`)**：原生支持图片（PNG/JPEG/WebP/GIF/SVG 等）、视频（MP4/WebM/MOV/AVI/MKV 等）、音频（WAV/MP3/OGG/FLAC/AAC/M4A 等）、文档（PDF、Word `.docx`、Excel `.xlsx`、PPT `.pptx`）以及 Markdown / JSON / CSV / 代码源文件，自动通过文件头魔数与 OOXML ZIP 结构识别真实 MIME 类型。
+- **本地受令牌保护的二进制暂存与分块中继 (`/api/bridge/attachments/{id}`)**：大体积音视频、高清图片与 PDF 无需塞入单帧 WebSocket JSON，由网关签发一次性受保护令牌暂存，MV3 Service Worker（或油猴 `GM_xmlhttpRequest`）拉取二进制流并分块重组为原生浏览器 `File` 对象，穿透多层 Shadow DOM 自动挂载至 Gemini Enterprise 输入框（优先 `<input type="file">`，支持拦截 `+` 附件菜单动态文件选择器及 `DataTransfer` 粘贴/拖拽兜底，全程零 `.innerHTML` 严格满足 `Trusted Types`）并等待上传进度完成后自动提交。
+- **多轮对话附件增量去重 (`smart_incremental_delta`)**：同一会话后续追问自动通过 SHA-256 指纹识别历史轮次已上传过的图片/文档，**仅上传当前轮新增附件**；新建或切换会话（`reset_chat=True`）时自动完整附带所需文件。
+- **官方 GCloud 模式同步适配 (`gcloud_provider.py`)**：Vertex AI Gemini 自动映射 `fileData`（`gs://`）、`inlineData`（图片/音频/视频/PDF）并对 Office/代码文本文件自动提取结构化正文；Discovery Engine `streamAssist` 自动内联文档与表格文本。
+
 ### 3. 多会话真并行工作池 + 后台自动扩容 (`WorkerSlot` Pool & Auto-Spawn)
 不再受限于全局单会话串行锁——支持在多个客户端窗口、多个 Copilot / Cursor / Cline 智能体会话中**同时并发调用** Gemini Enterprise：
 - **每标签页独立并发锁 (`WorkerSlot`)**：每个已打开的 `vertexaisearch.cloud.google.com` 标签页（包含不同 `/u/0/`、`/u/3/` 账号标签页或不同浏览器实例）均注册为独立并行工作槽位，多个会话可同时流式生成且互不阻塞。
@@ -196,7 +205,8 @@ I:\Projects\Gemini-Enterprise-Bridge\
 ├── updater.py                        # 零外部依赖 GitHub Releases 自动更新器（SHA-256 校验 + 配置保护）
 ├── server.py                         # FastAPI 主入口（支持 python server.py 直接运行）
 ├── config.py                         # 环境变量与 .env 配置加载
-├── schemas.py                        # OpenAI 兼容模型、工具参数与网页模型别名解析器
+├── multimodal.py                     # 多模态文件/音视频/图片/Office 文档归一化、嗅探与文本提取器
+├── schemas.py                        # OpenAI 兼容模型、多模态消息、工具参数与网页模型别名解析器
 ├── tool_calling.py                   # DOM 免疫工具调用协议、多级容错解析与 SSE 流式拦截器
 ├── context_builder.py                # 多轮对话与 Agentic Loop 智能增量上下文构建器 + 实时窗口水位监控
 ├── usage_stats.py                    # 官方 Google Gemini API 定价引擎与持久化用量等价账本

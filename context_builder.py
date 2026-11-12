@@ -3,10 +3,11 @@
 from __future__ import annotations
 
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Sequence, Tuple
-
 import time
+
+from multimodal import NormalizedAttachment, deduplicate_attachments, estimate_attachment_tokens
 from schemas import ChatMessage, estimate_tokens, model_requests_new_chat, resolve_target_web_model
 from usage_stats import DEFAULT_CONTEXT_WINDOW, get_context_window_for_model
 from tool_calling import (
@@ -38,6 +39,15 @@ def _canonicalize_for_match(role: str, text: str) -> str:
 
 
 @dataclass
+class _DialogueEntry:
+    role: str
+    display_text: str
+    match_text: str
+    history_text: str
+    attachments: List[NormalizedAttachment] = field(default_factory=list)
+
+
+@dataclass
 class PreparedPrompt:
     prompt: str
     reset_chat: bool
@@ -52,6 +62,7 @@ class PreparedPrompt:
     logical_prompt_tokens: int = 0
     cached_prefix_tokens: int = 0
     delta_prompt_tokens: int = 0
+    attachments: List[NormalizedAttachment] = field(default_factory=list)
 
 
 class ConversationContextBuilder:
@@ -142,18 +153,30 @@ class ConversationContextBuilder:
         return (False, "")
 
     @staticmethod
-    def _normalize_messages(messages: Sequence[ChatMessage]) -> Tuple[str, List[Tuple[str, str]]]:
+    def _normalize_message_entries(
+        messages: Sequence[ChatMessage],
+    ) -> Tuple[str, List[_DialogueEntry], List[NormalizedAttachment]]:
         system_parts: List[str] = []
-        dialogue: List[Tuple[str, str]] = []
+        system_attachments: List[NormalizedAttachment] = []
+        entries: List[_DialogueEntry] = []
         call_id_to_name: Dict[str, str] = {}
 
         for msg in messages:
             role = (msg.role or "user").strip().lower()
             text = msg.text_content().strip()
+            atts = msg.extract_attachments()
 
             if role in {"system", "developer"}:
                 if text:
                     system_parts.append(text)
+                for att in atts:
+                    extracted_sys = att.extract_text_fallback()
+                    if extracted_sys:
+                        system_parts.append(
+                            f"[System Reference File: {att.filename}]\n{extracted_sys}"
+                        )
+                    else:
+                        system_attachments.append(att)
                 continue
 
             if role == "assistant":
@@ -165,27 +188,71 @@ class ConversationContextBuilder:
                         call_id_to_name[tc_id] = fn_name
                 if tcs:
                     canon_asst = format_assistant_history_entry(text, tcs)
-                    dialogue.append(("assistant", canon_asst))
+                    entries.append(
+                        _DialogueEntry(
+                            role="assistant",
+                            display_text=canon_asst,
+                            match_text=canon_asst,
+                            history_text=canon_asst,
+                        )
+                    )
                 elif text:
-                    dialogue.append(("assistant", text))
+                    entries.append(
+                        _DialogueEntry(
+                            role="assistant",
+                            display_text=text,
+                            match_text=text,
+                            history_text=text,
+                        )
+                    )
                 continue
 
             if role in {"tool", "function"}:
                 resolved_name = msg.name or (
                     call_id_to_name.get(msg.tool_call_id) if msg.tool_call_id else None
                 )
+                eff_tool_text = text or ("[Attached file(s) in tool output]" if atts else "")
                 formatted_tool = format_tool_result_entry(
-                    text,
+                    eff_tool_text,
                     tool_call_id=msg.tool_call_id,
                     name=resolved_name,
                 )
-                dialogue.append(("tool", formatted_tool))
+                att_fp = " ".join(a.fingerprint_tag() for a in atts)
+                att_notes = "\n".join(a.history_note() for a in atts)
+                match_t = f"{formatted_tool}\n{att_fp}".strip() if att_fp else formatted_tool
+                hist_t = f"{formatted_tool}\n{att_notes}".strip() if att_notes else formatted_tool
+                entries.append(
+                    _DialogueEntry(
+                        role="tool",
+                        display_text=formatted_tool,
+                        match_text=match_t,
+                        history_text=hist_t,
+                        attachments=atts,
+                    )
+                )
                 continue
 
-            if text:
-                dialogue.append(("user", text))
+            if text or atts:
+                att_fp = " ".join(a.fingerprint_tag() for a in atts)
+                att_notes = "\n".join(a.history_note() for a in atts)
+                match_t = f"{text}\n{att_fp}".strip() if att_fp else text
+                hist_t = f"{text}\n{att_notes}".strip() if att_notes else text
+                entries.append(
+                    _DialogueEntry(
+                        role="user",
+                        display_text=text,
+                        match_text=match_t,
+                        history_text=hist_t,
+                        attachments=atts,
+                    )
+                )
 
-        return ("\n\n".join(system_parts).strip(), dialogue)
+        return ("\n\n".join(system_parts).strip(), entries, system_attachments)
+
+    @classmethod
+    def _normalize_messages(cls, messages: Sequence[ChatMessage]) -> Tuple[str, List[Tuple[str, str]]]:
+        sys_text, entries, _ = cls._normalize_message_entries(messages)
+        return (sys_text, [(e.role, e.match_text) for e in entries])
 
     def find_matching_slots(
         self,
@@ -305,7 +372,12 @@ class ConversationContextBuilder:
             else ""
         )
 
-        user_system_text, dialogue = self._normalize_messages(messages)
+        user_system_text, entries, system_attachments = self._normalize_message_entries(messages)
+        dialogue = [(e.role, e.match_text) for e in entries]
+        all_dialogue_atts = deduplicate_attachments(
+            [*system_attachments, *(a for e in entries for a in e.attachments)]
+        )
+        all_att_tokens = sum(estimate_attachment_tokens(a) for a in all_dialogue_atts)
 
         tool_sys_text = build_tool_system_instructions(
             norm_tools,
@@ -316,10 +388,9 @@ class ConversationContextBuilder:
 
         combined_sys_sections = [s for s in (user_system_text, tool_sys_text, fmt_sys_text) if s]
         combined_system_text = "\n\n".join(combined_sys_sections).strip()
+
         sys_tokens = estimate_tokens("\n\n".join(s for s in (user_system_text, fmt_sys_text) if s))
         tools_tokens = estimate_tokens(tool_sys_text)
-        dialogue_tokens = sum(estimate_tokens(txt) for _, txt in dialogue)
-        logical_prompt_tokens = sys_tokens + tools_tokens + dialogue_tokens
         prev_tracked_before = list(self._session_turns.get(session_key) or [])
 
         def _finalize_prepared(
@@ -328,9 +399,12 @@ class ConversationContextBuilder:
             strategy: str,
             norm_hist: List[Tuple[str, str]],
             cached_prefix: int = 0,
+            selected_attachments: Optional[List[NormalizedAttachment]] = None,
         ) -> PreparedPrompt:
-            delta_toks = estimate_tokens(prompt_str)
-            eff_hist_toks = sum(estimate_tokens(t) for _, t in norm_hist)
+            eff_atts = list(selected_attachments or [])
+            delta_att_toks = sum(estimate_attachment_tokens(a) for a in eff_atts)
+            delta_toks = estimate_tokens(prompt_str) + delta_att_toks
+            eff_hist_toks = sum(estimate_tokens(t) for _, t in norm_hist) + all_att_tokens
             eff_logical = max(sys_tokens + tools_tokens + eff_hist_toks, 1)
             eff_cached = min(eff_logical, max(0, cached_prefix))
             eff_model = target_model or self._session_models.get(session_key)
@@ -370,10 +444,11 @@ class ConversationContextBuilder:
                 logical_prompt_tokens=eff_logical,
                 cached_prefix_tokens=eff_cached,
                 delta_prompt_tokens=delta_toks,
+                attachments=eff_atts,
             )
 
-        if not dialogue:
-            fallback_prompt = combined_system_text or "Hello"
+        if not entries:
+            fallback_prompt = combined_system_text or ("" if system_attachments else "Hello")
             reset_only_sys = explicit_new_chat or self.auto_reset_new_chat
             if reset_only_sys:
                 self.clear_session(session_key)
@@ -381,21 +456,37 @@ class ConversationContextBuilder:
                 prompt_str=fallback_prompt,
                 reset_flag=reset_only_sys,
                 strategy="system_only",
-                norm_hist=[("user", fallback_prompt)],
+                norm_hist=[("user", fallback_prompt or "[System Attachments]")],
+                selected_attachments=deduplicate_attachments(system_attachments),
             )
 
         # Check inline [NEW_CHAT] directive on trailing user turn
-        if dialogue[-1][0] == "user" and dialogue[-1][1].startswith("[NEW_CHAT]"):
+        if entries[-1].role == "user" and (
+            entries[-1].display_text.startswith("[NEW_CHAT]")
+            or entries[-1].match_text.startswith("[NEW_CHAT]")
+        ):
             explicit_new_chat = True
-            stripped_user = dialogue[-1][1][len("[NEW_CHAT]") :].lstrip()
-            dialogue[-1] = ("user", stripped_user)
+            stripped_user = (
+                entries[-1].display_text[len("[NEW_CHAT]") :].lstrip()
+                if entries[-1].display_text.startswith("[NEW_CHAT]")
+                else entries[-1].display_text
+            )
+            att_fp = " ".join(a.fingerprint_tag() for a in entries[-1].attachments)
+            att_notes = "\n".join(a.history_note() for a in entries[-1].attachments)
+            entries[-1] = _DialogueEntry(
+                role="user",
+                display_text=stripped_user,
+                match_text=f"{stripped_user}\n{att_fp}".strip() if att_fp else stripped_user,
+                history_text=f"{stripped_user}\n{att_notes}".strip() if att_notes else stripped_user,
+                attachments=entries[-1].attachments,
+            )
+            dialogue = [(e.role, e.match_text) for e in entries]
 
         if explicit_new_chat:
             self.clear_session(session_key)
 
-        has_trailing_tool_results = any(
-            r == "tool" for r, _ in self._trailing_non_assistant_slice(dialogue)
-        )
+        tail_entries = self._trailing_non_assistant_entries(entries)
+        has_trailing_tool_results = any(e.role == "tool" for e in tail_entries)
         delta_reminder = build_tool_delta_reminder(
             norm_tools,
             tool_choice=tool_choice,
@@ -407,32 +498,42 @@ class ConversationContextBuilder:
             self._session_models[session_key] = target_model
 
         if mode == "last_message":
-            tail_prompt = self._format_delta_entries(
-                self._trailing_non_assistant_slice(dialogue) or [dialogue[-1]],
-                extra_instructions=[fmt_sys_text, delta_reminder] if len(dialogue) > 1 else [],
+            chosen_tail = tail_entries or [entries[-1]]
+            tail_atts = deduplicate_attachments(
+                [
+                    *(system_attachments if len(entries) == 1 else []),
+                    *(a for e in chosen_tail for a in e.attachments),
+                ]
             )
-            reset_last = explicit_new_chat or (self.auto_reset_new_chat and len(dialogue) == 1)
+            tail_prompt = self._format_delta_entries(
+                [(e.role, e.display_text) for e in chosen_tail],
+                extra_instructions=[fmt_sys_text, delta_reminder] if len(entries) > 1 else [],
+                has_attachments=bool(tail_atts),
+            )
+            reset_last = explicit_new_chat or (self.auto_reset_new_chat and len(entries) == 1)
             if reset_last:
                 self.clear_session(session_key)
             prompt = self._with_system_if_first_turn(
                 last_text=tail_prompt,
                 system_text=combined_system_text,
-                is_first_turn=len(dialogue) == 1,
+                is_first_turn=len(entries) == 1,
+                has_attachments=bool(tail_atts),
             )
             return _finalize_prepared(
                 prompt_str=prompt,
                 reset_flag=reset_last,
                 strategy="last_message",
                 norm_hist=dialogue,
+                selected_attachments=tail_atts,
             )
 
         if mode == "transcript":
             reset_trans = explicit_new_chat or self.auto_reset_new_chat
             if reset_trans:
                 self.clear_session(session_key)
-            prompt = self._format_full_transcript(
+            prompt = self._format_full_transcript_entries(
                 system_text=combined_system_text,
-                dialogue=dialogue,
+                entries=entries,
                 trailing_reminder=delta_reminder,
             )
             return _finalize_prepared(
@@ -440,29 +541,30 @@ class ConversationContextBuilder:
                 reset_flag=reset_trans,
                 strategy="transcript",
                 norm_hist=dialogue,
+                selected_attachments=all_dialogue_atts,
             )
 
         # Smart mode:
         # 1) Single-turn user prompt -> brand-new local conversation!
-        #    When `auto_reset_new_chat` is True (default), ALWAYS reset_chat=True (even on the first
-        #    request after server startup, in case the browser tab already has an old `/r/session/...` open;
-        #    page-driver.js fast-paths in 0ms if the tab is already on a blank new chat).
-        if len(dialogue) == 1 and dialogue[0][0] == "user":
+        if len(entries) == 1 and entries[0].role == "user":
             reset_chat = explicit_new_chat or self.auto_reset_new_chat
             if reset_chat:
                 self.clear_session(session_key)
                 if target_model is not None:
                     self._session_models[session_key] = target_model
+            single_atts = deduplicate_attachments([*system_attachments, *entries[0].attachments])
             prompt = self._with_system_if_first_turn(
-                last_text=dialogue[0][1],
+                last_text=entries[0].display_text,
                 system_text=combined_system_text,
                 is_first_turn=True,
+                has_attachments=bool(single_atts),
             )
             return _finalize_prepared(
                 prompt_str=prompt,
                 reset_flag=reset_chat,
                 strategy="smart_single_turn",
                 norm_hist=dialogue,
+                selected_attachments=single_atts,
             )
 
         # 2) Multi-turn continuation of the SAME local conversation (including tool_result loops!)
@@ -478,7 +580,8 @@ class ConversationContextBuilder:
             and len(tracked) < len(dialogue)
             and self._history_matches(tracked, dialogue[: len(tracked)])
         ):
-            delta_entries = dialogue[len(tracked) :]
+            delta_slice = entries[len(tracked) :]
+            delta_atts = deduplicate_attachments(a for e in delta_slice for a in e.attachments)
             prev_fp = self._session_tools_fp.get(session_key, "")
             extra_blocks: List[str] = []
             if sys_delta_block:
@@ -487,8 +590,7 @@ class ConversationContextBuilder:
                 extra_blocks.append(tool_sys_text)
             if fmt_sys_text:
                 extra_blocks.append(fmt_sys_text)
-
-            delta_has_tools = any(r == "tool" for r, _ in delta_entries)
+            delta_has_tools = any(e.role == "tool" for e in delta_slice)
             inc_reminder = build_tool_delta_reminder(
                 norm_tools,
                 tool_choice=tool_choice,
@@ -497,18 +599,35 @@ class ConversationContextBuilder:
             if inc_reminder:
                 extra_blocks.append(inc_reminder)
 
+            prior_att_tokens = sum(
+                estimate_attachment_tokens(a)
+                for e in entries[: len(tracked)]
+                for a in e.attachments
+            ) + sum(estimate_attachment_tokens(a) for a in system_attachments)
             cached_prefix = (
                 sys_tokens
                 + (tools_tokens if (not tools_fp or tools_fp == prev_fp) else 0)
                 + sum(estimate_tokens(t) for _, t in tracked)
+                + prior_att_tokens
             )
-            prompt = self._format_delta_entries(delta_entries, extra_instructions=extra_blocks)
+            prompt = self._format_delta_entries(
+                [
+                    (
+                        e.role,
+                        e.history_text if (len(delta_slice) > 1 and e.attachments) else e.display_text,
+                    )
+                    for e in delta_slice
+                ],
+                extra_instructions=extra_blocks,
+                has_attachments=bool(delta_atts),
+            )
             return _finalize_prepared(
                 prompt_str=prompt,
                 reset_flag=False,
                 strategy="smart_incremental_delta",
                 norm_hist=dialogue,
                 cached_prefix=cached_prefix,
+                selected_attachments=delta_atts,
             )
 
         # 3) Switched to a DIFFERENT multi-turn local conversation not matching current browser tab:
@@ -522,10 +641,9 @@ class ConversationContextBuilder:
             self.clear_session(session_key)
             if target_model is not None:
                 self._session_models[session_key] = target_model
-
-        prompt = self._format_full_transcript(
+        prompt = self._format_full_transcript_entries(
             system_text=combined_system_text,
-            dialogue=dialogue,
+            entries=entries,
             trailing_reminder=delta_reminder,
         )
         return _finalize_prepared(
@@ -533,7 +651,15 @@ class ConversationContextBuilder:
             reset_flag=reset_packed,
             strategy="smart_packed_context",
             norm_hist=dialogue,
+            selected_attachments=all_dialogue_atts,
         )
+
+    @staticmethod
+    def _trailing_non_assistant_entries(entries: Sequence[_DialogueEntry]) -> List[_DialogueEntry]:
+        idx = len(entries)
+        while idx > 0 and entries[idx - 1].role != "assistant":
+            idx -= 1
+        return list(entries[idx:])
 
     @staticmethod
     def _trailing_non_assistant_slice(dialogue: Sequence[Tuple[str, str]]) -> List[Tuple[str, str]]:
@@ -546,6 +672,7 @@ class ConversationContextBuilder:
     def _format_delta_entries(
         delta_entries: Sequence[Tuple[str, str]],
         extra_instructions: Optional[Sequence[str]] = None,
+        has_attachments: bool = False,
     ) -> str:
         extras = [e.strip() for e in (extra_instructions or []) if e and e.strip()]
         if len(delta_entries) == 1 and delta_entries[0][0] == "user" and not extras:
@@ -553,16 +680,19 @@ class ConversationContextBuilder:
 
         blocks: List[str] = []
         for role, content in delta_entries:
+            eff_content = content or ("[Please process the attached file(s).]" if has_attachments else "")
             if role == "tool":
-                blocks.append(content)
+                blocks.append(eff_content)
             elif role == "assistant":
-                blocks.append(f"Assistant: {content}")
+                blocks.append(f"Assistant: {eff_content}")
             else:
-                blocks.append(content if len(delta_entries) == 1 else f"User: {content}")
-
+                if len(delta_entries) == 1:
+                    if eff_content:
+                        blocks.append(eff_content)
+                else:
+                    blocks.append(f"User: {eff_content}")
         if delta_entries and delta_entries[-1][0] == "assistant":
             blocks.append("Please continue based on the conversation above.")
-
         blocks.extend(extras)
         return "\n\n".join(b for b in blocks if b)
 
@@ -587,10 +717,66 @@ class ConversationContextBuilder:
         return True
 
     @staticmethod
-    def _with_system_if_first_turn(last_text: str, system_text: str, is_first_turn: bool) -> str:
+    def _with_system_if_first_turn(
+        last_text: str,
+        system_text: str,
+        is_first_turn: bool,
+        has_attachments: bool = False,
+    ) -> str:
         if system_text and is_first_turn:
-            return f"[System Instructions]\n{system_text}\n\n[User Request]\n{last_text}"
+            eff_last = last_text or ("[Please process the attached file(s).]" if has_attachments else "")
+            return f"[System Instructions]\n{system_text}\n\n[User Request]\n{eff_last}"
         return last_text
+
+    @classmethod
+    def _format_full_transcript_entries(
+        cls,
+        system_text: str,
+        entries: Sequence[_DialogueEntry],
+        trailing_reminder: str = "",
+    ) -> str:
+        sections: List[str] = []
+        if system_text:
+            sections.append(f"[System Instructions]\n{system_text}")
+
+        tail = cls._trailing_non_assistant_entries(entries)
+        split_idx = len(entries) - len(tail) if tail else max(0, len(entries) - 1)
+        prior = entries[:split_idx]
+        current_entries = entries[split_idx:]
+
+        if prior:
+            lines: List[str] = ["[Conversation History]"]
+            for entry in prior:
+                if entry.role == "user":
+                    lines.append(f"User: {entry.history_text}")
+                elif entry.role == "assistant":
+                    lines.append(f"Assistant: {entry.history_text}")
+                else:
+                    lines.append(entry.history_text)
+            sections.append("\n".join(lines))
+
+        has_cur_atts = any(bool(e.attachments) for e in current_entries)
+        current_tuples = [
+            (
+                e.role,
+                e.history_text if (len(current_entries) > 1 and e.attachments) else e.display_text,
+            )
+            for e in current_entries
+        ]
+        current_body = cls._format_delta_entries(
+            current_tuples,
+            extra_instructions=[trailing_reminder] if trailing_reminder else None,
+            has_attachments=has_cur_atts,
+        )
+        if not current_body and has_cur_atts:
+            current_body = "[Please process the attached file(s).]"
+        heading = (
+            "[Tool Execution Results]"
+            if current_entries and all(e.role == "tool" for e in current_entries)
+            else "[Current User Request]"
+        )
+        sections.append(f"{heading}\n{current_body}")
+        return "\n\n".join(sections)
 
     @classmethod
     def _format_full_transcript(
@@ -599,37 +785,15 @@ class ConversationContextBuilder:
         dialogue: Sequence[Tuple[str, str]],
         trailing_reminder: str = "",
     ) -> str:
-        sections: List[str] = []
-        if system_text:
-            sections.append(f"[System Instructions]\n{system_text}")
-
-        tail = cls._trailing_non_assistant_slice(dialogue)
-        split_idx = len(dialogue) - len(tail) if tail else max(0, len(dialogue) - 1)
-        prior = dialogue[:split_idx]
-        current_entries = dialogue[split_idx:]
-
-        if prior:
-            lines: List[str] = ["[Conversation History]"]
-            for role, content in prior:
-                if role == "user":
-                    lines.append(f"User: {content}")
-                elif role == "assistant":
-                    lines.append(f"Assistant: {content}")
-                else:
-                    lines.append(content)
-            sections.append("\n".join(lines))
-
-        current_body = cls._format_delta_entries(
-            current_entries,
-            extra_instructions=[trailing_reminder] if trailing_reminder else None,
+        entries = [
+            _DialogueEntry(role=r, display_text=t, match_text=t, history_text=t)
+            for r, t in dialogue
+        ]
+        return cls._format_full_transcript_entries(
+            system_text=system_text,
+            entries=entries,
+            trailing_reminder=trailing_reminder,
         )
-        heading = (
-            "[Tool Execution Results]"
-            if current_entries and all(r == "tool" for r, _ in current_entries)
-            else "[Current User Request]"
-        )
-        sections.append(f"{heading}\n{current_body}")
-        return "\n\n".join(sections)
 
     def get_slot_context_metrics(self, session_key: str) -> Optional[Dict[str, Any]]:
         meta = self._session_metrics.get(session_key)

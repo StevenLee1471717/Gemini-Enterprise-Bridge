@@ -34,15 +34,22 @@ from server import create_app
 
 def test_extract_text_content_string_and_array() -> None:
     assert extract_text_content("你好 Gemini") == "你好 Gemini"
+    png_b64 = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII="
     multimodal = [
         {"type": "text", "text": "第一段说明"},
         {"type": "input_text", "text": "第二段代码"},
-        {"type": "image_url", "image_url": {"url": "data:image/png;base64,AAA"}},
+        {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{png_b64}"}},
     ]
     text = extract_text_content(multimodal)
     assert "第一段说明" in text
     assert "第二段代码" in text
-    assert "Image attachment omitted" in text
+    assert "Image attachment omitted" not in text
+
+    msg = ChatMessage(role="user", content=multimodal)
+    atts = msg.extract_attachments()
+    assert len(atts) == 1
+    assert atts[0].mime_type == "image/png"
+    assert atts[0].media_kind == "image"
 
 
 def test_smart_context_builder_incremental_and_packed() -> None:
@@ -2168,3 +2175,320 @@ def test_e2e_cross_version_ws_handshake_and_update_endpoints(tmp_path: Path) -> 
             assert ack_b["backend_version"] == "1.3.0"
             reload_msg = ws.receive_json()
             assert reload_msg == {"type": "extension_reload_available", "version": "1.3.0"}
+
+
+# ---------------------------------------------------------------------------
+# 3. Multimodal File & Media Normalization, Delta Tracking, Staging & GCloud
+# ---------------------------------------------------------------------------
+
+
+def _build_minimal_ooxml_zip(kind: str, text_snippet: str) -> bytes:
+    import io
+    import zipfile
+
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
+        if kind == "docx":
+            zf.writestr(
+                "word/document.xml",
+                f'<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">'
+                f"<w:body><w:p><w:r><w:t>{text_snippet}</w:t></w:r></w:p></w:body></w:document>",
+            )
+        elif kind == "xlsx":
+            zf.writestr(
+                "xl/sharedStrings.xml",
+                f'<sst xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">'
+                f"<si><t>{text_snippet}</t></si></sst>",
+            )
+            zf.writestr(
+                "xl/worksheets/sheet1.xml",
+                '<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">'
+                '<sheetData><row r="1"><c r="A1" t="s"><v>0</v></c><c r="B1"><v>42</v></c></row></sheetData></worksheet>',
+            )
+        elif kind == "pptx":
+            zf.writestr(
+                "ppt/slides/slide1.xml",
+                f'<p:sld xmlns:p="http://schemas.openxmlformats.org/presentationml/2006/main" '
+                f'xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main">'
+                f"<p:cSld><p:spTree><p:sp><p:txBody><a:p><a:r><a:t>{text_snippet}</a:t></a:r></a:p></p:txBody></p:sp></p:spTree></p:cSld></p:sld>",
+            )
+    return buf.getvalue()
+
+
+def test_multimodal_parsing_magic_sniffing_ooxml_and_local_files(tmp_path: Path) -> None:
+    import base64
+    from multimodal import extract_message_attachments
+
+    png_bytes = render_spark_icon_png(16)
+    wav_bytes = b"RIFF\x24\x00\x00\x00WAVEfmt " + b"\x00" * 24
+    mp4_bytes = b"\x00\x00\x00\x18ftypmp42\x00\x00\x00\x00mp42isom"
+    pdf_bytes = b"%PDF-1.7\n1 0 obj\n<<>>\nendobj\n%%EOF"
+    docx_bytes = _build_minimal_ooxml_zip("docx", "季度营收增长 38%")
+    xlsx_bytes = _build_minimal_ooxml_zip("xlsx", "预算科目A")
+    pptx_bytes = _build_minimal_ooxml_zip("pptx", "产品路线图里程碑")
+
+    local_md = tmp_path / "notes.md"
+    local_md.write_text("# 架构评审纪要\n- 支持多模态直传", encoding="utf-8")
+
+    content_parts = [
+        {"type": "text", "text": "请综合分析以下所有多模态材料"},
+        {
+            "type": "image_url",
+            "image_url": {"url": "data:image/png;base64," + base64.b64encode(png_bytes).decode()},
+        },
+        {
+            "type": "input_audio",
+            "input_audio": {"data": base64.b64encode(wav_bytes).decode(), "format": "wav"},
+        },
+        {
+            "type": "video_url",
+            "video_url": {"url": "data:video/mp4;base64," + base64.b64encode(mp4_bytes).decode()},
+        },
+        {
+            "type": "file",
+            "file": {
+                "filename": "report.pdf",
+                "file_data": base64.b64encode(pdf_bytes).decode(),
+            },
+        },
+        {
+            "type": "input_file",
+            "filename": "summary.docx",
+            "file_data": base64.b64encode(docx_bytes).decode(),
+        },
+        {
+            "type": "document",
+            "source": {
+                "type": "base64",
+                "media_type": "application/octet-stream",
+                "data": base64.b64encode(xlsx_bytes).decode(),
+            },
+        },
+        {
+            "type": "file",
+            "file": {
+                "filename": "deck.pptx",
+                "data": base64.b64encode(pptx_bytes).decode(),
+            },
+        },
+        {
+            "type": "file",
+            "file": {"url": str(local_md)},
+        },
+    ]
+
+    atts = extract_message_attachments(content=content_parts)
+    assert len(atts) == 8
+    mimes = [a.mime_type for a in atts]
+    assert mimes[0] == "image/png"
+    assert mimes[1] == "audio/wav"
+    assert mimes[2] == "video/mp4"
+    assert mimes[3] == "application/pdf"
+    assert mimes[4] == "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+    assert mimes[5] == "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+    assert mimes[6] == "application/vnd.openxmlformats-officedocument.presentationml.presentation"
+    assert mimes[7] == "text/markdown"
+
+    assert "季度营收增长 38%" in (atts[4].extract_text_fallback() or "")
+    xlsx_txt = atts[5].extract_text_fallback() or ""
+    assert "预算科目A" in xlsx_txt and "42" in xlsx_txt
+    assert "产品路线图里程碑" in (atts[6].extract_text_fallback() or "")
+    assert "架构评审纪要" in (atts[7].extract_text_fallback() or "")
+
+
+def test_multimodal_context_builder_delta_dedup_and_reset() -> None:
+    import base64
+
+    png_b64 = base64.b64encode(render_spark_icon_png(16)).decode()
+    pdf_b64 = base64.b64encode(b"%PDF-1.4\nfirst-doc\n%%EOF").decode()
+    wav_b64 = base64.b64encode(b"RIFF\x24\x00\x00\x00WAVEfmt " + b"\x00" * 24).decode()
+
+    builder = ConversationContextBuilder(default_mode="smart", auto_reset_new_chat=True)
+    session = "mm-session-1"
+
+    # Turn 1: user uploads PNG + PDF
+    m1 = ChatMessage(
+        role="user",
+        content=[
+            {"type": "text", "text": "对比这张架构图和 PDF 规范"},
+            {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{png_b64}"}},
+            {"type": "file", "file": {"filename": "spec.pdf", "file_data": pdf_b64}},
+        ],
+    )
+    p1 = builder.build([m1], model="gemini-4-argon", session_key=session)
+    assert p1.reset_chat is True
+    assert len(p1.attachments) == 2
+    builder.record_completed_turn(session, p1.normalized_history, "已完成架构图与规范对比。")
+
+    # Turn 2 (text-only follow-up): prior PNG + PDF MUST NOT be re-uploaded!
+    t2_msgs = [
+        m1,
+        ChatMessage(role="assistant", content="已完成架构图与规范对比。"),
+        ChatMessage(role="user", content="其中第 3 节有哪些潜在风险？"),
+    ]
+    p2 = builder.build(t2_msgs, model="gemini-4-argon", session_key=session)
+    assert p2.strategy_used == "smart_incremental_delta"
+    assert p2.reset_chat is False
+    assert p2.attachments == []
+    assert p2.prompt == "其中第 3 节有哪些潜在风险？"
+    builder.record_completed_turn(session, p2.normalized_history, "第 3 节存在超时重试风险。")
+
+    # Turn 3 (follow-up with a NEW audio attachment): sends ONLY the new WAV attachment!
+    m3 = ChatMessage(
+        role="user",
+        content=[
+            {"type": "text", "text": "结合这段会议录音再补充一点"},
+            {"type": "input_audio", "input_audio": {"data": wav_b64, "format": "wav"}},
+        ],
+    )
+    t3_msgs = [*t2_msgs, ChatMessage(role="assistant", content="第 3 节存在超时重试风险。"), m3]
+    p3 = builder.build(t3_msgs, model="gemini-4-argon", session_key=session)
+    assert p3.strategy_used == "smart_incremental_delta"
+    assert p3.reset_chat is False
+    assert len(p3.attachments) == 1
+    assert p3.attachments[0].mime_type == "audio/wav"
+
+    # Explicit -newchat reset on full conversation: re-includes ALL unique attachments across turns!
+    p_reset = builder.build(t3_msgs, model="gemini-4-argon-newchat", session_key=session)
+    assert p_reset.reset_chat is True
+    assert len(p_reset.attachments) == 3
+
+    # Attachment-only user turn (empty text caption) works cleanly
+    img_only_msg = ChatMessage(
+        role="user",
+        content=[{"type": "image_url", "image_url": {"url": f"data:image/png;base64,{png_b64}"}}],
+    )
+    p_img_only = builder.build([img_only_msg], model="gemini-4-argon", session_key="mm-img-only")
+    assert len(p_img_only.attachments) == 1
+    assert p_img_only.prompt == ""
+
+
+def test_e2e_browser_attachment_staging_token_guard_and_multi_turn_delta() -> None:
+    import base64
+
+    png_bytes = render_spark_icon_png(16)
+    pdf_bytes = b"%PDF-1.7\nenterprise-architecture\n%%EOF"
+    png_b64 = base64.b64encode(png_bytes).decode()
+    pdf_b64 = base64.b64encode(pdf_bytes).decode()
+
+    app = create_app(_make_test_settings())
+    captured_cmds: List[Dict[str, Any]] = []
+    fetched_blobs: List[bytes] = []
+
+    with TestClient(app) as client:
+        ready_ev = threading.Event()
+
+        with client.websocket_connect("/ws/browser?client_id=ext-mm") as ws:
+            assert ws.receive_json()["type"] == "welcome"
+            ws.send_json(
+                {
+                    "type": "tab_status",
+                    "tab_id": 77,
+                    "tab_url": "https://vertexaisearch.cloud.google.com/u/0/home/cid/mm",
+                    "ready": True,
+                }
+            )
+            assert ws.receive_json()["type"] == "ack"
+
+            def mm_worker() -> None:
+                ready_ev.set()
+                for turn_idx in range(2):
+                    cmd = ws.receive_json()
+                    assert cmd["type"] == "execute_prompt"
+                    captured_cmds.append(cmd)
+                    req_id = cmd["request_id"]
+                    ws.send_json({"type": "request_ack", "request_id": req_id})
+                    for att_meta in cmd.get("attachments") or []:
+                        # Verify wrong/missing token is rejected with 403
+                        bad_r = client.get(f"/api/bridge/attachments/{att_meta['id']}?token=wrong")
+                        assert bad_r.status_code == 403
+                        ok_r = client.get(att_meta["path"])
+                        assert ok_r.status_code == 200
+                        fetched_blobs.append(ok_r.content)
+                    ws.send_json(
+                        {
+                            "type": "request_complete",
+                            "request_id": req_id,
+                            "reply": f"多模态回复 #{turn_idx + 1}",
+                            "source": "shadow_dom",
+                        }
+                    )
+
+            th = threading.Thread(target=mm_worker, daemon=True)
+            th.start()
+            ready_ev.wait(timeout=3.0)
+
+            user_turn_1 = {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": "请审阅图片与 PDF"},
+                    {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{png_b64}"}},
+                    {"type": "file", "file": {"filename": "arch.pdf", "file_data": pdf_b64}},
+                ],
+            }
+            r1 = client.post(
+                "/v1/chat/completions",
+                json={"model": "gemini-4-argon", "messages": [user_turn_1]},
+            )
+            assert r1.status_code == 200
+            reply1 = r1.json()["choices"][0]["message"]["content"]
+            assert reply1 == "多模态回复 #1"
+
+            # Turn 2 in same session: follow-up without new attachments -> 0 staged attachments re-sent
+            r2 = client.post(
+                "/v1/chat/completions",
+                json={
+                    "model": "gemini-4-argon",
+                    "messages": [
+                        user_turn_1,
+                        {"role": "assistant", "content": reply1},
+                        {"role": "user", "content": "总结成三条要点"},
+                    ],
+                },
+            )
+            assert r2.status_code == 200
+            assert r2.json()["choices"][0]["message"]["content"] == "多模态回复 #2"
+            th.join(timeout=3.0)
+
+    assert len(captured_cmds) == 2
+    assert len(captured_cmds[0].get("attachments") or []) == 2
+    assert fetched_blobs == [png_bytes, pdf_bytes]
+    assert (captured_cmds[1].get("attachments") or []) == []
+    assert captured_cmds[1]["reset_chat"] is False
+
+
+def test_gcloud_provider_vertex_and_discovery_multimodal_parts() -> None:
+    import base64
+    from gcloud_provider import GCloudVertexProvider
+
+    png_bytes = render_spark_icon_png(16)
+    docx_bytes = _build_minimal_ooxml_zip("docx", "合同关键条款：保密期五年")
+    msg = ChatMessage(
+        role="user",
+        content=[
+            {"type": "text", "text": "核对图片、GCS 视频与 Word 合同"},
+            {"type": "image_url", "image_url": {"url": "data:image/png;base64," + base64.b64encode(png_bytes).decode()}},
+            {"type": "video_url", "video_url": {"url": "gs://corp-bucket/demo.mp4", "mime_type": "video/mp4"}},
+            {"type": "file", "file": {"filename": "contract.docx", "file_data": base64.b64encode(docx_bytes).decode()}},
+        ],
+    )
+    atts = msg.extract_attachments()
+    assert len(atts) == 3
+
+    provider = GCloudVertexProvider(_make_test_settings(gcp_project_id="demo-proj"))
+
+    async def _check() -> None:
+        p_img = await provider._attachment_to_vertex_part(atts[0])
+        assert p_img["inlineData"]["mimeType"] == "image/png"
+        assert base64.b64decode(p_img["inlineData"]["data"]) == png_bytes
+
+        p_gcs = await provider._attachment_to_vertex_part(atts[1])
+        assert p_gcs == {"fileData": {"mimeType": "video/mp4", "fileUri": "gs://corp-bucket/demo.mp4"}}
+
+        p_docx = await provider._attachment_to_vertex_part(atts[2])
+        assert "合同关键条款：保密期五年" in p_docx["text"]
+
+        d_docx = await provider._attachment_to_discovery_text(atts[2])
+        assert "合同关键条款：保密期五年" in d_docx
+
+    asyncio.run(_check())

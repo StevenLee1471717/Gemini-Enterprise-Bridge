@@ -7,6 +7,7 @@ import json
 import logging
 import os
 import time
+import urllib.parse
 import uuid
 from contextlib import asynccontextmanager
 from pathlib import Path
@@ -14,7 +15,7 @@ from typing import Any, AsyncIterator, Dict, Optional
 
 from fastapi import Depends, FastAPI, Header, Request, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse
+from fastapi.responses import HTMLResponse, JSONResponse, Response, StreamingResponse
 
 from bridge_hub import (
     BridgeExecutionError,
@@ -27,6 +28,7 @@ from context_builder import ConversationContextBuilder
 from dashboard_html import DASHBOARD_HTML
 from extension_exporter import export_extension_bundle
 from gcloud_provider import GCloudUpstreamError, GCloudVertexProvider
+from multimodal import estimate_attachment_tokens
 from schemas import (
     AVAILABLE_MODELS,
     BridgeCallbackPayload,
@@ -503,6 +505,43 @@ def create_app(
             )
         return {"ok": True}
 
+    @app.get("/api/bridge/attachments/{attachment_id}")
+    async def download_staged_bridge_attachment(
+        attachment_id: str,
+        token: str = "",
+    ) -> Response:
+        """Token-guarded local binary attachment endpoint for MV3 extension & userscript workers."""
+        staged, status_reason = hub.verify_staged_attachment(attachment_id, token)
+        if status_reason == "forbidden":
+            return _openai_error_response(
+                status_code=403,
+                message="附件访问令牌无效或缺失。",
+                error_type="permission_error",
+                code="invalid_attachment_token",
+            )
+        if staged is None:
+            return _openai_error_response(
+                status_code=404,
+                message="附件不存在或已过期。",
+                error_type="not_found_error",
+                code="attachment_not_found",
+            )
+        ascii_fallback = staged.filename.encode("ascii", "ignore").decode("ascii") or "attachment"
+        ascii_fallback = ascii_fallback.replace('"', "").replace("\\", "_")
+        encoded_utf8 = urllib.parse.quote(staged.filename, safe="")
+        headers = {
+            "Cache-Control": "no-store, max-age=0",
+            "X-Content-Type-Options": "nosniff",
+            "Content-Disposition": (
+                f'attachment; filename="{ascii_fallback}"; filename*=UTF-8\'\'{encoded_utf8}'
+            ),
+        }
+        return Response(
+            content=staged.data,
+            media_type=staged.mime_type or "application/octet-stream",
+            headers=headers,
+        )
+
     # ------------------------------------------------------------------
     # Agentic Loop & Tool Calling Support
     # ------------------------------------------------------------------
@@ -582,6 +621,11 @@ def create_app(
 
         # ---------------- Option 1: Official GCloud Upstream ----------------
         prompt_for_usage = "\n".join(m.text_content() for m in request.messages)
+        extra_attachment_tokens = sum(
+            estimate_attachment_tokens(att)
+            for m in request.messages
+            for att in m.extract_attachments()
+        )
 
         if upstream == "gcloud":
             if not gcloud.is_configured():
@@ -624,9 +668,18 @@ def create_app(
                     finish_reason=parsed.finish_reason,
                 )
                 u_info = resp_obj.get("usage") or {}
+                if extra_attachment_tokens > 0 and isinstance(resp_obj.get("usage"), dict):
+                    resp_obj["usage"]["prompt_tokens"] = int(u_info.get("prompt_tokens") or 0) + extra_attachment_tokens
+                    resp_obj["usage"]["total_tokens"] = (
+                        resp_obj["usage"]["prompt_tokens"] + int(u_info.get("completion_tokens") or 0)
+                    )
+                    u_info = resp_obj["usage"]
                 usage_tracker.record_request(
                     requested_model=model_name,
-                    prompt_tokens=int(u_info.get("prompt_tokens") or estimate_tokens(prompt_for_usage)),
+                    prompt_tokens=int(
+                        u_info.get("prompt_tokens")
+                        or (estimate_tokens(prompt_for_usage) + extra_attachment_tokens)
+                    ),
                     completion_tokens=int(u_info.get("completion_tokens") or 0),
                     gcloud_fallback_model=cfg.gcloud_model,
                     strategy="gcloud_direct",
@@ -698,6 +751,9 @@ def create_app(
                     else:
                         completion_usage_str = parsed.content or ""
                     gcloud_u = build_usage(prompt_for_usage, completion_usage_str)
+                    if extra_attachment_tokens > 0:
+                        gcloud_u["prompt_tokens"] += extra_attachment_tokens
+                        gcloud_u["total_tokens"] = gcloud_u["prompt_tokens"] + gcloud_u["completion_tokens"]
                     usage_tracker.record_request(
                         requested_model=model_name,
                         prompt_tokens=gcloud_u["prompt_tokens"],
@@ -802,6 +858,7 @@ def create_app(
                         reset_chat=prepared.reset_chat,
                         suppress_citations=suppress_citations,
                         request_timeout=cfg.request_timeout_seconds,
+                        attachments=prepared.attachments,
                     )
                     parsed = parse_assistant_output(
                         raw_reply,
@@ -937,6 +994,7 @@ def create_app(
                         reset_chat=prepared.reset_chat,
                         suppress_citations=suppress_citations,
                         request_timeout=cfg.request_timeout_seconds,
+                        attachments=prepared.attachments,
                     ):
                         if not delta:
                             if time.monotonic() - last_sse_ts >= 14.5:

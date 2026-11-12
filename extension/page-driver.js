@@ -5,7 +5,7 @@
 //   3) Optional in-page fetch replay once a chat RPC template is observed
 
 (() => {
-  const DRIVER_VERSION = "2.4.0";
+  const DRIVER_VERSION = "2.6.0";
 
   // Optional Trusted Types policy (gracefully guarded if CSP `trusted-types` header restricts custom policy names;
   // all DOM mutations below strictly use `replaceChildren` + `createElement` + `textContent` and ZERO `innerHTML`!)
@@ -901,15 +901,511 @@
     return "enter_keypress";
   }
 
-  async function submitComposerWithVerification(inputEl, promptText, job = null, baselineCount = 0) {
+  const BASE64_ALPHABET = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+
+  function decodeBase64ToUint8Array(b64) {
+    const clean = String(b64 || "").replace(/[^A-Za-z0-9+/=]/g, "");
+    if (!clean) return new Uint8Array(0);
+    if (typeof atob === "function") {
+      const bin = atob(clean);
+      const out = new Uint8Array(bin.length);
+      for (let i = 0; i < bin.length; i += 1) {
+        out[i] = bin.charCodeAt(i) & 0xff;
+      }
+      return out;
+    }
+    const bytes = [];
+    for (let i = 0; i < clean.length; i += 4) {
+      const c0 = BASE64_ALPHABET.indexOf(clean[i]);
+      const c1 = BASE64_ALPHABET.indexOf(clean[i + 1]);
+      const c2 = clean[i + 2] === "=" ? -1 : BASE64_ALPHABET.indexOf(clean[i + 2]);
+      const c3 = clean[i + 3] === "=" ? -1 : BASE64_ALPHABET.indexOf(clean[i + 3]);
+      if (c0 < 0 || c1 < 0) break;
+      const triple = (c0 << 18) | (c1 << 12) | ((c2 < 0 ? 0 : c2) << 6) | (c3 < 0 ? 0 : c3);
+      bytes.push((triple >> 16) & 0xff);
+      if (c2 >= 0) bytes.push((triple >> 8) & 0xff);
+      if (c3 >= 0) bytes.push(triple & 0xff);
+    }
+    return new Uint8Array(bytes);
+  }
+
+  function constructBrowserFile(bytes, filename, mimeType) {
+    const safeName = String(filename || "attachment.bin");
+    const safeMime = String(mimeType || "application/octet-stream");
+    const now = Date.now();
+    if (typeof File === "function") {
+      return new File([bytes], safeName, { type: safeMime, lastModified: now });
+    }
+    if (typeof Blob === "function") {
+      const blob = new Blob([bytes], { type: safeMime });
+      try {
+        Object.defineProperty(blob, "name", { value: safeName, configurable: true });
+        Object.defineProperty(blob, "lastModified", { value: now, configurable: true });
+      } catch (_) {}
+      return blob;
+    }
+    return {
+      name: safeName,
+      size: bytes.byteLength,
+      type: safeMime,
+      lastModified: now,
+      _bytes: bytes
+    };
+  }
+
+  function buildDataTransferForFiles(files) {
+    if (typeof DataTransfer === "function") {
+      const dt = new DataTransfer();
+      for (const file of files) {
+        dt.items.add(file);
+      }
+      return dt;
+    }
+    const fileList = files.slice();
+    fileList.item = (idx) => fileList[idx] || null;
+    return {
+      dropEffect: "copy",
+      effectAllowed: "all",
+      files: fileList,
+      items: files.map((f) => ({
+        kind: "file",
+        type: f.type || "application/octet-stream",
+        getAsFile: () => f
+      })),
+      types: ["Files"],
+      getData: () => ""
+    };
+  }
+
+  function getComposerScopeRoots(inputEl) {
+    const roots = [];
+    const seen = new Set();
+    let cur = inputEl;
+    for (let depth = 0; depth < 10 && cur; depth += 1) {
+      const scope = cur.shadowRoot || cur;
+      if (scope && !seen.has(scope)) {
+        seen.add(scope);
+        roots.push(scope);
+      }
+      if (cur.parentElement) {
+        cur = cur.parentElement;
+      } else {
+        const rn = cur.getRootNode ? cur.getRootNode() : null;
+        cur = rn && rn.host ? rn.host : null;
+      }
+    }
+    return roots;
+  }
+
+  function fileMatchesAcceptToken(file, token) {
+    const t = String(token || "").trim().toLowerCase();
+    if (!t || t === "*/*" || t === "*") return true;
+    const mime = String(file.type || "").toLowerCase();
+    const name = String(file.name || "").toLowerCase();
+    if (t.startsWith(".")) {
+      return name.endsWith(t);
+    }
+    if (t.endsWith("/*")) {
+      const prefix = t.slice(0, -1);
+      return mime.startsWith(prefix);
+    }
+    return mime === t;
+  }
+
+  function scoreFileInputCandidate(el, files, composerHost) {
+    if (!el || el.disabled || el.hasAttribute("disabled")) return -1;
+    let score = 10;
+    if (composerHost && containsDeep(composerHost, el)) {
+      score += 50;
+    }
+    if (el.multiple && files.length > 1) {
+      score += 15;
+    }
+    const acceptRaw = String(el.getAttribute("accept") || "").trim();
+    if (!acceptRaw) {
+      score += 20;
+    } else {
+      const tokens = acceptRaw.split(",").map((s) => s.trim()).filter(Boolean);
+      const allMatch = files.every((f) => tokens.some((tok) => fileMatchesAcceptToken(f, tok)));
+      if (allMatch) {
+        score += 25;
+      } else {
+        score -= 30;
+      }
+    }
+    return score;
+  }
+
+  function findBestFileInput(inputEl, files) {
+    const composerHost = getComposerRootHost(inputEl);
+    const candidates = [];
+    const seen = new Set();
+    for (const root of getComposerScopeRoots(inputEl)) {
+      for (const el of querySelectorAllDeep('input[type="file"]', root)) {
+        if (!seen.has(el)) {
+          seen.add(el);
+          candidates.push(el);
+        }
+      }
+    }
+    for (const el of querySelectorAllDeep('input[type="file"]')) {
+      if (!seen.has(el)) {
+        seen.add(el);
+        candidates.push(el);
+      }
+    }
+    const scored = candidates
+      .map((el) => ({ el, score: scoreFileInputCandidate(el, files, composerHost) }))
+      .filter((item) => item.score >= 0);
+    if (scored.length === 0) return null;
+    scored.sort((a, b) => b.score - a.score);
+    return scored[0].el;
+  }
+
+  function findComposerAttachButton(inputEl) {
+    const attachHintRe =
+      /\b(attach|attach_file|attachment|upload|upload_file|add_photo_alternate|add_circle|add_box|paperclip|plus|add)\b|[+＋]|上传|附件|添加文件|添加/i;
+    const excludeRe =
+      /\b(send|submit|ask|run|stop|mic|voice|audio_magic_eraser|add_comment|chat_add_on|new chat|new session|reset|clear|model|argon|carbon|pro|flash|auto)\b|发送|提交|停止|语音|新建|新对话|模型/i;
+
+    for (const root of getComposerScopeRoots(inputEl)) {
+      const buttons = querySelectorAllDeep(
+        'button, md-icon-button, md-filled-tonal-icon-button, md-outlined-button, ucs-icon-button, [role="button"]',
+        root
+      ).filter(
+        (btn) =>
+          isElementVisible(btn) &&
+          !btn.disabled &&
+          btn.getAttribute("aria-disabled") !== "true" &&
+          !btn.hasAttribute("disabled")
+      );
+      for (const btn of buttons) {
+        const label = readButtonIconAndLabelText(btn).trim();
+        if (excludeRe.test(label)) continue;
+        if (attachHintRe.test(label)) {
+          return btn;
+        }
+      }
+    }
+    return null;
+  }
+
+  function findLocalUploadMenuOption(triggerBtn) {
+    const localUploadRe =
+      /\b(upload\s*files?|upload\s*from\s*computer|from\s*computer|from\s*your\s*computer|local\s*files?|choose\s*files?|browse\s*files?|upload\s*image|upload\s*media|computer|device|upload)\b|本地文件|从电脑上传|从设备上传|上传文件|选择文件|上传图片|上传/i;
+    const cloudExcludeRe =
+      /\b(google\s*drive|drive|onedrive|sharepoint|box|dropbox|github|jira|confluence|cloud|connector|data\s*source)\b|云端硬盘|数据源|连接器/i;
+    const items = querySelectorAllDeep(
+      'mat-menu-item, md-menu-item, md-list-item, mwc-list-item, ucs-menu-item, [role="menuitem"], .mat-mdc-menu-item, button'
+    ).filter(
+      (el) =>
+        isElementVisible(el) &&
+        el !== triggerBtn &&
+        !containsDeep(el, triggerBtn) &&
+        !el.disabled &&
+        el.getAttribute("aria-disabled") !== "true"
+    );
+    for (const item of items) {
+      const txt = `${getDeepVisibleText(item)} ${getElementTooltipOrLabel(item)}`.trim();
+      if (!txt || cloudExcludeRe.test(txt)) continue;
+      if (localUploadRe.test(txt)) {
+        return item;
+      }
+    }
+    return null;
+  }
+
+  function countComposerAttachmentIndicators(inputEl) {
+    const composerHost = getComposerRootHost(inputEl);
+    const roots = composerHost ? [composerHost.shadowRoot || composerHost] : getComposerScopeRoots(inputEl).slice(0, 5);
+    const seen = new Set();
+    const chipSelector = [
+      "ucs-file-chip",
+      "ucs-attachment-chip",
+      "ucs-attachment",
+      "ucs-uploaded-file",
+      "file-chip",
+      "attachment-chip",
+      "md-input-chip",
+      "mat-chip-row",
+      '[data-test-id*="attachment" i]',
+      '[data-testid*="attachment" i]',
+      '[data-test-id*="file-chip" i]',
+      '[data-testid*="file-chip" i]',
+      '[class*="attachment-chip" i]',
+      '[class*="file-chip" i]',
+      '[class*="uploaded-file" i]'
+    ].join(", ");
+    for (const root of roots) {
+      for (const chip of querySelectorAllDeep(chipSelector, root)) {
+        if (isElementVisible(chip)) {
+          seen.add(chip);
+        }
+      }
+    }
+    return seen.size;
+  }
+
+  function isComposerUploadingFiles(inputEl) {
+    const composerHost = getComposerRootHost(inputEl);
+    const roots = composerHost ? [composerHost.shadowRoot || composerHost] : getComposerScopeRoots(inputEl).slice(0, 5);
+    const progressSelector = [
+      "md-circular-progress",
+      "md-linear-progress",
+      "mat-progress-spinner",
+      "mat-spinner",
+      "mat-progress-bar",
+      '[role="progressbar"]',
+      '[aria-busy="true"]',
+      '[data-upload-state="uploading"]',
+      '[class*="uploading" i]'
+    ].join(", ");
+    for (const root of roots) {
+      const active = querySelectorAllDeep(progressSelector, root).filter(isElementVisible);
+      if (active.length > 0) {
+        return true;
+      }
+    }
+    return false;
+  }
+
+  async function assignFilesToInputElement(fileInput, files) {
+    const batches = !fileInput.multiple && files.length > 1 ? files.map((f) => [f]) : [files];
+    for (let idx = 0; idx < batches.length; idx += 1) {
+      const dt = buildDataTransferForFiles(batches[idx]);
+      let assigned = false;
+      try {
+        const desc =
+          typeof HTMLInputElement !== "undefined" && HTMLInputElement.prototype
+            ? Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, "files")
+            : null;
+        if (desc && typeof desc.set === "function") {
+          desc.set.call(fileInput, dt.files);
+          assigned = true;
+        }
+      } catch (_) {}
+      if (!assigned) {
+        try {
+          fileInput.files = dt.files;
+          assigned = true;
+        } catch (_) {
+          try {
+            Object.defineProperty(fileInput, "files", {
+              value: dt.files,
+              configurable: true,
+              writable: true
+            });
+          } catch (__) {}
+        }
+      }
+      fileInput.dispatchEvent(new Event("input", { bubbles: true, composed: true }));
+      fileInput.dispatchEvent(new Event("change", { bubbles: true, composed: true }));
+      if (idx + 1 < batches.length) {
+        await sleep(90);
+      }
+    }
+  }
+
+  function dispatchPasteAndDropFallback(inputEl, files) {
+    const dt = buildDataTransferForFiles(files);
+    const composerHost = getComposerRootHost(inputEl) || inputEl;
+    let dispatched = false;
+    try {
+      inputEl.focus();
+    } catch (_) {}
+
+    try {
+      let pasteEv;
+      if (typeof ClipboardEvent === "function") {
+        pasteEv = new ClipboardEvent("paste", {
+          bubbles: true,
+          composed: true,
+          cancelable: true,
+          clipboardData: dt
+        });
+      } else {
+        pasteEv = new Event("paste", { bubbles: true, composed: true, cancelable: true });
+      }
+      if (!pasteEv.clipboardData) {
+        try {
+          Object.defineProperty(pasteEv, "clipboardData", { value: dt, configurable: true });
+        } catch (_) {}
+      }
+      inputEl.dispatchEvent(pasteEv);
+      dispatched = true;
+    } catch (_) {}
+
+    try {
+      for (const type of ["dragenter", "dragover", "drop"]) {
+        let dragEv;
+        if (typeof DragEvent === "function") {
+          dragEv = new DragEvent(type, {
+            bubbles: true,
+            composed: true,
+            cancelable: true,
+            dataTransfer: dt
+          });
+        } else {
+          dragEv = new Event(type, { bubbles: true, composed: true, cancelable: true });
+        }
+        if (!dragEv.dataTransfer) {
+          try {
+            Object.defineProperty(dragEv, "dataTransfer", { value: dt, configurable: true });
+          } catch (_) {}
+        }
+        composerHost.dispatchEvent(dragEv);
+      }
+      dispatched = true;
+    } catch (_) {}
+
+    return dispatched;
+  }
+
+  async function waitForComposerAttachmentsReady(inputEl, totalBytes = 0) {
+    await sleep(120);
+    const maxWaitMs = Math.min(60000, Math.max(8000, Math.ceil(totalBytes / 2048)));
+    const deadline = Date.now() + maxWaitMs;
+    let quietChecks = 0;
+    while (Date.now() < deadline) {
+      const liveInput = findComposerInput() || inputEl;
+      const uploading = isComposerUploadingFiles(liveInput);
+      if (!uploading) {
+        quietChecks += 1;
+        if (quietChecks >= 2) {
+          break;
+        }
+      } else {
+        quietChecks = 0;
+      }
+      await sleep(120);
+    }
+  }
+
+  async function uploadAttachmentsToComposer(inputEl, attachmentSpecs) {
+    if (!Array.isArray(attachmentSpecs) || attachmentSpecs.length === 0) {
+      return { uploaded: 0, method: "none" };
+    }
+    const files = [];
+    let totalBytes = 0;
+    for (let i = 0; i < attachmentSpecs.length; i += 1) {
+      const spec = attachmentSpecs[i] || {};
+      const bytes =
+        spec.bytes instanceof Uint8Array
+          ? spec.bytes
+          : decodeBase64ToUint8Array(spec.data_b64 || "");
+      totalBytes += bytes.byteLength;
+      files.push(
+        constructBrowserFile(
+          bytes,
+          spec.filename || `attachment-${i + 1}.bin`,
+          spec.mime_type || "application/octet-stream"
+        )
+      );
+    }
+
+    let uploadMethod = "";
+    let fileInput = findBestFileInput(inputEl, files);
+    if (fileInput) {
+      await assignFilesToInputElement(fileInput, files);
+      uploadMethod = "file_input";
+    } else {
+      const attachBtn = findComposerAttachButton(inputEl);
+      if (attachBtn) {
+        const hasInputProto =
+          typeof HTMLInputElement !== "undefined" &&
+          HTMLInputElement.prototype &&
+          typeof HTMLInputElement.prototype.click === "function";
+        const origClick = hasInputProto ? HTMLInputElement.prototype.click : null;
+        let capturedInput = null;
+        if (hasInputProto) {
+          HTMLInputElement.prototype.click = function (...args) {
+            if (this && String(this.type || "").toLowerCase() === "file") {
+              capturedInput = this;
+              return undefined;
+            }
+            return origClick.apply(this, args);
+          };
+        }
+        try {
+          attachBtn.click();
+          await sleep(110);
+          if (!capturedInput) {
+            capturedInput = findBestFileInput(inputEl, files);
+          }
+          if (!capturedInput) {
+            const menuOpt = findLocalUploadMenuOption(attachBtn);
+            if (menuOpt) {
+              menuOpt.click();
+              await sleep(110);
+              if (!capturedInput && isElementVisible(menuOpt)) {
+                dispatchRealisticClick(menuOpt);
+                await sleep(110);
+              }
+            }
+          }
+          if (!capturedInput) {
+            capturedInput = findBestFileInput(inputEl, files);
+          }
+        } finally {
+          if (hasInputProto && origClick) {
+            HTMLInputElement.prototype.click = origClick;
+          }
+        }
+        if (capturedInput) {
+          await assignFilesToInputElement(capturedInput, files);
+          uploadMethod = "attach_button_file_input";
+          await dismissTransientOverlays(null);
+        } else {
+          await dismissTransientOverlays(null);
+        }
+      }
+    }
+
+    if (!uploadMethod) {
+      dispatchPasteAndDropFallback(inputEl, files);
+      uploadMethod = "paste_drop_fallback";
+    }
+
+    await waitForComposerAttachmentsReady(inputEl, totalBytes);
+    logDriver(
+      "info",
+      `已注入 ${files.length} 个多模态附件 (${uploadMethod}, bytes=${totalBytes}): ${files
+        .map((f) => f.name)
+        .join(", ")}`
+    );
+    return {
+      uploaded: files.length,
+      method: uploadMethod,
+      chipCount: countComposerAttachmentIndicators(findComposerInput() || inputEl)
+    };
+  }
+
+  async function submitComposerWithVerification(
+    inputEl,
+    promptText,
+    job = null,
+    baselineCount = 0,
+    options = {}
+  ) {
     const promptTrimLen = String(promptText || "").trim().length;
+    const hadAttachments = Boolean(options && options.hadAttachments);
+    const preSubmitChipCount = Number((options && options.preSubmitChipCount) || 0);
+
     const hasSubmissionStarted = () => {
       if (job && (job.networkText.length > 0 || job.networkDone)) return true;
       if (isPageStillGenerating()) return true;
       if (collectAssistantReplyTexts().length > baselineCount) return true;
-      const curText = readComposerCurrentText(inputEl);
-      if (curText.length === 0) return true;
+      const liveInput = findComposerInput() || inputEl;
+      const curText = readComposerCurrentText(liveInput);
+      if (promptTrimLen > 0 && curText.length === 0) return true;
       if (promptTrimLen > 10 && curText.length < Math.min(20, promptTrimLen * 0.2)) return true;
+      if (
+        hadAttachments &&
+        preSubmitChipCount > 0 &&
+        countComposerAttachmentIndicators(liveInput) === 0
+      ) {
+        return true;
+      }
       return false;
     };
 
@@ -965,7 +1461,7 @@
     await sleep(180);
 
     const activeInput = findComposerInput() || inputEl;
-    if (!readComposerCurrentText(activeInput) && !hasSubmissionStarted()) {
+    if (promptTrimLen > 0 && !readComposerCurrentText(activeInput) && !hasSubmissionStarted()) {
       await fillInputWithPrompt(activeInput, promptText);
       await sleep(100);
     }
@@ -2101,6 +2597,48 @@
   const REPLY_POSTMSG_CHUNK_THRESHOLD = 32768;
   const REPLY_POSTMSG_CHUNK_SIZE = 24576;
   const mainPromptReassembly = new Map();
+  const mainAttachmentReassembly = new Map();
+
+  function cleanupRequestAttachments(requestId) {
+    if (!requestId) return;
+    const prefix = `${requestId}:`;
+    for (const key of Array.from(mainAttachmentReassembly.keys())) {
+      if (key.startsWith(prefix)) {
+        mainAttachmentReassembly.delete(key);
+      }
+    }
+  }
+
+  function reassembleRequestAttachments(requestId, rawAttachments) {
+    if (!Array.isArray(rawAttachments) || rawAttachments.length === 0) {
+      cleanupRequestAttachments(requestId);
+      return [];
+    }
+    const resolved = [];
+    for (let i = 0; i < rawAttachments.length; i += 1) {
+      const item = rawAttachments[i] || {};
+      const attId = String(item.id || `att-${i}`);
+      const key = `${requestId}:${attId}`;
+      const entry = mainAttachmentReassembly.get(key);
+      mainAttachmentReassembly.delete(key);
+      let dataB64 = "";
+      if (typeof item.data_b64 === "string" && item.data_b64.length > 0) {
+        dataB64 = item.data_b64;
+      } else if (entry) {
+        const total = item.total_chunks || entry.total || entry.parts.length;
+        dataB64 = Array.from({ length: total }, (_, idx) => entry.parts[idx] || "").join("");
+      }
+      resolved.push({
+        id: attId,
+        filename: String(item.filename || `attachment-${i + 1}.bin`),
+        mime_type: String(item.mime_type || "application/octet-stream"),
+        kind: String(item.kind || "file"),
+        bytes: item.bytes instanceof Uint8Array ? item.bytes : decodeBase64ToUint8Array(dataB64)
+      });
+    }
+    cleanupRequestAttachments(requestId);
+    return resolved;
+  }
 
   function emitRequestComplete(payload) {
     const fullReply = String(payload.reply || "");
@@ -2129,6 +2667,7 @@
   async function executePromptJob({
     request_id: requestId,
     prompt,
+    attachments,
     callback_url: callbackUrl,
     target_model: targetModel,
     reset_chat: resetChat,
@@ -2171,7 +2710,10 @@
     activeJob = job;
 
     try {
-      if (!String(prompt || "").trim()) {
+      const resolvedAttachments = reassembleRequestAttachments(requestId, attachments);
+      const hasAttachments = resolvedAttachments.length > 0;
+      const promptText = String(prompt || "");
+      if (!promptText.trim() && !hasAttachments) {
         throw new Error("收到的请求内容为空 (len=0)，已中止空消息提交。");
       }
 
@@ -2189,8 +2731,8 @@
         await ensureWebModelSelected(targetModel);
       }
 
-      // Optional Replay path if explicitly selected
-      if (driverConfig.driverMode === "replay" && sharedState.lastCapturedRpc) {
+      // Optional Replay path if explicitly selected (bypassed when binary/file attachments are present)
+      if (!hasAttachments && driverConfig.driverMode === "replay" && sharedState.lastCapturedRpc) {
         try {
           const replayReply = await tryDirectFetchReplay(prompt, job, timeoutMs || 180000);
           emitRequestComplete({
@@ -2227,14 +2769,33 @@
       const baselineCount = baselineReplies.length;
       const baselineLastText = baselineCount > 0 ? baselineReplies[baselineCount - 1] : "";
 
-      await fillInputWithPrompt(inputEl, prompt);
+      let preSubmitChipCount = 0;
+      if (hasAttachments) {
+        const uploadRes = await uploadAttachmentsToComposer(inputEl, resolvedAttachments);
+        preSubmitChipCount = Number(uploadRes.chipCount || 0);
+        inputEl = findComposerInput() || inputEl;
+      }
+
+      let effectivePrompt = promptText;
+      if (promptText.trim().length > 0) {
+        await fillInputWithPrompt(inputEl, promptText);
+      } else if (hasAttachments && !findSendButton(inputEl)) {
+        // Some composer versions keep Send disabled unless at least a single space/period is typed
+        await fillInputWithPrompt(inputEl, " ");
+        effectivePrompt = " ";
+      }
       const sendMethod = await submitComposerWithVerification(
         inputEl,
-        prompt,
+        effectivePrompt,
         job,
-        baselineCount
+        baselineCount,
+        { hadAttachments: hasAttachments, preSubmitChipCount }
       );
-      logDriver("info", `已提交问题 (${sendMethod}, len=${prompt.length})，等待响应流...`);
+
+      logDriver(
+        "info",
+        `已提交问题 (${sendMethod}, len=${promptText.length}, files=${resolvedAttachments.length})，等待响应流...`
+      );
 
       const startedAt = Date.now();
       lastActivityAt = Date.now();
@@ -2380,6 +2941,7 @@
         });
       }
     } finally {
+      cleanupRequestAttachments(requestId);
       if (activeJob === job) {
         activeJob = null;
       }
@@ -2478,6 +3040,18 @@
       return;
     }
 
+    if (action === "attachment_chunk") {
+      const key = `${payload.request_id}:${payload.attachment_id}`;
+      let entry = mainAttachmentReassembly.get(key);
+      if (!entry) {
+        entry = { parts: [], total: payload.total_chunks || 0 };
+        mainAttachmentReassembly.set(key, entry);
+      }
+      entry.parts[payload.chunk_index] = payload.data || "";
+      if (payload.total_chunks) entry.total = payload.total_chunks;
+      return;
+    }
+
     if (action === "prompt_chunk") {
       let entry = mainPromptReassembly.get(payload.request_id);
       if (!entry) {
@@ -2544,6 +3118,9 @@
     computeCleanNewChatUrl,
     findComposerInput,
     findSendButton,
+    findBestFileInput,
+    findComposerAttachButton,
+    uploadAttachmentsToComposer,
     fillInputWithPrompt,
     submitComposer,
     submitComposerWithVerification,

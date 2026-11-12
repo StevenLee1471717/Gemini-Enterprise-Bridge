@@ -775,5 +775,200 @@ assert.ok(healedEv, "Must complete prompt after background tab self-heal");
 assert.equal(healedEv.reply, "Self-healed reply: Prompt needing background tab self-heal");
 sendBtn._listeners.set("click", savedSendListeners);
 
+// Test 9: Multimodal binary chunk reassembly (`attachment_chunk`) + hidden `<input type="file">` upload + empty-caption attachment submission!
+const hiddenFileInput = new MockElement("input", {
+  hidden: true,
+  attrs: { type: "file" }
+});
+hiddenFileInput.type = "file";
+hiddenFileInput.multiple = true;
+let uploadedFilesOnHiddenInput = [];
+const activeChipNodes = [];
+hiddenFileInput.addEventListener("change", () => {
+  uploadedFilesOnHiddenInput = Array.from(hiddenFileInput.files || []);
+  // Render attachment chips inside composer + brief upload progress spinner to test waitForComposerAttachmentsReady!
+  const spinner = new MockElement("md-circular-progress", {
+    rect: { left: 360, top: 740, right: 380, bottom: 760, width: 20, height: 20 }
+  });
+  searchShadow.appendChild(spinner);
+  for (const f of uploadedFilesOnHiddenInput) {
+    const chip = new MockElement("ucs-attachment-chip", {
+      text: f.name,
+      rect: { left: 360, top: 735, right: 480, bottom: 762, width: 120, height: 27 }
+    });
+    searchShadow.appendChild(chip);
+    activeChipNodes.push(chip);
+  }
+  realSetTimeout(() => {
+    spinner.remove();
+  }, 80);
+});
+searchShadow.appendChild(hiddenFileInput);
+
+sendBtn.addEventListener("click", () => {
+  while (activeChipNodes.length > 0) {
+    const chip = activeChipNodes.pop();
+    chip.remove();
+  }
+});
+
+const rawPngPayload = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0xde, 0xad, 0xbe, 0xef]);
+const rawPdfPayload = Buffer.from("%PDF-1.7\nMultimodal Bridge Test\n%%EOF", "utf8");
+const pngB64 = rawPngPayload.toString("base64");
+const pdfB64 = rawPdfPayload.toString("base64");
+
+// Stream PNG in 2 chunks via `attachment_chunk` and PDF in 1 chunk
+doc.dispatchEvent(
+  Object.assign(new MockEvent("message"), {
+    source: vmWindow,
+    origin: mockLocation.origin,
+    data: {
+      channel: "GEB_ISOLATED_TO_MAIN",
+      action: "attachment_chunk",
+      payload: {
+        request_id: "req-mm-hidden-input",
+        attachment_id: "att-png-1",
+        chunk_index: 0,
+        total_chunks: 2,
+        data: pngB64.slice(0, 8)
+      }
+    }
+  })
+);
+doc.dispatchEvent(
+  Object.assign(new MockEvent("message"), {
+    source: vmWindow,
+    origin: mockLocation.origin,
+    data: {
+      channel: "GEB_ISOLATED_TO_MAIN",
+      action: "attachment_chunk",
+      payload: {
+        request_id: "req-mm-hidden-input",
+        attachment_id: "att-png-1",
+        chunk_index: 1,
+        total_chunks: 2,
+        data: pngB64.slice(8)
+      }
+    }
+  })
+);
+doc.dispatchEvent(
+  Object.assign(new MockEvent("message"), {
+    source: vmWindow,
+    origin: mockLocation.origin,
+    data: {
+      channel: "GEB_ISOLATED_TO_MAIN",
+      action: "attachment_chunk",
+      payload: {
+        request_id: "req-mm-hidden-input",
+        attachment_id: "att-pdf-2",
+        chunk_index: 0,
+        total_chunks: 1,
+        data: pdfB64
+      }
+    }
+  })
+);
+
+nextSimulatedReplyOverride = "Parsed diagram.png and spec.pdf successfully!";
+doc.dispatchEvent(
+  Object.assign(new MockEvent("message"), {
+    source: vmWindow,
+    origin: mockLocation.origin,
+    data: {
+      channel: "GEB_ISOLATED_TO_MAIN",
+      action: "execute_prompt",
+      payload: {
+        request_id: "req-mm-hidden-input",
+        prompt: "", // Empty text caption: attachment-only submission!
+        chunked: false,
+        total_chunks: 0,
+        attachments: [
+          { id: "att-png-1", filename: "diagram.png", mime_type: "image/png", size_bytes: rawPngPayload.length, media_kind: "image", total_chunks: 2 },
+          { id: "att-pdf-2", filename: "spec.pdf", mime_type: "application/pdf", size_bytes: rawPdfPayload.length, media_kind: "document", total_chunks: 1 }
+        ],
+        target_model: null,
+        reset_chat: false,
+        timeout_ms: 6000
+      }
+    }
+  })
+);
+
+for (let w = 0; w < 120; w += 1) {
+  if (emittedEvents.some((e) => e.type === "request_complete" && e.request_id === "req-mm-hidden-input")) {
+    break;
+  }
+  await new Promise((r) => realSetTimeout(r, 25));
+}
+const mmEv1 = emittedEvents.find(
+  (e) => e.type === "request_complete" && e.request_id === "req-mm-hidden-input"
+);
+assert.ok(mmEv1, "Attachment-only multimodal prompt must complete cleanly");
+assert.equal(mmEv1.reply, "Parsed diagram.png and spec.pdf successfully!");
+assert.equal(uploadedFilesOnHiddenInput.length, 2, "Both PNG and PDF must be attached to hidden <input type='file'>");
+assert.equal(uploadedFilesOnHiddenInput[0].name, "diagram.png");
+assert.equal(uploadedFilesOnHiddenInput[0].type, "image/png");
+assert.equal(uploadedFilesOnHiddenInput[0].size, rawPngPayload.length);
+assert.equal(uploadedFilesOnHiddenInput[1].name, "spec.pdf");
+assert.equal(uploadedFilesOnHiddenInput[1].type, "application/pdf");
+assert.equal(uploadedFilesOnHiddenInput[1].size, rawPdfPayload.length);
+
+// Test 10: Attach-button + local upload menu interception via `HTMLInputElement.prototype.click` when no `<input type="file">` is pre-mounted!
+hiddenFileInput.remove();
+sandbox.HTMLInputElement.prototype.click = function () {};
+let dynamicMenuCapturedFiles = [];
+const uploadMenuItem = new MockElement("md-menu-item", {
+  text: "Upload from computer",
+  hidden: true,
+  attrs: { role: "menuitem" },
+  rect: { left: 316, top: 720, right: 500, bottom: 760, width: 184, height: 40 }
+});
+doc.body.appendChild(uploadMenuItem);
+
+composerPlusBtn.addEventListener("click", () => {
+  uploadMenuItem.style.display = "block";
+});
+uploadMenuItem.addEventListener("click", () => {
+  uploadMenuItem.style.display = "none";
+  const ephemeralFileInput = new MockElement("input", { hidden: true, attrs: { type: "file" } });
+  ephemeralFileInput.type = "file";
+  ephemeralFileInput.multiple = true;
+  ephemeralFileInput.addEventListener("change", () => {
+    dynamicMenuCapturedFiles = Array.from(ephemeralFileInput.files || []);
+  });
+  // Trigger native picker click — page-driver.js must intercept this without opening OS dialog!
+  sandbox.HTMLInputElement.prototype.click.call(ephemeralFileInput);
+});
+
+const audioPayload = Buffer.from("RIFF\x24\x00\x00\x00WAVEfmt ", "binary");
+nextSimulatedReplyOverride = "Transcribed meeting.wav!";
+await api.executePromptJob({
+  request_id: "req-mm-attach-menu",
+  prompt: "Transcribe this audio",
+  attachments: [
+    {
+      id: "att-wav-1",
+      filename: "meeting.wav",
+      mime_type: "audio/wav",
+      size_bytes: audioPayload.length,
+      media_kind: "audio",
+      data_b64: audioPayload.toString("base64")
+    }
+  ],
+  target_model: null,
+  reset_chat: false,
+  timeout_ms: 6000
+});
+
+const mmEv2 = emittedEvents.find(
+  (e) => e.type === "request_complete" && e.request_id === "req-mm-attach-menu"
+);
+assert.ok(mmEv2, "Attach-menu intercepted upload must complete cleanly");
+assert.equal(mmEv2.reply, "Transcribed meeting.wav!");
+assert.equal(dynamicMenuCapturedFiles.length, 1, "Must intercept dynamic file input via attach button + Upload menu");
+assert.equal(dynamicMenuCapturedFiles[0].name, "meeting.wav");
+assert.equal(dynamicMenuCapturedFiles[0].type, "audio/wav");
+
 console.log("ALL_SHADOW_DOM_DRIVER_TESTS_PASSED");
 process.exit(0);

@@ -6,6 +6,8 @@ const elTabStatus = document.getElementById("tabStatusText");
 const elRpcStatus = document.getElementById("rpcStatusText");
 const elErrorBanner = document.getElementById("errorBanner");
 const elTabSelect = document.getElementById("tabSelect");
+const elAutoSpawn = document.getElementById("autoSpawnSelect");
+const elMaxTabs = document.getElementById("maxTabsSelect");
 const elModeSelect = document.getElementById("driverModeSelect");
 const elWsUrl = document.getElementById("wsUrlInput");
 const elModelSel = document.getElementById("modelSelector");
@@ -52,6 +54,8 @@ async function loadState(overwriteInputs = false) {
     if (!initialFormHydrated || overwriteInputs) {
       elEnabled.checked = Boolean(settings.enabled);
       elModeSelect.value = settings.driverMode || "auto";
+      if (elAutoSpawn) elAutoSpawn.value = settings.autoSpawnTabs === false ? "false" : "true";
+      if (elMaxTabs) elMaxTabs.value = String(settings.maxParallelTabs || 4);
       elWsUrl.value = settings.wsUrl || "ws://127.0.0.1:8000/ws/browser";
       if (elModelSel) elModelSel.value = settings.customModelSelector || "";
       elInputSel.value = settings.customInputSelector || "";
@@ -65,16 +69,16 @@ async function loadState(overwriteInputs = false) {
     elTabSelect.replaceChildren();
     const autoOpt = document.createElement("option");
     autoOpt.value = "";
-    autoOpt.textContent = "自动选择活跃的 Gemini Enterprise 标签页";
+    autoOpt.textContent = `多标签页并行池（已挂载 ${(vertexTabs || []).length} 个标签页）`;
     elTabSelect.appendChild(autoOpt);
 
     for (const t of vertexTabs || []) {
       const opt = document.createElement("option");
       opt.value = String(t.id);
-      const shortTitle = (t.title || "Gemini Enterprise").slice(0, 28);
+      const shortTitle = (t.title || "Gemini Enterprise").slice(0, 26);
       const acctMatch = (t.url || "").match(/\/u\/(\d+)\//);
       const acctTag = acctMatch ? ` [/u/${acctMatch[1]}]` : "";
-      opt.textContent = `#${t.id}${acctTag} ${shortTitle}`;
+      opt.textContent = `仅固定 #${t.id}${acctTag} ${shortTitle}`;
       if (String(t.id) === currentSelected) {
         opt.selected = true;
       }
@@ -92,9 +96,13 @@ async function loadState(overwriteInputs = false) {
       elWsPill.className = "pill err";
     }
 
-    if (activeTab) {
-      elTabStatus.textContent = `#${activeTab.id} · ${activeTab.title || activeTab.url}`;
+    const tabTotal = (vertexTabs || []).length;
+    if (preferredTabId && activeTab) {
+      elTabStatus.textContent = `固定单页 #${activeTab.id} · ${activeTab.title || activeTab.url}`;
       elTabStatus.title = activeTab.url;
+    } else if (tabTotal > 0) {
+      elTabStatus.textContent = `${tabTotal} 个工作页就绪 (上限 ${settings.maxParallelTabs || 4})`;
+      elTabStatus.title = (vertexTabs || []).map((t) => `#${t.id}: ${t.url}`).join("\n");
     } else {
       elTabStatus.textContent = "未打开 vertexaisearch.cloud.google.com";
       elTabStatus.title = "";
@@ -128,6 +136,8 @@ async function saveSettings() {
   const settings = {
     enabled: elEnabled.checked,
     driverMode: elModeSelect.value,
+    autoSpawnTabs: elAutoSpawn ? elAutoSpawn.value !== "false" : true,
+    maxParallelTabs: elMaxTabs ? Number(elMaxTabs.value) || 4 : 4,
     wsUrl: elWsUrl.value.trim() || "ws://127.0.0.1:8000/ws/browser",
     customModelSelector: elModelSel ? elModelSel.value.trim() : "",
     customInputSelector: elInputSel.value.trim(),
@@ -170,6 +180,19 @@ document.getElementById("saveBtn").addEventListener("click", () => {
 elEnabled.addEventListener("change", () => {
   void saveSettings();
 });
+
+const spawnBtn = document.getElementById("spawnTabBtn");
+if (spawnBtn) {
+  spawnBtn.addEventListener("click", () => {
+    void (async () => {
+      elDiagOut.dataset.showingDiag = "1";
+      elDiagOut.textContent = "正在后台静默创建新的 Gemini Enterprise 并行工作标签页...";
+      const res = await chrome.runtime.sendMessage({ type: "GEB_POPUP_SPAWN_TAB" });
+      elDiagOut.textContent = JSON.stringify(res, null, 2);
+      await loadState(false);
+    })();
+  });
+}
 
 document.getElementById("diagnoseBtn").addEventListener("click", () => {
   void runPageDiagnosis();

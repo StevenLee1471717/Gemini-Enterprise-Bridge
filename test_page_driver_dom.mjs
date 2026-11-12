@@ -390,6 +390,7 @@ const menuDefs = [
   { label: "Auto", desc: "Automatically selects the best model for your prompt" }, // Note "prompt" contains "pro"!
   { label: "3.1 Pro", desc: "Complex reasoning & analysis" },
   { label: "4 Argon", desc: "Frontier multimodal & agentic tasks" },
+  { label: "4 Carbon", desc: "Next-gen enterprise reasoning & coding" },
   { label: "3.8 Flash", desc: "Fast everyday assistance" }
 ];
 
@@ -516,6 +517,24 @@ const swArgonAgain = await api.ensureWebModelSelected("4-argon");
 assert.equal(swArgonAgain.ok, true);
 assert.equal(swArgonAgain.switched, false);
 assert.equal(swArgonAgain.alreadySelected, true);
+
+// Test 2b: Switch from "4 Argon" -> "4-carbon" (`4carbon`) — must NOT falsely treat "4 Argon" as already matching "4-carbon"!
+const swCarbon = await api.ensureWebModelSelected("4-carbon");
+assert.equal(swCarbon.ok, true);
+assert.equal(swCarbon.switched, true);
+assert.equal(api.readDetectedWebModel(), "4 Carbon");
+
+// Calling ensureWebModelSelected("4-carbon") again is an instant no-op (`alreadySelected: true`)
+const swCarbonAgain = await api.ensureWebModelSelected("4-carbon");
+assert.equal(swCarbonAgain.ok, true);
+assert.equal(swCarbonAgain.switched, false);
+assert.equal(swCarbonAgain.alreadySelected, true);
+
+// Switching back from "4 Carbon" -> "4-argon" must also switch cleanly without false match
+const swBackToArgon = await api.ensureWebModelSelected("4-argon");
+assert.equal(swBackToArgon.ok, true);
+assert.equal(swBackToArgon.switched, true);
+assert.equal(api.readDetectedWebModel(), "4 Argon");
 
 // Test 3: Switch to "3.1-pro" — must NOT falsely match "prompt" in Auto's description, AND must dismiss sticky backdrop!
 const sw31Pro = await api.ensureWebModelSelected("3.1-pro");

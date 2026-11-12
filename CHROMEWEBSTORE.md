@@ -18,7 +18,7 @@ Gemini Enterprise Web-to-API Bridge lets developers and researchers use their ac
 ### Key Benefits
 - **Zero credential extraction:** Uses your normal signed-in browser tab directly without copying cookies or tokens to external servers.
 - **Local-only gateway:** Connects exclusively to `127.0.0.1` / `localhost` on your own machine.
-- **Direct model selection:** Choose Gemini 3.1 Pro, Gemini 4 Argon, Gemini 3.8 Flash, or custom enterprise models directly from your local client.
+- **Direct model selection:** Choose Gemini 3.1 Pro, Gemini 4 Argon, Gemini 4 Carbon, Gemini 3.8 Flash, or custom enterprise models directly from your local client.
 - **Agentic & tool-calling ready:** Supports multi-step local tool execution workflows alongside real-time streaming responses.
 - **Multi-account workspace support:** Select which signed-in `/u/0/`, `/u/1/`, or `/u/3/` Gemini Enterprise tab handles your requests.
 - **One-click diagnostics:** Check page readiness, start a fresh conversation, or pause bridging anytime from the toolbar popup.

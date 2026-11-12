@@ -75,7 +75,9 @@ cd I:\Projects\Gemini-Enterprise-Bridge
 | **Model（保持网页当前模型）** | `gemini-enterprise-web`（新建对话：`gemini-enterprise-web-newchat`） |
 | **Model（自动切换 Gemini 3.1 Pro）** | `gemini-3.1-pro`（简写：`3.1pro` / `3.1-pro`；新建对话：`gemini-3.1-pro-newchat`） |
 | **Model（自动切换 Gemini 4 Argon）** | `gemini-4-argon`（简写：`4argon` / `4-argon`；新建对话：`gemini-4-argon-newchat`） |
+| **Model（自动切换 Gemini 4 Carbon）** | `gemini-4-carbon`（简写：`4carbon` / `4-carbon`；新建对话：`gemini-4-carbon-newchat`） |
 | **Model（自动切换 Gemini 3.8 Flash）** | `gemini-3.8-flash`（简写：`3.8flash` / `3.8-flash`；新建对话：`gemini-3.8-flash-newchat`） |
+| **Model（多会话固定绑定语法）** | 任意模型名后追加 `@会话名`（如 `gemini-4-argon@agent1`、`3.1pro@agent2`）或请求头 `X-Session-Id` |
 | **Model（其他网页模型透传）** | `gemini-2.5-pro`、`gemini-2.5-flash` 或任意 `gemini-web:<网页菜单名称>` |
 | **Model（官方 GCloud 模式）** | `gemini-enterprise-gcloud` |
 
@@ -85,8 +87,9 @@ cd I:\Projects\Gemini-Enterprise-Bridge
 
 ## 核心特性说明
 
-### 1. 客户端直接切换网页模型（3.1 Pro / 4 Argon / 3.8 Flash）
-无需切回浏览器手动点选模型菜单：在 Cursor、Cline、ChatBox、NextChat 或代码中指定 `model`（例如 `gemini-3.1-pro`、`4argon`、`3.8flash`），页面混合驱动会自动穿透多层 Shadow DOM 检查当前激活模型；若与目标不一致，则自动打开模型下拉框完成切换后再发送请求（若企业管理员锁定了单模型，也会自动记录提示并平滑降级发送，绝不中断请求）。
+### 1. 客户端直接切换网页模型（3.1 Pro / 4 Argon / 4 Carbon / 3.8 Flash）
+
+无需切回浏览器手动点选模型菜单：在 Cursor、Cline、ChatBox、NextChat 或代码中指定 `model`（例如 `gemini-3.1-pro`、`4argon`、`4carbon`、`3.8flash`），页面混合驱动会自动穿透多层 Shadow DOM 检查当前激活模型；若与目标不一致，则自动打开模型下拉框完成切换后再发送请求（若企业管理员锁定了单模型，也会自动记录提示并平滑降级发送，绝不中断请求）。
 
 ### 2. 完整 OpenAI Tool Calling (`tools` / `tool_calls`) 与多轮 Agentic Loop 支持
 完美适配 **Cursor Agent、Cline、Roo Code、LangChain、OpenAI Agents SDK** 等智能体工具循环：
@@ -127,8 +130,13 @@ resp = client.chat.completions.create(
 print(resp.choices[0].message.tool_calls)
 ```
 
-### 3. 多账号 `/u/3/` 标签页定向绑定
-如果你在浏览器中同时登录了个人 Google 账号（`/u/0/`）与企业/机构账号（`/u/3/`），点击扩展弹窗即可在 **绑定标签页** 下拉框中精确指定某个标签页，或交由扩展自动选择活跃的 Gemini Enterprise 页面。
+### 3. 多会话真并行工作池 + 后台自动扩容 (`WorkerSlot` Pool & Auto-Spawn)
+不再受限于全局单会话串行锁——支持在多个客户端窗口、多个 Copilot / Cursor / Cline 智能体会话中**同时并发调用** Gemini Enterprise：
+- **每标签页独立并发锁 (`WorkerSlot`)**：每个已打开的 `vertexaisearch.cloud.google.com` 标签页（包含不同 `/u/0/`、`/u/3/` 账号标签页或不同浏览器实例）均注册为独立并行工作槽位，多个会话可同时流式生成且互不阻塞。
+- **按需后台静默扩容 (`BRIDGE_AUTO_SPAWN_TABS=true`)**：哪怕你最初只打开了 **1 个** Gemini Enterprise 标签页，当第 2、第 3 个并行会话到来时，MV3 扩展会在后台静默新建工作标签页（`active: false`，不抢占当前窗口焦点，默认上限 `BRIDGE_MAX_PARALLEL_TABS=4`，可在 `.env` 或扩展弹窗调整；也可随时点击扩展弹窗中的 **+ 新增并行标签页**）。
+- **零配置历史前缀粘性路由 + 可选 `@会话名` 强绑定**：
+  - **自动粘性路由**：网关自动比对各工作槽位的对话前缀（含多步 Tool Call 循环），确保会话 A 的追问精准回到标签页 #1、会话 B 的追问精准回到标签页 #2，互不覆盖、无需重置。
+  - **显式会话绑定（可选）**：在客户端模型名后加上 `@任意标识`（如窗口 1 填 `gemini-4-argon@code`、窗口 2 填 `gemini-3.8-flash@doc`，或传入请求头 `X-Session-Id` / JSON 字段 `session_id`），即可为每个窗口永久分配专属工作标签页。
 
 ### 4. 三种页面执行模式（扩展弹窗可随时切换）
 - **`Auto 混合模式`（默认推荐）**：通过深层 Shadow DOM 自动填入问题并触发发送，同时在 `MAIN` 世界被动监听 `StreamAssist` / `converse` 响应流，实时推送流式文本分片与企业知识库参考链接；若接口格式变动，自动无缝回退至 Shadow DOM 增量文本提取。
@@ -160,7 +168,7 @@ pytest -v
 
 测试套件 (`test_bridge.py`) 完整覆盖：
 - `/health`、`/api/status`、`/v1/models` 与 API Key 鉴权校验；
-- 网页模型直选与简写别名解析（`3.1pro`、`4argon`、`3.8flash`、`*-newchat`、`gemini-web:*`）及向浏览器端下发验证；
+- 网页模型直选与简写别名解析（`3.1pro`、`4argon`、`4carbon`、`3.8flash`、`*-newchat`、`gemini-web:*`）及向浏览器端下发验证；
 - OpenAI Tool Calling 非流式与 SSE 流式分片解析（含并行工具控制、强制函数调用、零标签泄漏验证）；
 - 多轮 Agentic Loop 同会话增量回传（`smart_incremental_delta` + `reset_chat=False`）与 `json_object` 模式校验；
 - 模拟浏览器 WebSocket 扩展与 Tampermonkey HTTP 长轮询桥接及并发请求 FIFO 串行锁验证；

@@ -24,10 +24,16 @@
   pageWin.__GEB_USERSCRIPT_ACTIVE__ = true;
 
   const SERVER_BASE = GM_getValue("geb_server_base", "http://127.0.0.1:8000");
-  let clientId = GM_getValue("geb_client_id", "");
-  if (!clientId) {
+  // Use per-tab `sessionStorage` so each open Gemini Enterprise tab acts as an independent parallel worker!
+  let clientId = "";
+  try {
+    clientId = pageWin.sessionStorage.getItem("geb_tab_client_id") || "";
+    if (!clientId) {
+      clientId = "tm-" + Math.random().toString(36).slice(2, 10);
+      pageWin.sessionStorage.setItem("geb_tab_client_id", clientId);
+    }
+  } catch (_) {
     clientId = "tm-" + Math.random().toString(36).slice(2, 10);
-    GM_setValue("geb_client_id", clientId);
   }
 
   let activeJob = null;
@@ -266,7 +272,8 @@
     const k = String(targetModel).trim().toLowerCase();
     if (k === "auto") return /^(?:gemini\s+)?auto\b|^自动/i.test(headline);
     if (k === "3.1-pro") return /3\.1\s*[-]?\s*pro\b|3\.1pro\b/i.test(headline) || /3\.1\s*[-]?\s*pro\b/i.test(cleaned);
-    if (k === "4-argon") return /4\s*[-]?\s*argon\b|4argon\b|\bargon\b/i.test(headline) || /4\s*[-]?\s*argon\b/i.test(cleaned);
+    if (k === "4-argon") return !/\bcarbon\b|4carbon\b/i.test(headline) && (/4(?:\.0)?\s*[-]?\s*argon\b|4argon\b|\bargon\b/i.test(headline) || /4(?:\.0)?\s*[-]?\s*argon\b/i.test(cleaned));
+    if (k === "4-carbon") return !/\bargon\b|4argon\b/i.test(headline) && (/4(?:\.0)?\s*[-]?\s*carbon\b|4carbon\b|\bcarbon\b/i.test(headline) || /4(?:\.0)?\s*[-]?\s*carbon\b/i.test(cleaned));
     if (k === "3.8-flash") return /3\.8\s*[-]?\s*flash\b|3\.8flash\b/i.test(headline) || /3\.8\s*[-]?\s*flash\b/i.test(cleaned);
     if (k === "2.5-pro") return /2\.5\s*[-]?\s*pro\b|2\.5pro\b/i.test(headline);
     if (k === "2.5-flash") return /2\.5\s*[-]?\s*flash\b|2\.5flash\b/i.test(headline);
@@ -302,7 +309,7 @@
   async function ensureWebModelSelected(targetModel) {
     if (!targetModel || !String(targetModel).trim()) return;
     const excludeRe = /\b(send|submit|attach|upload|mic|voice|stop|clear|copy|new chat|new session|history|settings|tools|sources)\b|发送|上传|语音|停止|清空|新建|新会话|历史|设置|工具|数据源/i;
-    const modelTextRe = /\b(gemini|3\.1\s*[-]?\s*pro|3\.1pro|4\s*[-]?\s*argon|4argon|argon|3\.8\s*[-]?\s*flash|3\.8flash|2\.5\s*[-]?\s*pro|2\.5\s*[-]?\s*flash)\b|^(auto|自动|fast|pro|flash|thinking)$/i;
+    const modelTextRe = /\b(gemini|3\.1\s*[-]?\s*pro|3\.1pro|4(?:\.0)?\s*[-]?\s*argon|4argon|argon|4(?:\.0)?\s*[-]?\s*carbon|4carbon|carbon|3\.8\s*[-]?\s*flash|3\.8flash|2\.5\s*[-]?\s*pro|2\.5\s*[-]?\s*flash)\b|^(auto|自动|fast|pro|flash|thinking)$/i;
 
     let trigger = null;
     const hosts = queryDeep('ucs-model-selector, ucs-model-picker, model-selector, [data-test-id*="model" i], [data-testid*="model" i], [class*="model-selector" i]').filter(visible);

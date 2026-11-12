@@ -1297,7 +1297,7 @@
   }
 
   // =========================================================================
-  // 2b. Web UI Model Selector Discovery & Auto-Switching (Auto / 3.1 Pro / 4 Argon / 3.8 Flash)
+  // 2b. Web UI Model Selector Discovery & Auto-Switching (Auto / 3.1 Pro / 4 Argon / 4 Carbon / 3.8 Flash)
   // =========================================================================
 
   const MODEL_MATCH_RULES = {
@@ -1310,8 +1310,14 @@
       headlineRe: /3\.1\s*[-]?\s*pro\b|3\.1pro\b/i
     },
     "4-argon": {
-      exactRe: /^(?:gemini\s+)?4\s*[-]?\s*argon\b|^argon\b/i,
-      headlineRe: /4\s*[-]?\s*argon\b|4argon\b|\bargon\b/i
+      exactRe: /^(?:gemini\s+)?4(?:\.0)?\s*[-]?\s*argon\b|^argon\b/i,
+      headlineRe: /4(?:\.0)?\s*[-]?\s*argon\b|4argon\b|\bargon\b/i,
+      conflictRe: /\bcarbon\b|4carbon\b/i
+    },
+    "4-carbon": {
+      exactRe: /^(?:gemini\s+)?4(?:\.0)?\s*[-]?\s*carbon\b|^carbon\b/i,
+      headlineRe: /4(?:\.0)?\s*[-]?\s*carbon\b|4carbon\b|\bcarbon\b/i,
+      conflictRe: /\bargon\b|4argon\b/i
     },
     "3.8-flash": {
       exactRe: /^(?:gemini\s+)?3\.8\s*[-]?\s*flash\b/i,
@@ -1342,10 +1348,11 @@
 
     const rule = MODEL_MATCH_RULES[key];
     if (rule) {
+      if (rule.conflictRe && rule.conflictRe.test(headline)) return 0;
       if (rule.exactRe.test(headline)) return 120;
       if (rule.headlineRe.test(headline)) return 100;
       // For `auto`, avoid matching description text like "Automatically selects..."
-      if (key !== "auto" && rule.headlineRe.test(cleaned)) return 75;
+      if (key !== "auto" && (!rule.conflictRe || !rule.conflictRe.test(cleaned)) && rule.headlineRe.test(cleaned)) return 75;
       return 0;
     }
 
@@ -1440,7 +1447,7 @@
       /\b(send|submit|attach|upload|mic|voice|audio|stop|clear|copy|new chat|new conversation|history|settings|share|feedback|help|sign out|tools|sources|connectors|data stores)\b|发送|提交|上传|附件|语音|停止|清空|新建|新会话|历史|设置|分享|反馈|工具|数据源|连接器/i;
 
     const explicitModelNameRe =
-      /\b(gemini|3\.1\s*[-]?\s*pro|3\.1pro|4\s*[-]?\s*argon|4argon|argon|3\.8\s*[-]?\s*flash|3\.8flash|2\.5\s*[-]?\s*pro|2\.5\s*[-]?\s*flash|2\.0\s*[-]?\s*flash)\b/i;
+      /\b(gemini|3\.1\s*[-]?\s*pro|3\.1pro|4(?:\.0)?\s*[-]?\s*argon|4argon|argon|4(?:\.0)?\s*[-]?\s*carbon|4carbon|carbon|3\.8\s*[-]?\s*flash|3\.8flash|2\.5\s*[-]?\s*pro|2\.5\s*[-]?\s*flash|2\.0\s*[-]?\s*flash)\b/i;
     const shortModePillRe =
       /^(auto|自动|fast|pro|flash|thinking|reasoning|ultra|standard|default)$/i;
     const modelAttrRe = /\b(model|llm|select model|choose model|switch model)\b|模型|切换模型|选择模型/i;

@@ -124,21 +124,26 @@ class ChatCompletionRequest(_FlexibleModel):
     max_completion_tokens: Optional[int] = None
     stop: Optional[Union[str, List[str]]] = None
     user: Optional[str] = None
+    session_id: Optional[str] = None
 
 
 class BridgeRegisterRequest(_FlexibleModel):
     client_id: Optional[str] = None
     user_agent: Optional[str] = None
+    tab_id: Optional[int] = None
     tab_url: Optional[str] = None
     tab_title: Optional[str] = None
     driver_mode: str = "auto"
     active_model: Optional[str] = None
+    tabs: Optional[List[Dict[str, Any]]] = None
+    capabilities: Optional[List[str]] = None
 
 
 class BridgeEventPayload(_FlexibleModel):
     client_id: str
     event: str  # heartbeat | request_ack | stream_chunk | request_complete | request_error | tab_status
     request_id: Optional[str] = None
+    tab_id: Optional[int] = None
     delta: Optional[str] = None
     reply: Optional[str] = None
     error: Optional[str] = None
@@ -150,6 +155,8 @@ class BridgeEventPayload(_FlexibleModel):
     driver_mode: Optional[str] = None
     captured_rpc: Optional[bool] = None
     active_model: Optional[str] = None
+    tabs: Optional[List[Dict[str, Any]]] = None
+    capabilities: Optional[List[str]] = None
     chunk_index: Optional[int] = None
     total_chunks: Optional[int] = None
     data: Optional[str] = None
@@ -159,6 +166,7 @@ class BridgeCallbackPayload(_FlexibleModel):
     """Direct HTTP callback upload for large (>32KB / 100KB+) replies & tool calls."""
 
     client_id: Optional[str] = None
+    tab_id: Optional[int] = None
     request_id: str
     reply: Optional[str] = None
     error: Optional[str] = None
@@ -317,11 +325,24 @@ WEB_MODEL_ALIASES: Dict[str, str] = {
     "3.1": "3.1-pro",
     # Gemini 4 Argon
     "gemini-4-argon": "4-argon",
+    "gemini-4.0-argon": "4-argon",
+    "gemini4.0argon": "4-argon",
     "gemini4argon": "4-argon",
     "gemini-4argon": "4-argon",
     "4-argon": "4-argon",
+    "4.0-argon": "4-argon",
     "4argon": "4-argon",
     "argon": "4-argon",
+    # Gemini 4 Carbon
+    "gemini-4-carbon": "4-carbon",
+    "gemini-4.0-carbon": "4-carbon",
+    "gemini4.0carbon": "4-carbon",
+    "gemini4carbon": "4-carbon",
+    "gemini-4carbon": "4-carbon",
+    "4-carbon": "4-carbon",
+    "4.0-carbon": "4-carbon",
+    "4carbon": "4-carbon",
+    "carbon": "4-carbon",
     # Gemini 3.8 Flash
     "gemini-3.8-flash": "3.8-flash",
     "gemini3.8flash": "3.8-flash",
@@ -363,10 +384,34 @@ _GENERIC_THIRD_PARTY_PREFIXES = (
 )
 
 
-def model_requests_new_chat(model_name: Optional[str]) -> bool:
+def parse_model_and_session(model_name: Optional[str]) -> tuple[str, Optional[str]]:
+    """Split optional `@session_tag` or `#session_tag` from model string.
+
+    Examples:
+        - `"gemini-4-argon@agent-1"` -> `("gemini-4-argon", "agent-1")`
+        - `"3.1pro#tab2"`            -> `("3.1pro", "tab2")`
+        - `"gemini-4-argon"`         -> `("gemini-4-argon", None)`
+    """
     if not model_name:
+        return ("", None)
+    raw = model_name.strip()
+    for sep in ("@", "#"):
+        if sep in raw:
+            base, _, tag = raw.partition(sep)
+            clean_tag = tag.strip()
+            # Support `4argon@sess1-newchat` by moving `-newchat` back onto base model
+            if clean_tag.lower().endswith("-newchat") and not base.lower().endswith("-newchat"):
+                clean_tag = clean_tag[: -len("-newchat")].strip()
+                base = f"{base.strip()}-newchat"
+            return (base.strip(), clean_tag or None)
+    return (raw, None)
+
+
+def model_requests_new_chat(model_name: Optional[str]) -> bool:
+    base_model, _ = parse_model_and_session(model_name)
+    if not base_model:
         return False
-    return model_name.strip().lower().endswith("-newchat")
+    return base_model.strip().lower().endswith("-newchat")
 
 
 def resolve_target_web_model(model_name: Optional[str]) -> Optional[str]:
@@ -374,13 +419,14 @@ def resolve_target_web_model(model_name: Optional[str]) -> Optional[str]:
 
     Returns:
         - `None` when the current browser model should be kept unchanged (e.g. `gemini-enterprise-web` or `gcloud`)
-        - Canonical web model key (`"3.1-pro"`, `"4-argon"`, `"3.8-flash"`, `"2.5-pro"`, `"2.5-flash"`)
+        - Canonical web model key (`"3.1-pro"`, `"4-argon"`, `"4-carbon"`, `"3.8-flash"`, `"2.5-pro"`, `"2.5-flash"`)
         - Or a clean custom UI label for pass-through models (`gemini-web:<label>` or future Gemini versions)
     """
-    if not model_name:
+    base_model, _ = parse_model_and_session(model_name)
+    if not base_model:
         return None
 
-    raw = model_name.strip()
+    raw = base_model.strip()
     if raw.lower().endswith("-newchat"):
         raw = raw[: -len("-newchat")].strip()
 
@@ -462,6 +508,20 @@ AVAILABLE_MODELS: List[Dict[str, Any]] = [
         "created": 1735689600,
         "owned_by": "google-enterprise-bridge",
         "description": "Start a fresh web chat session and select Gemini 4 Argon",
+    },
+    {
+        "id": "gemini-4-carbon",
+        "object": "model",
+        "created": 1735689600,
+        "owned_by": "google-enterprise-bridge",
+        "description": "Auto-select Gemini 4 Carbon in Gemini Enterprise web UI (aliases: 4carbon, 4-carbon)",
+    },
+    {
+        "id": "gemini-4-carbon-newchat",
+        "object": "model",
+        "created": 1735689600,
+        "owned_by": "google-enterprise-bridge",
+        "description": "Start a fresh web chat session and select Gemini 4 Carbon",
     },
     {
         "id": "gemini-3.8-flash",

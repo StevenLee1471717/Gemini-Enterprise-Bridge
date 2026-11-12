@@ -20,6 +20,7 @@ from schemas import (
     ChatMessage,
     extract_text_content,
     model_requests_new_chat,
+    parse_model_and_session,
     resolve_target_web_model,
 )
 from server import create_app
@@ -380,9 +381,18 @@ def test_model_alias_resolution_and_models_endpoint() -> None:
         assert resolve_target_web_model(alias) == "3.1-pro"
     for alias in ("4argon", "4-argon", "argon", "gemini-4-argon", "4argon-newchat"):
         assert resolve_target_web_model(alias) == "4-argon"
+    for alias in (
+        "4carbon",
+        "4-carbon",
+        "carbon",
+        "gemini4carbon",
+        "gemini-4-carbon",
+        "gemini-4.0-carbon",
+        "gemini-4-carbon-newchat",
+    ):
+        assert resolve_target_web_model(alias) == "4-carbon"
     for alias in ("3.8flash", "3.8-flash", "gemini-3.8-flash", "gemini-3.8-flash-newchat"):
         assert resolve_target_web_model(alias) == "3.8-flash"
-
     assert resolve_target_web_model("2.5pro") == "2.5-pro"
     assert resolve_target_web_model("2.5flash") == "2.5-flash"
     assert resolve_target_web_model("gemini-web:Gemini 4.5 Ultra") == "Gemini 4.5 Ultra"
@@ -390,6 +400,8 @@ def test_model_alias_resolution_and_models_endpoint() -> None:
 
     assert model_requests_new_chat("gemini-4-argon-newchat") is True
     assert model_requests_new_chat("gemini-4-argon") is False
+    assert model_requests_new_chat("gemini-4-carbon-newchat") is True
+    assert model_requests_new_chat("gemini-4-carbon") is False
 
     app = create_app(_make_test_settings())
     dispatched_commands: List[Dict[str, Any]] = []
@@ -402,6 +414,8 @@ def test_model_alias_resolution_and_models_endpoint() -> None:
             "gemini-3.1-pro-newchat",
             "gemini-4-argon",
             "gemini-4-argon-newchat",
+            "gemini-4-carbon",
+            "gemini-4-carbon-newchat",
             "gemini-3.8-flash",
             "gemini-3.8-flash-newchat",
         ):
@@ -422,7 +436,7 @@ def test_model_alias_resolution_and_models_endpoint() -> None:
 
             def model_worker() -> None:
                 ready.set()
-                for _ in range(3):
+                for _ in range(4):
                     cmd = ws.receive_json()
                     dispatched_commands.append(cmd)
                     ws.send_json(
@@ -438,7 +452,7 @@ def test_model_alias_resolution_and_models_endpoint() -> None:
             t.start()
             ready.wait(timeout=3.0)
 
-            for req_model in ("3.1pro", "gemini-4-argon", "3.8flash-newchat"):
+            for req_model in ("3.1pro", "gemini-4-argon", "gemini-4-carbon", "3.8flash-newchat"):
                 r = client.post(
                     "/v1/chat/completions",
                     json={"model": req_model, "messages": [{"role": "user", "content": "Ping"}]},
@@ -446,13 +460,12 @@ def test_model_alias_resolution_and_models_endpoint() -> None:
                 assert r.status_code == 200
 
             t.join(timeout=3.0)
-
             status_data = client.get("/api/status").json()
             assert status_data["hub"]["active_client"]["active_model"] == "3.8-flash"
 
-    assert [c["target_model"] for c in dispatched_commands] == ["3.1-pro", "4-argon", "3.8-flash"]
+    assert [c["target_model"] for c in dispatched_commands] == ["3.1-pro", "4-argon", "4-carbon", "3.8-flash"]
     # With auto_reset_new_chat=True by default, each brand-new single-turn local conversation starts a clean web session
-    assert [c["reset_chat"] for c in dispatched_commands] == [True, True, True]
+    assert [c["reset_chat"] for c in dispatched_commands] == [True, True, True, True]
 
 
 def test_local_session_switch_creates_new_web_session_automatically() -> None:
@@ -1212,3 +1225,252 @@ def test_large_120kb_tool_call_chunking_and_async_callback_stress() -> None:
     reassembled_args = json.loads("".join(arg_fragments))
     assert reassembled_args["path"] == "src/generated_output.ts"
     assert reassembled_args["content"] == large_generated_code
+
+
+# ---------------------------------------------------------------------------
+# 6. Parallel Multi-Session Pool, Auto-Spawn & Sticky Affinity Tests
+# ---------------------------------------------------------------------------
+
+
+def test_parallel_sessions_auto_spawn_and_true_overlap() -> None:
+    """Start with 1 tab; fire 3 concurrent sessions -> auto-spawns 2 tabs and runs all 3 in parallel."""
+    from concurrent.futures import ThreadPoolExecutor
+
+    app = create_app(_make_test_settings(max_parallel_tabs=4, auto_spawn_tabs=True))
+    spawned_tab_ids: List[int] = []
+    executed_on_tabs: List[int] = []
+    active_concurrency = 0
+    peak_concurrency = 0
+    conc_lock = threading.Lock()
+
+    with TestClient(app) as client:
+        ready = threading.Event()
+        with client.websocket_connect("/ws/browser?client_id=ext-parallel") as ws:
+            ws.receive_json()  # welcome
+            ws.send_json(
+                {
+                    "type": "tab_status",
+                    "capabilities": ["multi_tab", "spawn_tab"],
+                    "max_parallel_tabs": 4,
+                    "tabs": [
+                        {
+                            "tab_id": 101,
+                            "tab_url": "https://vertexaisearch.cloud.google.com/u/3/home/cid/demo-cid",
+                            "tab_title": "Gemini Enterprise #101",
+                            "ready": True,
+                        }
+                    ],
+                }
+            )
+            ws.receive_json()  # ack
+
+            next_tab_id = 102
+            done_count = 0
+            ws_send_lock = threading.Lock()
+
+            def safe_ws_send(payload: Dict[str, Any]) -> None:
+                with ws_send_lock:
+                    ws.send_json(payload)
+
+            def simulate_tab_work(cmd: Dict[str, Any]) -> None:
+                nonlocal active_concurrency, peak_concurrency
+                with conc_lock:
+                    active_concurrency += 1
+                    peak_concurrency = max(peak_concurrency, active_concurrency)
+                try:
+                    # Hold all 3 tabs concurrently for 180ms to prove true overlapping execution!
+                    time.sleep(0.18)
+                    safe_ws_send(
+                        {
+                            "type": "request_complete",
+                            "request_id": cmd["request_id"],
+                            "tab_id": cmd["tab_id"],
+                            "reply": f"Tab-{cmd['tab_id']}->{cmd['prompt']}",
+                            "active_model": cmd.get("target_model") or "4 Argon",
+                        }
+                    )
+                finally:
+                    with conc_lock:
+                        active_concurrency -= 1
+
+            def extension_router() -> None:
+                nonlocal next_tab_id, done_count
+                ready.set()
+                sub_threads: List[threading.Thread] = []
+                while done_count < 3:
+                    msg = ws.receive_json()
+                    if msg["type"] == "spawn_tab":
+                        new_tid = next_tab_id
+                        next_tab_id += 1
+                        spawned_tab_ids.append(new_tid)
+                        safe_ws_send(
+                            {
+                                "type": "spawn_tab_result",
+                                "spawn_id": msg["spawn_id"],
+                                "ok": True,
+                                "tab": {
+                                    "tab_id": new_tid,
+                                    "tab_url": msg.get("base_url") or "https://vertexaisearch.cloud.google.com/u/3/home/cid/demo-cid",
+                                    "tab_title": f"Gemini Enterprise #{new_tid}",
+                                    "ready": True,
+                                },
+                            }
+                        )
+                    elif msg["type"] == "execute_prompt":
+                        done_count += 1
+                        executed_on_tabs.append(msg["tab_id"])
+                        t = threading.Thread(target=simulate_tab_work, args=(msg,), daemon=True)
+                        t.start()
+                        sub_threads.append(t)
+                for t in sub_threads:
+                    t.join(timeout=3.0)
+
+            router_thread = threading.Thread(target=extension_router, daemon=True)
+            router_thread.start()
+            ready.wait(timeout=3.0)
+
+            def call_session(idx: int) -> httpx.Response:
+                return client.post(
+                    "/v1/chat/completions",
+                    json={
+                        "model": "4argon",
+                        "messages": [{"role": "user", "content": f"ParallelQuery-{idx}"}],
+                    },
+                )
+
+            t0 = time.monotonic()
+            with ThreadPoolExecutor(max_workers=3) as pool:
+                futures = [pool.submit(call_session, i) for i in (1, 2, 3)]
+                responses = [f.result(timeout=8.0) for f in futures]
+            elapsed = time.monotonic() - t0
+
+            router_thread.join(timeout=3.0)
+
+            status = client.get("/api/status").json()
+            assert status["hub"]["parallel_capacity"] == 3
+
+    assert all(r.status_code == 200 for r in responses)
+    # Must have auto-spawned 2 new background tabs (#102 and #103) so all 3 tabs were distinct!
+    assert sorted(spawned_tab_ids) == [102, 103]
+    assert sorted(executed_on_tabs) == [101, 102, 103]
+    # Peak concurrency >= 2 and total wall time well below sequential 3 * 0.18 = 0.54s!
+    assert peak_concurrency >= 2
+    assert elapsed < 0.48
+
+
+def test_parallel_interleaved_multi_turn_and_named_session_affinity() -> None:
+    """Verify two parallel multi-turn sessions stick to their own tabs without resetting each other."""
+    assert parse_model_and_session("gemini-4-argon@alpha") == ("gemini-4-argon", "alpha")
+    assert parse_model_and_session("3.1pro#beta") == ("3.1pro", "beta")
+    assert parse_model_and_session("4argon@alpha-newchat") == ("4argon-newchat", "alpha")
+    assert resolve_target_web_model("gemini-4-argon@alpha") == "4-argon"
+    assert model_requests_new_chat("4argon@alpha-newchat") is True
+
+    app = create_app(_make_test_settings(max_parallel_tabs=4, auto_spawn_tabs=True))
+    tab_history_log: Dict[int, List[Dict[str, Any]]] = {201: [], 202: []}
+
+    with TestClient(app) as client:
+        ready = threading.Event()
+        with client.websocket_connect("/ws/browser?client_id=ext-sticky") as ws:
+            ws.receive_json()
+            ws.send_json(
+                {
+                    "type": "tab_status",
+                    "capabilities": ["multi_tab", "spawn_tab"],
+                    "tabs": [
+                        {
+                            "tab_id": 201,
+                            "tab_url": "https://vertexaisearch.cloud.google.com/u/3/home/cid/demo-cid",
+                            "ready": True,
+                        },
+                        {
+                            "tab_id": 202,
+                            "tab_url": "https://vertexaisearch.cloud.google.com/u/3/home/cid/demo-cid",
+                            "ready": True,
+                        },
+                    ],
+                }
+            )
+            ws.receive_json()
+
+            def sticky_worker() -> None:
+                ready.set()
+                for idx in range(5):
+                    cmd = ws.receive_json()
+                    assert cmd["type"] == "execute_prompt"
+                    tid = cmd["tab_id"]
+                    tab_history_log[tid].append(cmd)
+                    ws.send_json(
+                        {
+                            "type": "request_complete",
+                            "request_id": cmd["request_id"],
+                            "tab_id": tid,
+                            "reply": f"Ans-{idx + 1}-from-{tid}",
+                            "active_model": cmd.get("target_model") or "default",
+                        }
+                    )
+
+            th = threading.Thread(target=sticky_worker, daemon=True)
+            th.start()
+            ready.wait(timeout=3.0)
+
+            # Session Alpha Turn 1 -> claims one tab (e.g. #201)
+            alpha_msgs: List[Dict[str, Any]] = [{"role": "user", "content": "Alpha Turn 1"}]
+            r_a1 = client.post(
+                "/v1/chat/completions",
+                json={"model": "gemini-4-argon@alpha", "messages": alpha_msgs},
+            )
+            assert r_a1.status_code == 200
+            alpha_slot = r_a1.headers["x-bridge-slot"]
+            alpha_msgs.append({"role": "assistant", "content": r_a1.json()["choices"][0]["message"]["content"]})
+
+            # Session Beta Turn 1 -> claims the OTHER tab (#202) without touching Alpha's tab!
+            beta_msgs: List[Dict[str, Any]] = [{"role": "user", "content": "Beta Turn 1"}]
+            r_b1 = client.post(
+                "/v1/chat/completions",
+                json={"model": "gemini-3.8-flash", "messages": beta_msgs},
+            )
+            assert r_b1.status_code == 200
+            beta_slot = r_b1.headers["x-bridge-slot"]
+            assert alpha_slot != beta_slot
+            beta_msgs.append({"role": "assistant", "content": r_b1.json()["choices"][0]["message"]["content"]})
+
+            # Session Alpha Turn 2 -> returns to `alpha_slot` with `reset_chat=False`!
+            alpha_msgs.append({"role": "user", "content": "Alpha Turn 2"})
+            r_a2 = client.post(
+                "/v1/chat/completions",
+                json={"model": "gemini-4-argon@alpha", "messages": alpha_msgs},
+            )
+            assert r_a2.status_code == 200
+            assert r_a2.headers["x-bridge-slot"] == alpha_slot
+
+            # Session Beta Turn 2 (even without `@tag`, matched via message-history prefix!) -> returns to `beta_slot` with `reset_chat=False`!
+            beta_msgs.append({"role": "user", "content": "Beta Turn 2"})
+            r_b2 = client.post(
+                "/v1/chat/completions",
+                json={"model": "gemini-3.8-flash", "messages": beta_msgs},
+            )
+            assert r_b2.status_code == 200
+            assert r_b2.headers["x-bridge-slot"] == beta_slot
+
+            # Session Alpha starts a brand-new topic using `@alpha` -> resets ONLY `alpha_slot`, leaving `beta_slot` untouched!
+            r_a_new = client.post(
+                "/v1/chat/completions",
+                json={
+                    "model": "gemini-4-argon@alpha",
+                    "messages": [{"role": "user", "content": "Alpha Fresh Topic"}],
+                },
+            )
+            assert r_a_new.status_code == 200
+            assert r_a_new.headers["x-bridge-slot"] == alpha_slot
+
+            th.join(timeout=3.0)
+
+    alpha_tid = int(alpha_slot.split(":")[1])
+    beta_tid = int(beta_slot.split(":")[1])
+
+    assert [c["reset_chat"] for c in tab_history_log[alpha_tid]] == [True, False, True]
+    assert tab_history_log[alpha_tid][1]["prompt"] == "Alpha Turn 2"
+
+    assert [c["reset_chat"] for c in tab_history_log[beta_tid]] == [True, False]
+    assert tab_history_log[beta_tid][1]["prompt"] == "Beta Turn 2"

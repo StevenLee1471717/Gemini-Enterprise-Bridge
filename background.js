@@ -6,6 +6,8 @@ const DEFAULT_SETTINGS = {
   wsUrl: "ws://127.0.0.1:8000/ws/browser",
   enabled: true,
   driverMode: "auto", // auto | dom | replay
+  autoSpawnTabs: true,
+  maxParallelTabs: 4,
   customModelSelector: "",
   customInputSelector: "",
   customSendSelector: "",
@@ -15,7 +17,7 @@ const DEFAULT_SETTINGS = {
 const ALARM_NAME = "geb-keepalive-alarm";
 const VERTEX_MATCH_PATTERN = "https://vertexaisearch.cloud.google.com/*";
 
-// Live non-serializable WebSocket handle only; all durable state lives in chrome.storage
+// Live non-serializable WebSocket handle & per-tab fast caches; durable settings live in chrome.storage
 const socketRuntime = {
   ws: null,
   connecting: false,
@@ -23,6 +25,9 @@ const socketRuntime = {
   reconnectTimer: null,
   reconnectAttempts: 0
 };
+
+const runtimeTabMeta = new Map(); // tabId -> { activeModel, capturedRpc }
+const injectedTabVersions = new Map(); // tabId -> driverVersion
 
 async function getSettings() {
   const stored = await chrome.storage.local.get(Object.keys(DEFAULT_SETTINGS));
@@ -66,7 +71,8 @@ async function setSessionStatus(patch) {
       "activeTabId",
       "activeTabUrl",
       "activeTabTitle",
-      "capturedRpc"
+      "capturedRpc",
+      "tabCount"
     ]);
     const next = { ...current, ...patch };
     await chrome.storage.session.set(next);
@@ -82,7 +88,8 @@ async function updateActionBadge(status) {
     return;
   }
   if (status.wsConnected && status.activeTabId) {
-    await chrome.action.setBadgeText({ text: "ON" });
+    const count = Number(status.tabCount) || 1;
+    await chrome.action.setBadgeText({ text: count > 1 ? `${count}T` : "ON" });
     await chrome.action.setBadgeBackgroundColor({ color: "#0D9488" });
   } else if (status.wsConnected) {
     await chrome.action.setBadgeText({ text: "TAB" });
@@ -93,17 +100,37 @@ async function updateActionBadge(status) {
   }
 }
 
-async function findBestVertexTab() {
+async function getEligibleVertexTabs() {
   const tabs = await chrome.tabs.query({ url: VERTEX_MATCH_PATTERN });
   if (!tabs || tabs.length === 0) {
-    return null;
+    return [];
   }
   const { preferredTabId } = await chrome.storage.session.get("preferredTabId");
   if (preferredTabId) {
-    const preferred = tabs.find((t) => t.id === preferredTabId);
-    if (preferred) {
-      return preferred;
+    const pinned = tabs.find((t) => t.id === preferredTabId);
+    if (pinned) {
+      return [pinned];
     }
+  }
+  return tabs.filter((t) => Boolean(t.id));
+}
+
+async function findTargetVertexTab(requestedTabId = null) {
+  if (requestedTabId !== null && requestedTabId !== undefined) {
+    try {
+      const exact = await chrome.tabs.get(Number(requestedTabId));
+      if (exact && exact.id) {
+        return exact;
+      }
+    } catch (_) {}
+  }
+  return await findBestVertexTab();
+}
+
+async function findBestVertexTab() {
+  const tabs = await getEligibleVertexTabs();
+  if (tabs.length === 0) {
+    return null;
   }
   const activeInWindow = tabs.find((t) => t.active);
   return activeInWindow || tabs[0];
@@ -144,30 +171,56 @@ async function injectIntoExistingTabs() {
   }
 }
 
-async function reportTabStatusToBackend() {
-  const settings = await getSettings();
-  const tab = await findBestVertexTab();
+async function buildReportedTabsSnapshot() {
+  const tabs = await getEligibleVertexTabs();
   const { capturedRpc = false, activeModel = "" } = await chrome.storage.session.get([
     "capturedRpc",
     "activeModel"
   ]);
+  return tabs.map((t) => {
+    const meta = runtimeTabMeta.get(t.id) || {};
+    return {
+      tab_id: t.id,
+      tab_url: t.url || "",
+      tab_title: t.title || "",
+      ready: Boolean(t.id),
+      active_model: meta.activeModel || activeModel || "",
+      captured_rpc: meta.capturedRpc !== undefined ? Boolean(meta.capturedRpc) : Boolean(capturedRpc)
+    };
+  });
+}
+
+async function reportTabStatusToBackend() {
+  const settings = await getSettings();
+  const tabsSnapshot = await buildReportedTabsSnapshot();
+  const primary = tabsSnapshot[0] || null;
+  const { preferredTabId } = await chrome.storage.session.get("preferredTabId");
+  const capabilities = ["multi_tab"];
+  if (settings.autoSpawnTabs !== false && !preferredTabId) {
+    capabilities.push("spawn_tab");
+  }
 
   await setSessionStatus({
-    activeTabId: tab ? tab.id : null,
-    activeTabUrl: tab ? tab.url || "" : "",
-    activeTabTitle: tab ? tab.title || "" : "",
+    activeTabId: primary ? primary.tab_id : null,
+    activeTabUrl: primary ? primary.tab_url : "",
+    activeTabTitle: primary ? primary.tab_title : "",
+    capturedRpc: tabsSnapshot.some((t) => t.captured_rpc),
+    tabCount: tabsSnapshot.length,
     wsConnected: Boolean(socketRuntime.ws && socketRuntime.ws.readyState === WebSocket.OPEN)
   });
 
   sendWsJson({
     type: "tab_status",
-    tab_id: tab ? tab.id : null,
-    tab_url: tab ? tab.url || "" : "",
-    tab_title: tab ? tab.title || "" : "",
-    ready: Boolean(tab && tab.id),
+    tab_id: primary ? primary.tab_id : null,
+    tab_url: primary ? primary.tab_url : "",
+    tab_title: primary ? primary.tab_title : "",
+    ready: tabsSnapshot.length > 0,
     driver_mode: settings.driverMode,
-    captured_rpc: Boolean(capturedRpc),
-    active_model: activeModel || "",
+    captured_rpc: tabsSnapshot.some((t) => t.captured_rpc),
+    active_model: primary ? primary.active_model : "",
+    capabilities,
+    max_parallel_tabs: Math.max(1, Number(settings.maxParallelTabs) || 4),
+    tabs: tabsSnapshot,
     user_agent: navigator.userAgent
   });
 }
@@ -196,17 +249,25 @@ function startHeartbeatInterval() {
   // Send a WebSocket frame every 20s to keep MV3 service worker & WS alive (Chrome 116+)
   socketRuntime.heartbeatTimer = setInterval(() => {
     void (async () => {
-      const tab = await findBestVertexTab();
       const settings = await getSettings();
-      const { capturedRpc = false } = await chrome.storage.session.get("capturedRpc");
+      const tabsSnapshot = await buildReportedTabsSnapshot();
+      const primary = tabsSnapshot[0] || null;
+      const { preferredTabId } = await chrome.storage.session.get("preferredTabId");
+      const capabilities = ["multi_tab"];
+      if (settings.autoSpawnTabs !== false && !preferredTabId) {
+        capabilities.push("spawn_tab");
+      }
       sendWsJson({
         type: "heartbeat",
-        tab_id: tab ? tab.id : null,
-        tab_url: tab ? tab.url || "" : "",
-        tab_title: tab ? tab.title || "" : "",
-        ready: Boolean(tab && tab.id),
+        tab_id: primary ? primary.tab_id : null,
+        tab_url: primary ? primary.tab_url : "",
+        tab_title: primary ? primary.tab_title : "",
+        ready: tabsSnapshot.length > 0,
         driver_mode: settings.driverMode,
-        captured_rpc: Boolean(capturedRpc)
+        captured_rpc: tabsSnapshot.some((t) => t.captured_rpc),
+        capabilities,
+        max_parallel_tabs: Math.max(1, Number(settings.maxParallelTabs) || 4),
+        tabs: tabsSnapshot
       });
     })();
   }, 20000);
@@ -394,7 +455,9 @@ async function prepareTabForBackgroundExecution(tab) {
 
   await protectTabFromFreeze(freshTab.id);
 
-  // 1) If Chrome Memory Saver discarded/unloaded the background tab, reload it silently first
+  // If Chrome Memory Saver discarded/unloaded the background tab, reload it silently.
+  // Note: Do NOT force `active: true` here so multiple tabs in the same Chrome window
+  // can run concurrently in the background without stealing tab focus from each other!
   if (freshTab.discarded || freshTab.status === "unloaded") {
     await appendLog("info", `Waking discarded background tab #${freshTab.id}...`);
     const reloadWait = waitForTabComplete(freshTab.id, 15000);
@@ -402,24 +465,64 @@ async function prepareTabForBackgroundExecution(tab) {
     await reloadWait;
     await new Promise((r) => setTimeout(r, 650));
     await ensureScriptsInjected(freshTab.id);
+    injectedTabVersions.set(freshTab.id, "2.5");
     try {
       freshTab = await chrome.tabs.get(freshTab.id);
     } catch (_) {}
   }
 
-  // 2) If Chrome window itself is in the background (user is working in Cursor/ChatBox)
-  //    and another tab was active in that unfocused Chrome window, activate the Gemini tab
-  //    WITHOUT focusing the Chrome window (zero OS focus steal!).
-  if (!freshTab.active && freshTab.windowId !== undefined) {
-    try {
-      const win = await chrome.windows.get(freshTab.windowId);
-      if (win && !win.focused) {
-        freshTab = await chrome.tabs.update(freshTab.id, { active: true });
-      }
-    } catch (_) {}
+  return freshTab;
+}
+
+async function spawnParallelWorkerTab(baseUrlHint = "") {
+  const allVertexTabs = await chrome.tabs.query({ url: VERTEX_MATCH_PATTERN });
+  const settings = await getSettings();
+  const maxTabs = Math.max(1, Number(settings.maxParallelTabs) || 4);
+  if (allVertexTabs.length >= maxTabs) {
+    throw new Error(`已达到最大并行标签页上限 (${maxTabs})`);
   }
 
-  return freshTab;
+  let targetUrl = "";
+  if (baseUrlHint && baseUrlHint.startsWith("https://vertexaisearch.cloud.google.com")) {
+    targetUrl = computeCleanVertexHomeUrl(baseUrlHint) || baseUrlHint;
+  }
+  if (!targetUrl && allVertexTabs.length > 0) {
+    const refUrl = allVertexTabs[0].url || "";
+    targetUrl = computeCleanVertexHomeUrl(refUrl) || refUrl;
+  }
+  if (!targetUrl) {
+    targetUrl = "https://vertexaisearch.cloud.google.com/";
+  }
+
+  const createOpts = { url: targetUrl, active: false };
+  if (allVertexTabs.length > 0 && allVertexTabs[0].windowId !== undefined) {
+    createOpts.windowId = allVertexTabs[0].windowId;
+  }
+
+  const created = await chrome.tabs.create(createOpts);
+  if (!created || !created.id) {
+    throw new Error("无法创建新的后台工作标签页");
+  }
+
+  await protectTabFromFreeze(created.id);
+  await waitForTabComplete(created.id, 14000);
+  await new Promise((r) => setTimeout(r, 600));
+  await ensureScriptsInjected(created.id);
+  injectedTabVersions.set(created.id, "2.5");
+
+  let latest = created;
+  try {
+    latest = await chrome.tabs.get(created.id);
+  } catch (_) {}
+
+  await appendLog("info", `Spawned parallel worker tab #${latest.id}`);
+  await reportTabStatusToBackend();
+  return {
+    tab_id: latest.id,
+    tab_url: latest.url || targetUrl,
+    tab_title: latest.title || "Gemini Enterprise",
+    ready: true
+  };
 }
 
 async function resetTabChatWithFallback(tab) {
@@ -502,6 +605,7 @@ async function deliverResultToBackend(eventData) {
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
           client_id: clientId,
+          tab_id: eventData.tab_id || null,
           request_id: eventData.request_id,
           reply: replyStr,
           citations: eventData.citations || [],
@@ -555,6 +659,28 @@ async function handleBackendCommand(msg) {
     return;
   }
 
+  if (type === "spawn_tab") {
+    const spawnId = msg.spawn_id || "";
+    try {
+      const spawned = await spawnParallelWorkerTab(msg.base_url || "");
+      sendWsJson({
+        type: "spawn_tab_result",
+        spawn_id: spawnId,
+        ok: true,
+        tab: spawned
+      });
+    } catch (err) {
+      await appendLog("warn", `Auto-spawn tab skipped: ${err.message}`);
+      sendWsJson({
+        type: "spawn_tab_result",
+        spawn_id: spawnId,
+        ok: false,
+        error: err.message
+      });
+    }
+    return;
+  }
+
   if (type === "execute_prompt_chunk") {
     // Buffer chunks safely inside Service Worker FIRST so any subsequent tab wake/reload/new_chat
     // navigation during `execute_prompt` NEVER wipes buffered prompt chunks!
@@ -580,7 +706,7 @@ async function handleBackendCommand(msg) {
         : "";
     }
 
-    const rawTab = await findBestVertexTab();
+    const rawTab = await findTargetVertexTab(msg.tab_id);
     if (!rawTab || !rawTab.id) {
       sendWsJson({
         type: "request_error",
@@ -590,7 +716,7 @@ async function handleBackendCommand(msg) {
       return;
     }
 
-    sendWsJson({ type: "request_ack", request_id: requestId });
+    sendWsJson({ type: "request_ack", request_id: requestId, tab_id: rawTab.id });
 
     const tab = await prepareTabForBackgroundExecution(rawTab);
 
@@ -603,12 +729,10 @@ async function handleBackendCommand(msg) {
         (msg.reset_chat ? " [new_chat]" : "")
     );
 
-    // Ensure hot-swapped latest page-driver.js & content-bridge.js are active on this tab
-    const { injectedDriverTabs = {} } = await chrome.storage.session.get("injectedDriverTabs");
-    if (injectedDriverTabs[tab.id] !== "2.4") {
+    // Ensure hot-swapped latest page-driver.js & content-bridge.js are active on this tab (race-free per-tab map)
+    if (injectedTabVersions.get(tab.id) !== "2.5") {
       await ensureScriptsInjected(tab.id);
-      injectedDriverTabs[tab.id] = "2.4";
-      await chrome.storage.session.set({ injectedDriverTabs });
+      injectedTabVersions.set(tab.id, "2.5");
     }
 
     let remainingResetChat = Boolean(msg.reset_chat);
@@ -692,7 +816,7 @@ async function handleBackendCommand(msg) {
   }
 
   if (type === "cancel_request") {
-    const tab = await findBestVertexTab();
+    const tab = await findTargetVertexTab(msg.tab_id);
     if (tab && tab.id) {
       try {
         await chrome.tabs.sendMessage(tab.id, {
@@ -743,7 +867,9 @@ chrome.tabs.onUpdated.addListener((tabId, changeInfo, tab) => {
   }
 });
 
-chrome.tabs.onRemoved.addListener(() => {
+chrome.tabs.onRemoved.addListener((tabId) => {
+  runtimeTabMeta.delete(tabId);
+  injectedTabVersions.delete(tabId);
   void reportTabStatusToBackend();
 });
 
@@ -778,22 +904,36 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
 
   (async () => {
     if (msgType === "GEB_DRIVER_EVENT") {
-      const eventData = message.payload || {};
-      if (typeof eventData.captured_rpc === "boolean") {
-        await chrome.storage.session.set({ capturedRpc: eventData.captured_rpc });
+      const senderTabId = sender && sender.tab && sender.tab.id ? sender.tab.id : null;
+      const eventData = { ...(message.payload || {}) };
+      if (senderTabId !== null && eventData.tab_id === undefined) {
+        eventData.tab_id = senderTabId;
       }
-      if (typeof eventData.active_model === "string" && eventData.active_model) {
-        await chrome.storage.session.set({ activeModel: eventData.active_model });
+
+      if (senderTabId !== null) {
+        const prevMeta = runtimeTabMeta.get(senderTabId) || {};
+        const nextMeta = { ...prevMeta };
+        if (typeof eventData.captured_rpc === "boolean") {
+          nextMeta.capturedRpc = eventData.captured_rpc;
+          await chrome.storage.session.set({ capturedRpc: eventData.captured_rpc });
+        }
+        if (typeof eventData.active_model === "string" && eventData.active_model) {
+          nextMeta.activeModel = eventData.active_model;
+          await chrome.storage.session.set({ activeModel: eventData.active_model });
+        }
+        runtimeTabMeta.set(senderTabId, nextMeta);
       }
+
       if (eventData.type === "driver_ready" || eventData.type === "driver_heartbeat" || eventData.type === "tab_visibility") {
-        if (sender && sender.tab && sender.tab.id) {
-          await protectTabFromFreeze(sender.tab.id);
+        if (senderTabId) {
+          await protectTabFromFreeze(senderTabId);
         }
         await ensureWebSocketConnected(false);
         await reportTabStatusToBackend();
       } else if (eventData.type === "log") {
-        await appendLog(eventData.level || "info", eventData.message || "");
-        sendWsJson(eventData);
+        const tabPrefix = senderTabId ? `[Tab#${senderTabId}] ` : "";
+        await appendLog(eventData.level || "info", tabPrefix + (eventData.message || ""));
+        sendWsJson({ ...eventData, message: tabPrefix + (eventData.message || "") });
       } else if (eventData.type === "sw_reply_chunk") {
         let entry = swReplyReassembly.get(eventData.request_id);
         if (!entry) {
@@ -903,6 +1043,16 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
       try {
         const res = await chrome.tabs.sendMessage(tab.id, { type: "GEB_TRIGGER_NEW_CHAT" });
         sendResponse({ ok: true, result: res });
+      } catch (err) {
+        sendResponse({ ok: false, error: err.message });
+      }
+      return;
+    }
+
+    if (msgType === "GEB_POPUP_SPAWN_TAB") {
+      try {
+        const spawned = await spawnParallelWorkerTab("");
+        sendResponse({ ok: true, tab: spawned });
       } catch (err) {
         sendResponse({ ok: false, error: err.message });
       }

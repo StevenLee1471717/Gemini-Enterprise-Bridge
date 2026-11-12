@@ -34,6 +34,7 @@ from schemas import (
     build_chat_completion_chunk,
     build_chat_completion_response,
     build_usage,
+    parse_model_and_session,
     resolve_target_web_model,
 )
 from tool_calling import (
@@ -79,6 +80,9 @@ def create_app(settings: Optional[BridgeSettings] = None) -> FastAPI:
     hub = BrowserBridgeHub(
         include_citations=cfg.include_citations,
         callback_base_url=f"http://{cb_host}:{cfg.port}",
+        max_parallel_tabs=cfg.max_parallel_tabs,
+        auto_spawn_tabs=cfg.auto_spawn_tabs,
+        session_affinity_ttl_seconds=cfg.session_affinity_ttl_seconds,
     )
     context_builder = ConversationContextBuilder(
         default_mode=cfg.context_mode,
@@ -213,6 +217,7 @@ def create_app(settings: Optional[BridgeSettings] = None) -> FastAPI:
         state = hub.register_http_client(
             client_id=payload.client_id,
             user_agent=payload.user_agent or "",
+            tab_id=payload.tab_id,
             tab_url=payload.tab_url or "",
             tab_title=payload.tab_title or "",
             driver_mode=payload.driver_mode,
@@ -255,6 +260,7 @@ def create_app(settings: Optional[BridgeSettings] = None) -> FastAPI:
                 {
                     "type": "request_complete",
                     "request_id": payload.request_id,
+                    "tab_id": payload.tab_id,
                     "reply": payload.reply or "",
                     "citations": payload.citations or [],
                     "source": payload.source or "http_callback",
@@ -268,9 +274,16 @@ def create_app(settings: Optional[BridgeSettings] = None) -> FastAPI:
     # ------------------------------------------------------------------
 
     @app.post("/v1/chat/completions/tools", dependencies=[Depends(verify_api_key)])
-    async def chat_tools(request: ChatCompletionRequest) -> Any:
-        # 实现工具调用代理逻辑，允许浏览器端 Gemini 处理 Function Calling
-        return await chat_completions(request)
+    async def chat_tools(
+        request: ChatCompletionRequest,
+        x_session_id: Optional[str] = Header(default=None),
+        x_bridge_session: Optional[str] = Header(default=None),
+    ) -> Any:
+        return await chat_completions(
+            request=request,
+            x_session_id=x_session_id,
+            x_bridge_session=x_bridge_session,
+        )
 
     # ------------------------------------------------------------------
     # OpenAI-Compatible /v1/models & /v1/chat/completions
@@ -295,7 +308,11 @@ def create_app(settings: Optional[BridgeSettings] = None) -> FastAPI:
 
     @app.post("/v1/chat/completions", dependencies=[Depends(verify_api_key)])
     @app.post("/chat/completions", dependencies=[Depends(verify_api_key)], include_in_schema=False)
-    async def chat_completions(request: ChatCompletionRequest) -> Any:
+    async def chat_completions(
+        request: ChatCompletionRequest,
+        x_session_id: Optional[str] = Header(default=None),
+        x_bridge_session: Optional[str] = Header(default=None),
+    ) -> Any:
         if not request.messages:
             return _openai_error_response(
                 status_code=400,
@@ -304,7 +321,16 @@ def create_app(settings: Optional[BridgeSettings] = None) -> FastAPI:
                 code="empty_messages",
             )
 
-        model_name = request.model or cfg.default_model
+        raw_model_name = request.model or cfg.default_model
+        base_model_name, model_session_tag = parse_model_and_session(raw_model_name)
+        model_name = base_model_name or cfg.default_model
+        explicit_session_id = (
+            model_session_tag
+            or (x_session_id.strip() if x_session_id and x_session_id.strip() else None)
+            or (x_bridge_session.strip() if x_bridge_session and x_bridge_session.strip() else None)
+            or (request.session_id.strip() if request.session_id and request.session_id.strip() else None)
+        )
+
         upstream = _select_upstream(model_name)
         target_web_model = resolve_target_web_model(model_name)
         completion_id = uuid.uuid4().hex
@@ -459,9 +485,8 @@ def create_app(settings: Optional[BridgeSettings] = None) -> FastAPI:
                 },
             )
 
-        # ---------------- Option 2: Browser-in-the-loop Bridge ----------------
-        active_client = hub.select_active_client()
-        if active_client is None:
+        # ---------------- Option 2: Parallel Browser-in-the-loop Worker Pool ----------------
+        if not hub.has_ready_client():
             return _openai_error_response(
                 status_code=503,
                 message=(
@@ -472,27 +497,56 @@ def create_app(settings: Optional[BridgeSettings] = None) -> FastAPI:
                 code="browser_not_connected",
             )
 
-        session_key = f"{active_client.client_id}:{active_client.tab_id or 'active'}"
-        prepared = context_builder.build(
-            messages=request.messages,
-            model=model_name,
-            session_key=session_key,
-            tools=norm_tools,
-            tool_choice=norm_tool_choice,
-            parallel_tool_calls=request.parallel_tool_calls,
-            response_format=request.response_format,
-        )
-
         if not request.stream:
+            matching_slots = context_builder.find_matching_slots(
+                hub.list_ready_slot_keys(),
+                request.messages,
+                model=model_name,
+            )
             try:
-                raw_reply = await hub.dispatch_complete(
-                    prompt=prepared.prompt,
-                    target_model=target_web_model,
-                    reset_chat=prepared.reset_chat,
-                    suppress_citations=suppress_citations,
-                    request_timeout=cfg.request_timeout_seconds,
+                async with hub.acquire_slot(
+                    explicit_session_id=explicit_session_id,
+                    matching_slot_keys=matching_slots,
                     queue_timeout=cfg.queue_timeout_seconds,
-                )
+                ) as slot:
+                    session_key = slot.slot_key
+                    prepared = context_builder.build(
+                        messages=request.messages,
+                        model=model_name,
+                        session_key=session_key,
+                        tools=norm_tools,
+                        tool_choice=norm_tool_choice,
+                        parallel_tool_calls=request.parallel_tool_calls,
+                        response_format=request.response_format,
+                    )
+                    raw_reply = await hub.dispatch_complete_on_slot(
+                        slot=slot,
+                        prompt=prepared.prompt,
+                        target_model=target_web_model,
+                        reset_chat=prepared.reset_chat,
+                        suppress_citations=suppress_citations,
+                        request_timeout=cfg.request_timeout_seconds,
+                    )
+                    parsed = parse_assistant_output(
+                        raw_reply,
+                        tools=norm_tools,
+                        tool_choice=norm_tool_choice,
+                        parallel_tool_calls=request.parallel_tool_calls,
+                        response_format=request.response_format,
+                    )
+                    slot.pending_tool_call_until = (
+                        time.time() + 60.0 if parsed.has_tool_calls else 0.0
+                    )
+                    context_builder.record_completed_turn(
+                        session_key=session_key,
+                        sent_history=prepared.normalized_history,
+                        assistant_reply=parsed.content or "",
+                        assistant_tool_calls=parsed.tool_calls or None,
+                        active_model=target_web_model,
+                        tools_fingerprint=prepared.tools_fingerprint,
+                        system_fingerprint=prepared.system_fingerprint,
+                    )
+                    slot_header_val = slot.slot_key
             except BridgeUnavailableError as exc:
                 return _openai_error_response(503, str(exc), "bridge_unavailable_error", "browser_not_connected")
             except BridgeTimeoutError as exc:
@@ -500,36 +554,24 @@ def create_app(settings: Optional[BridgeSettings] = None) -> FastAPI:
             except BridgeExecutionError as exc:
                 return _openai_error_response(502, str(exc), "bridge_execution_error", "dom_execution_failed")
 
-            parsed = parse_assistant_output(
-                raw_reply,
-                tools=norm_tools,
-                tool_choice=norm_tool_choice,
-                parallel_tool_calls=request.parallel_tool_calls,
-                response_format=request.response_format,
-            )
-            context_builder.record_completed_turn(
-                session_key=session_key,
-                sent_history=prepared.normalized_history,
-                assistant_reply=parsed.content or "",
-                assistant_tool_calls=parsed.tool_calls or None,
-                active_model=target_web_model,
-                tools_fingerprint=prepared.tools_fingerprint,
-                system_fingerprint=prepared.system_fingerprint,
-            )
-            return build_chat_completion_response(
+            resp_payload = build_chat_completion_response(
                 request_id=completion_id,
-                model=model_name,
+                model=raw_model_name,
                 reply_text=parsed.content,
                 prompt_text=prepared.prompt,
                 created=created_ts,
                 tool_calls=parsed.tool_calls or None,
                 finish_reason=parsed.finish_reason,
             )
+            resp_headers = {"X-Bridge-Slot": slot_header_val}
+            if explicit_session_id:
+                resp_headers["X-Bridge-Session-Id"] = explicit_session_id
+            return JSONResponse(content=resp_payload, headers=resp_headers)
 
         async def browser_sse() -> AsyncIterator[str]:
             initial = build_chat_completion_chunk(
                 request_id=completion_id,
-                model=model_name,
+                model=raw_model_name,
                 delta={"role": "assistant", "content": ""},
                 created=created_ts,
             )
@@ -543,74 +585,101 @@ def create_app(settings: Optional[BridgeSettings] = None) -> FastAPI:
             )
             finish_reason = "stop"
             completion_usage_str = ""
+            prompt_for_usage_str = ""
 
             try:
-                async for delta in hub.dispatch_stream(
-                    prompt=prepared.prompt,
-                    target_model=target_web_model,
-                    reset_chat=prepared.reset_chat,
-                    suppress_citations=suppress_citations,
-                    request_timeout=cfg.request_timeout_seconds,
+                matching_slots = context_builder.find_matching_slots(
+                    hub.list_ready_slot_keys(),
+                    request.messages,
+                    model=model_name,
+                )
+                async with hub.acquire_slot(
+                    explicit_session_id=explicit_session_id,
+                    matching_slot_keys=matching_slots,
                     queue_timeout=cfg.queue_timeout_seconds,
-                ):
-                    for safe_piece in processor.feed(delta):
-                        chunk = build_chat_completion_chunk(
-                            request_id=completion_id,
-                            model=model_name,
-                            delta={"content": safe_piece},
-                            created=created_ts,
-                        )
-                        yield f"data: {json.dumps(chunk, ensure_ascii=False)}\n\n"
-
-                tail_pieces, parsed = processor.finalize()
-                for raw_piece in tail_pieces:
-                    for safe_piece in split_text_slices(raw_piece):
-                        chunk = build_chat_completion_chunk(
-                            request_id=completion_id,
-                            model=model_name,
-                            delta={"content": safe_piece},
-                            created=created_ts,
-                        )
-                        yield f"data: {json.dumps(chunk, ensure_ascii=False)}\n\n"
-
-                if parsed.has_tool_calls:
-                    finish_reason = "tool_calls"
-                    for tc_batch in build_sse_tool_call_deltas(parsed.tool_calls):
-                        tc_chunk = build_chat_completion_chunk(
-                            request_id=completion_id,
-                            model=model_name,
-                            delta={"tool_calls": tc_batch},
-                            created=created_ts,
-                        )
-                        yield f"data: {json.dumps(tc_chunk, ensure_ascii=False)}\n\n"
-                    completion_usage_str = (parsed.content or "") + " " + json.dumps(
-                        parsed.tool_calls, ensure_ascii=False
-                    )
-                    context_builder.record_completed_turn(
+                ) as slot:
+                    session_key = slot.slot_key
+                    prepared = context_builder.build(
+                        messages=request.messages,
+                        model=model_name,
                         session_key=session_key,
-                        sent_history=prepared.normalized_history,
-                        assistant_reply=parsed.content or "",
-                        assistant_tool_calls=parsed.tool_calls,
-                        active_model=target_web_model,
-                        tools_fingerprint=prepared.tools_fingerprint,
-                        system_fingerprint=prepared.system_fingerprint,
+                        tools=norm_tools,
+                        tool_choice=norm_tool_choice,
+                        parallel_tool_calls=request.parallel_tool_calls,
+                        response_format=request.response_format,
                     )
-                else:
-                    full_reply = (parsed.content or "").strip()
-                    completion_usage_str = full_reply
-                    if full_reply:
+                    prompt_for_usage_str = prepared.prompt
+
+                    async for delta in hub.dispatch_stream_on_slot(
+                        slot=slot,
+                        prompt=prepared.prompt,
+                        target_model=target_web_model,
+                        reset_chat=prepared.reset_chat,
+                        suppress_citations=suppress_citations,
+                        request_timeout=cfg.request_timeout_seconds,
+                    ):
+                        for safe_piece in processor.feed(delta):
+                            chunk = build_chat_completion_chunk(
+                                request_id=completion_id,
+                                model=raw_model_name,
+                                delta={"content": safe_piece},
+                                created=created_ts,
+                            )
+                            yield f"data: {json.dumps(chunk, ensure_ascii=False)}\n\n"
+
+                    tail_pieces, parsed = processor.finalize()
+                    for raw_piece in tail_pieces:
+                        for safe_piece in split_text_slices(raw_piece):
+                            chunk = build_chat_completion_chunk(
+                                request_id=completion_id,
+                                model=raw_model_name,
+                                delta={"content": safe_piece},
+                                created=created_ts,
+                            )
+                            yield f"data: {json.dumps(chunk, ensure_ascii=False)}\n\n"
+
+                    slot.pending_tool_call_until = (
+                        time.time() + 60.0 if parsed.has_tool_calls else 0.0
+                    )
+
+                    if parsed.has_tool_calls:
+                        finish_reason = "tool_calls"
+                        for tc_batch in build_sse_tool_call_deltas(parsed.tool_calls):
+                            tc_chunk = build_chat_completion_chunk(
+                                request_id=completion_id,
+                                model=raw_model_name,
+                                delta={"tool_calls": tc_batch},
+                                created=created_ts,
+                            )
+                            yield f"data: {json.dumps(tc_chunk, ensure_ascii=False)}\n\n"
+                        completion_usage_str = (parsed.content or "") + " " + json.dumps(
+                            parsed.tool_calls, ensure_ascii=False
+                        )
                         context_builder.record_completed_turn(
                             session_key=session_key,
                             sent_history=prepared.normalized_history,
-                            assistant_reply=full_reply,
+                            assistant_reply=parsed.content or "",
+                            assistant_tool_calls=parsed.tool_calls,
                             active_model=target_web_model,
                             tools_fingerprint=prepared.tools_fingerprint,
                             system_fingerprint=prepared.system_fingerprint,
                         )
+                    else:
+                        full_reply = (parsed.content or "").strip()
+                        completion_usage_str = full_reply
+                        if full_reply:
+                            context_builder.record_completed_turn(
+                                session_key=session_key,
+                                sent_history=prepared.normalized_history,
+                                assistant_reply=full_reply,
+                                active_model=target_web_model,
+                                tools_fingerprint=prepared.tools_fingerprint,
+                                system_fingerprint=prepared.system_fingerprint,
+                            )
             except (BridgeUnavailableError, BridgeTimeoutError, BridgeExecutionError) as exc:
                 err_chunk = build_chat_completion_chunk(
                     request_id=completion_id,
-                    model=model_name,
+                    model=raw_model_name,
                     delta={"content": f"\n\n[Bridge Error: {exc}]"},
                     created=created_ts,
                 )
@@ -618,7 +687,7 @@ def create_app(settings: Optional[BridgeSettings] = None) -> FastAPI:
 
             stop_chunk = build_chat_completion_chunk(
                 request_id=completion_id,
-                model=model_name,
+                model=raw_model_name,
                 delta={},
                 finish_reason=finish_reason,
                 created=created_ts,
@@ -628,23 +697,27 @@ def create_app(settings: Optional[BridgeSettings] = None) -> FastAPI:
             if include_usage:
                 usage_chunk = build_chat_completion_chunk(
                     request_id=completion_id,
-                    model=model_name,
+                    model=raw_model_name,
                     delta={},
                     created=created_ts,
-                    usage=build_usage(prepared.prompt, completion_usage_str),
+                    usage=build_usage(prompt_for_usage_str, completion_usage_str),
                 )
                 yield f"data: {json.dumps(usage_chunk, ensure_ascii=False)}\n\n"
 
             yield "data: [DONE]\n\n"
 
+        sse_headers = {
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no",
+        }
+        if explicit_session_id:
+            sse_headers["X-Bridge-Session-Id"] = explicit_session_id
+
         return StreamingResponse(
             browser_sse(),
             media_type="text/event-stream",
-            headers={
-                "Cache-Control": "no-cache",
-                "Connection": "keep-alive",
-                "X-Accel-Buffering": "no",
-            },
+            headers=sse_headers,
         )
 
     return app

@@ -203,18 +203,18 @@ DASHBOARD_HTML = """<!DOCTYPE html>
         <h2>第三方客户端接入参数 (Cursor / Cline / ChatBox / NextChat)</h2>
         <div class="kv"><span>API Host / Base URL</span><span class="mono" id="baseUrlVal">http://127.0.0.1:8000/v1</span></div>
         <div class="kv"><span>API Key</span><span class="mono">sk-local-bridge (任意填写或按 .env)</span></div>
-        <div class="kv"><span>可选网页模型</span><span class="mono">gemini-3.1-pro · gemini-4-argon · gemini-3.8-flash</span></div>
-        <div class="kv"><span>默认/新建会话</span><span class="mono">gemini-enterprise-web / *-newchat</span></div>
-        <div class="kv"><span>能力支持</span><span class="mono">SSE 流式 · OpenAI Tools · Agentic Loop</span></div>
+        <div class="kv"><span>可选网页模型</span><span class="mono">gemini-3.1-pro · gemini-4-argon · gemini-4-carbon · gemini-3.8-flash</span></div>
+        <div class="kv"><span>默认/固定会话</span><span class="mono">gemini-4-argon / gemini-4-carbon / 4carbon@sess1</span></div>
+        <div class="kv"><span>能力支持</span><span class="mono">多会话并行池 · Tools · Agentic Loop</span></div>
       </section>
 
       <section class="card">
-        <h2>实时桥接状态</h2>
+        <h2>实时并行工作池状态</h2>
         <div class="kv"><span>运行模式</span><span class="mono" id="modeVal">-</span></div>
         <div class="kv"><span>连接通道</span><span class="mono" id="transportVal">未连接</span></div>
-        <div class="kv"><span>挂载标签页</span><span class="mono" id="tabVal">等待打开 vertexaisearch.cloud.google.com</span></div>
+        <div class="kv"><span>并行工作标签页池</span><span class="mono" id="tabVal">等待打开 vertexaisearch.cloud.google.com</span></div>
         <div class="kv"><span>当前网页模型 / RPC</span><span class="mono" id="rpcVal">-</span></div>
-        <div class="kv"><span>队列 / 累计请求</span><span class="mono" id="statsVal">0 / 0</span></div>
+        <div class="kv"><span>并发执行 / 排队 / 累计</span><span class="mono" id="statsVal">0 / 0 / 0</span></div>
       </section>
     </div>
 
@@ -227,6 +227,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
             <option value="gemini-enterprise-web">gemini-enterprise-web (保持当前模型)</option>
             <option value="gemini-3.1-pro">gemini-3.1-pro (自动切换 3.1 Pro)</option>
             <option value="gemini-4-argon">gemini-4-argon (自动切换 4 Argon)</option>
+            <option value="gemini-4-carbon">gemini-4-carbon (自动切换 4 Carbon)</option>
             <option value="gemini-3.8-flash">gemini-3.8-flash (自动切换 3.8 Flash)</option>
             <option value="gemini-2.5-pro">gemini-2.5-pro (自动切换 2.5 Pro)</option>
             <option value="gemini-2.5-flash">gemini-2.5-flash (自动切换 2.5 Flash)</option>
@@ -260,16 +261,29 @@ DASHBOARD_HTML = """<!DOCTYPE html>
         document.getElementById('modeVal').textContent =
           data.backend_mode + ' / context=' + data.context_mode;
 
-        if (active) {
+        const hub = data.hub || {};
+        const slots = hub.worker_slots || [];
+
+        if (active || slots.length > 0) {
           dot.className = 'dot ok';
-          txt.textContent = '浏览器已挂载';
+          txt.textContent = slots.length > 1
+            ? ('并行池已就绪 (' + slots.length + ' Tabs)')
+            : '浏览器已挂载';
           document.getElementById('transportVal').textContent =
-            active.transport + ' (' + active.driver_mode + ')';
-          document.getElementById('tabVal').textContent =
-            (active.tab_title ? active.tab_title + ' · ' : '') + (active.tab_url || '已就绪');
-          const modelLabel = active.active_model ? (active.active_model + ' · ') : '';
+            (active ? active.transport + ' (' + active.driver_mode + ')' : 'multi-slot') +
+            (hub.auto_spawn_tabs ? ' · 自动扩容(≤' + (hub.max_parallel_tabs || 4) + ')' : '');
+          if (slots.length > 0) {
+            const summary = slots.map(function (s) {
+              return '#' + (s.tab_id || 'tm') + (s.busy ? '[忙碌]' : '[空闲]') + (s.active_model ? '(' + s.active_model + ')' : '');
+            }).join('  ');
+            document.getElementById('tabVal').textContent = summary;
+          } else {
+            document.getElementById('tabVal').textContent =
+              (active.tab_title ? active.tab_title + ' · ' : '') + (active.tab_url || '已就绪');
+          }
+          const modelLabel = (active && active.active_model) ? (active.active_model + ' · ') : '';
           document.getElementById('rpcVal').textContent =
-            modelLabel + (active.captured_rpc ? '已捕获 RPC 模板' : '被动监听 + Shadow DOM');
+            modelLabel + ((active && active.captured_rpc) ? '已捕获 RPC 模板' : '被动监听 + Shadow DOM');
         } else if (data.gcloud_configured && data.backend_mode !== 'browser') {
           dot.className = 'dot ok';
           txt.textContent = 'GCloud 官方模式就绪';
@@ -284,9 +298,10 @@ DASHBOARD_HTML = """<!DOCTYPE html>
           document.getElementById('rpcVal').textContent = '-';
         }
 
-        const hub = data.hub || {};
         document.getElementById('statsVal').textContent =
-          (hub.queued_requests || 0) + ' 排队 / ' + (hub.total_requests || 0) + ' 总计';
+          (hub.active_slots_busy || 0) + ' 并发 / ' +
+          (hub.queued_requests || 0) + ' 排队 / ' +
+          (hub.total_requests || 0) + ' 总计';
 
         const logs = hub.recent_logs || [];
         const logsBox = document.getElementById('logsBox');

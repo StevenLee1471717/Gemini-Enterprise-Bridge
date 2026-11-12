@@ -52,6 +52,85 @@ class ConversationContextBuilder:
     def get_session_model(self, session_key: str = "default") -> Optional[str]:
         return self._session_models.get(session_key)
 
+    def has_active_conversation(self, session_key: str) -> bool:
+        return bool(self._session_turns.get(session_key))
+
+    @staticmethod
+    def _normalize_messages(messages: Sequence[ChatMessage]) -> Tuple[str, List[Tuple[str, str]]]:
+        system_parts: List[str] = []
+        dialogue: List[Tuple[str, str]] = []
+        call_id_to_name: Dict[str, str] = {}
+
+        for msg in messages:
+            role = (msg.role or "user").strip().lower()
+            text = msg.text_content().strip()
+
+            if role in {"system", "developer"}:
+                if text:
+                    system_parts.append(text)
+                continue
+
+            if role == "assistant":
+                tcs = msg.normalized_tool_calls()
+                for tc in tcs:
+                    tc_id = str(tc.get("id") or "")
+                    fn_name = str((tc.get("function") or {}).get("name") or "")
+                    if tc_id and fn_name:
+                        call_id_to_name[tc_id] = fn_name
+                if tcs:
+                    canon_asst = format_assistant_history_entry(text, tcs)
+                    dialogue.append(("assistant", canon_asst))
+                elif text:
+                    dialogue.append(("assistant", text))
+                continue
+
+            if role in {"tool", "function"}:
+                resolved_name = msg.name or (
+                    call_id_to_name.get(msg.tool_call_id) if msg.tool_call_id else None
+                )
+                formatted_tool = format_tool_result_entry(
+                    text,
+                    tool_call_id=msg.tool_call_id,
+                    name=resolved_name,
+                )
+                dialogue.append(("tool", formatted_tool))
+                continue
+
+            if text:
+                dialogue.append(("user", text))
+
+        return ("\n\n".join(system_parts).strip(), dialogue)
+
+    def find_matching_slots(
+        self,
+        candidate_slot_keys: Sequence[str],
+        messages: Sequence[ChatMessage],
+        model: str = "gemini-enterprise-web",
+    ) -> List[str]:
+        """Find worker slot keys whose active browser conversation matches `messages`'s prefix."""
+        if not candidate_slot_keys or model_requests_new_chat(model):
+            return []
+
+        user_system_text, dialogue = self._normalize_messages(messages)
+        if len(dialogue) <= 1:
+            return []
+        if dialogue[-1][0] == "user" and dialogue[-1][1].startswith("[NEW_CHAT]"):
+            return []
+
+        matched: List[Tuple[int, str]] = []
+        for slot_key in candidate_slot_keys:
+            tracked = self._session_turns.get(slot_key)
+            if not tracked or len(tracked) >= len(dialogue):
+                continue
+            prev_sys_fp = self._session_system_fp.get(slot_key)
+            if prev_sys_fp is not None and prev_sys_fp != user_system_text:
+                continue
+            if self._history_matches(tracked, dialogue[: len(tracked)]):
+                matched.append((len(tracked), slot_key))
+
+        matched.sort(key=lambda item: item[0], reverse=True)
+        return [slot_key for _, slot_key in matched]
+
     def record_completed_turn(
         self,
         session_key: str,
@@ -98,47 +177,7 @@ class ConversationContextBuilder:
             else ""
         )
 
-        system_parts: List[str] = []
-        dialogue: List[Tuple[str, str]] = []
-        call_id_to_name: Dict[str, str] = {}
-
-        for msg in messages:
-            role = (msg.role or "user").strip().lower()
-            text = msg.text_content().strip()
-
-            if role in {"system", "developer"}:
-                if text:
-                    system_parts.append(text)
-                continue
-
-            if role == "assistant":
-                tcs = msg.normalized_tool_calls()
-                for tc in tcs:
-                    tc_id = str(tc.get("id") or "")
-                    fn_name = str((tc.get("function") or {}).get("name") or "")
-                    if tc_id and fn_name:
-                        call_id_to_name[tc_id] = fn_name
-                if tcs:
-                    canon_asst = format_assistant_history_entry(text, tcs)
-                    dialogue.append(("assistant", canon_asst))
-                elif text:
-                    dialogue.append(("assistant", text))
-                continue
-
-            if role in {"tool", "function"}:
-                resolved_name = msg.name or (
-                    call_id_to_name.get(msg.tool_call_id) if msg.tool_call_id else None
-                )
-                formatted_tool = format_tool_result_entry(
-                    text,
-                    tool_call_id=msg.tool_call_id,
-                    name=resolved_name,
-                )
-                dialogue.append(("tool", formatted_tool))
-                continue
-
-            if text:
-                dialogue.append(("user", text))
+        user_system_text, dialogue = self._normalize_messages(messages)
 
         tool_sys_text = build_tool_system_instructions(
             norm_tools,
@@ -147,7 +186,6 @@ class ConversationContextBuilder:
         )
         fmt_sys_text = build_response_format_instructions(response_format)
 
-        user_system_text = "\n\n".join(system_parts).strip()
         combined_sys_sections = [s for s in (user_system_text, tool_sys_text, fmt_sys_text) if s]
         combined_system_text = "\n\n".join(combined_sys_sections).strip()
 

@@ -87,7 +87,7 @@ $ExtFolder = Join-Path $PSScriptRoot "extension"
 Write-Host ""
 Write-Host "  1. Load unpacked extension from: $ExtFolder" -ForegroundColor Green
 Write-Host "  2. Sign in at: https://vertexaisearch.cloud.google.com" -ForegroundColor Green
-Write-Host "  3. OpenAI Base URL: http://127.0.0.1:${ActivePort}/v1  (Models: gemini-4-argon / gemini-3.1-pro / gemini-3.8-flash)" -ForegroundColor Green
+Write-Host "  3. OpenAI Base URL: http://127.0.0.1:${ActivePort}/v1  (Models: gemini-4-argon / gemini-4-carbon / gemini-3.1-pro / gemini-3.8-flash)" -ForegroundColor Green
 Write-Host "  4. Local Dashboard: http://127.0.0.1:${ActivePort}/" -ForegroundColor Green
 Write-Host ""
 

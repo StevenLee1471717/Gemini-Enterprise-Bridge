@@ -256,7 +256,7 @@ prose.addEventListener("input", () => {
 // Dropdown menu options whose labels ALSO live inside each `<ucs-model-option>` shadowRoot!
 const menu = new Elem("div", { attrs: { role: "menu" }, hidden: true });
 doc.body.appendChild(menu);
-for (const lbl of ["Auto", "3.1 Pro", "4 Argon", "3.8 Flash"]) {
+for (const lbl of ["Auto", "3.1 Pro", "4 Argon", "4 Carbon", "3.8 Flash"]) {
   const opt = new Elem("ucs-model-option", { attrs: { role: "menuitemradio" } });
   const optSr = opt.attachShadow();
   optSr.appendChild(new Elem("span", { text: lbl }));
@@ -533,7 +533,7 @@ def test_full_chain_client_server_extension_dom_integration(tmp_path: Path) -> N
             with client.stream(
                 "POST",
                 "/v1/chat/completions",
-                json={"model": "4argon", "stream": True, "tools": large_tools, "messages": msgs},
+                json={"model": "gemini-4-carbon", "stream": True, "tools": large_tools, "messages": msgs},
             ) as r2:
                 assert r2.status_code == 200
                 final_answer = ""
@@ -545,17 +545,16 @@ def test_full_chain_client_server_extension_dom_integration(tmp_path: Path) -> N
                 assert "核心指标已全部达成" in final_answer
 
             worker.join(timeout=5.0)
-
             status_snapshot = client.get("/api/status").json()
-            # Must report "4 Argon", NEVER "Choose model"!
-            assert status_snapshot["hub"]["active_client"]["active_model"] == "4 Argon"
+            # Must report "4 Carbon" after switching from "4 Argon" on Turn 2, NEVER "Choose model"!
+            assert status_snapshot["hub"]["active_client"]["active_model"] == "4 Carbon"
 
     assert len(dom_runs) == 2
     assert dom_runs[0]["clickedSendButton"] is True
     assert dom_runs[0]["submittedLength"] > 33000  # Proves chunked + reset_chat NEVER produces len=0!
     assert dom_runs[0]["activeModel"] == "4 Argon"
     assert dom_runs[1]["clickedSendButton"] is True
-    assert dom_runs[1]["activeModel"] == "4 Argon"
+    assert dom_runs[1]["activeModel"] == "4 Carbon"
 
 
 def test_stale_websocket_close_does_not_evict_newer_connection() -> None:

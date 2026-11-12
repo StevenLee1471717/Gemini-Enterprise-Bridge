@@ -71,6 +71,9 @@ class BridgeSettings:
     request_timeout_seconds: float = 180.0
     queue_timeout_seconds: float = 90.0
     auto_reset_new_chat: bool = True
+    max_parallel_tabs: int = 4
+    auto_spawn_tabs: bool = True
+    session_affinity_ttl_seconds: float = 300.0
     include_citations: bool = True
     cors_allow_origins: List[str] = field(default_factory=lambda: ["*"])
     auto_export_extension: bool = True
@@ -111,6 +114,11 @@ class BridgeSettings:
             request_timeout_seconds=_env_float("BRIDGE_REQUEST_TIMEOUT", 180.0),
             queue_timeout_seconds=_env_float("BRIDGE_QUEUE_TIMEOUT", 90.0),
             auto_reset_new_chat=_env_bool("BRIDGE_AUTO_RESET_NEW_CHAT", True),
+            max_parallel_tabs=max(1, _env_int("BRIDGE_MAX_PARALLEL_TABS", 4)),
+            auto_spawn_tabs=_env_bool("BRIDGE_AUTO_SPAWN_TABS", True),
+            session_affinity_ttl_seconds=max(
+                0.0, _env_float("BRIDGE_SESSION_AFFINITY_TTL", 300.0)
+            ),
             include_citations=_env_bool("BRIDGE_INCLUDE_CITATIONS", True),
             cors_allow_origins=origins,
             auto_export_extension=_env_bool("BRIDGE_AUTO_EXPORT_EXTENSION", True),

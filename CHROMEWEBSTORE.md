@@ -1,7 +1,7 @@
 # Chrome Web Store Listing & Permissions Reference
 
 **Extension Name:** Gemini Enterprise Web-to-API Bridge  
-**Current Version:** 1.1.0  
+**Current Version:** 1.1.1  
 **Last Updated:** 2026-11-12  
 **Distribution Target:** Local Developer Unpacked Extension / Private Enterprise Internal Distribution
 
@@ -51,5 +51,6 @@ Every permission in `manifest.json` is strictly scoped to local bridging:
 
 ## Version History
 
+- **1.1.1 (2026-11-12):** Eliminated background WebSocket connection-refused and handshake warnings via lightweight gateway readiness checks, and improved back/forward cache keep-alive port cleanup during tab navigation.
 - **1.1.0 (2026-11-12):** Added Gemini 4 Carbon support, real-time context window and API cost equivalence telemetry, and automated GitHub Releases update detection with one-click local gateway upgrade.
 - **1.0.0 (2026-11-11):** Initial release with local WebSocket gateway connection, multi-account tab selector, real-time response streaming, custom selector overrides, and page diagnostics.

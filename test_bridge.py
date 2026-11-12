@@ -2168,3 +2168,47 @@ def test_e2e_cross_version_ws_handshake_and_update_endpoints(tmp_path: Path) -> 
             assert ack_b["backend_version"] == "1.3.0"
             reload_msg = ws.receive_json()
             assert reload_msg == {"type": "extension_reload_available", "version": "1.3.0"}
+
+
+def test_websocket_browser_accepts_chrome_extension_and_vertex_origins_never_403() -> None:
+    ext_origin = "chrome-extension://abcdefghijklmnopabcdefghijklmnop"
+    vertex_origin = "https://vertexaisearch.cloud.google.com"
+
+    # 1. Default wildcard CORS (allow_origins=["*"], allow_credentials=True)
+    app_wildcard = create_app(_make_test_settings(cors_allow_origins=["*"]))
+    with TestClient(app_wildcard) as client:
+        preflight = client.options(
+            "/health",
+            headers={
+                "Origin": ext_origin,
+                "Access-Control-Request-Method": "GET",
+            },
+        )
+        assert preflight.status_code == 200
+        assert preflight.headers.get("access-control-allow-origin") == ext_origin
+
+        health_resp = client.get("/health", headers={"Origin": ext_origin})
+        assert health_resp.status_code == 200
+        assert health_resp.headers.get("access-control-allow-origin") == ext_origin
+        assert health_resp.json()["status"] == "ok"
+
+        for idx, origin in enumerate((ext_origin, vertex_origin)):
+            with client.websocket_connect(
+                f"/ws/browser?client_id=ext-origin-{idx}",
+                headers={"Origin": origin},
+            ) as ws:
+                welcome = ws.receive_json()
+                assert welcome["type"] == "welcome"
+
+    # 2. Restricted HTTP CORS list still allows local /ws/browser extension & userscript handshakes
+    app_restricted = create_app(
+        _make_test_settings(cors_allow_origins=["http://localhost:3000"])
+    )
+    with TestClient(app_restricted) as client:
+        for idx, origin in enumerate((ext_origin, vertex_origin)):
+            with client.websocket_connect(
+                f"/ws/browser?client_id=ext-restricted-{idx}",
+                headers={"Origin": origin},
+            ) as ws:
+                welcome = ws.receive_json()
+                assert welcome["type"] == "welcome"

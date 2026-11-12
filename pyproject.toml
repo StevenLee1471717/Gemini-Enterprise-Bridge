@@ -1,6 +1,6 @@
 [project]
 name = "gemini-enterprise-bridge"
-version = "1.1.0"
+version = "1.1.1"
 description = "Browser-in-the-loop OpenAI-compatible local gateway for Google Cloud Gemini Enterprise (Vertex AI Search / Agentspace)"
 readme = "README.md"
 requires-python = ">=3.10"

@@ -203,9 +203,24 @@ def create_app(
     app.state.update_manager = updater
     app.state.gcloud = gcloud
 
+    class _WebSocketSafeCORSMiddleware:
+        """Apply CORSMiddleware to HTTP requests while letting WebSocket handshakes pass cleanly."""
+
+        def __init__(self, asgi_app: Any, **cors_kwargs: Any) -> None:
+            self.asgi_app = asgi_app
+            self.cors_app = CORSMiddleware(asgi_app, **cors_kwargs)
+
+        async def __call__(self, scope: Dict[str, Any], receive: Any, send: Any) -> None:
+            if scope.get("type") == "websocket":
+                await self.asgi_app(scope, receive, send)
+                return
+            await self.cors_app(scope, receive, send)
+
+    wildcard_cors = "*" in (cfg.cors_allow_origins or [])
     app.add_middleware(
-        CORSMiddleware,
-        allow_origins=cfg.cors_allow_origins,
+        _WebSocketSafeCORSMiddleware,
+        allow_origins=[] if wildcard_cors else cfg.cors_allow_origins,
+        allow_origin_regex=r".*" if wildcard_cors else None,
         allow_credentials=True,
         allow_methods=["*"],
         allow_headers=["*"],

@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "Gemini Enterprise Web-to-API Bridge",
-  "version": "1.1.0",
+  "version": "1.1.1",
   "description": "Bridge Google Cloud Vertex AI Search / Agentspace web sessions to a local OpenAI-compatible API server.",
   "permissions": [
     "storage",

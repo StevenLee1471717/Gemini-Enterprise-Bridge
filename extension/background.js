@@ -33,9 +33,9 @@ const activeInFlightRequests = new Map(); // requestId -> expiresAtMs
 
 function getExtensionVersion() {
   try {
-    return (chrome.runtime.getManifest() && chrome.runtime.getManifest().version) || "1.1.0";
+    return (chrome.runtime.getManifest() && chrome.runtime.getManifest().version) || "1.1.1";
   } catch (_) {
-    return "1.1.0";
+    return "1.1.1";
   }
 }
 
@@ -436,10 +436,51 @@ async function ensureWebSocketConnected(forceReconnect = false, fromBackoffTimer
 
   clearReconnectTimer();
   socketRuntime.connecting = true;
+
+  const rawWsUrl = settings.wsUrl.trim() || DEFAULT_SETTINGS.wsUrl;
+  const httpBase = deriveHttpBaseFromWs(rawWsUrl);
+
+  // Preflight HTTP /health before opening WebSocket so Chromium never logs
+  // unsuppressible net::ERR_CONNECTION_REFUSED or 403 handshake errors in chrome://extensions.
+  try {
+    const healthRes = await fetchJsonWithTimeout(
+      `${httpBase}/health`,
+      { method: "GET", cache: "no-store" },
+      1800
+    );
+    const isBridgeHealthy =
+      healthRes.ok &&
+      healthRes.data &&
+      healthRes.data.status === "ok" &&
+      typeof healthRes.data.browser_connected === "boolean";
+    if (!isBridgeHealthy) {
+      socketRuntime.connecting = false;
+      await setSessionStatus({
+        wsConnected: false,
+        lastError: `本地端口响应异常 (${httpBase}/health HTTP ${healthRes.status})，请确认运行的是最新 Gemini Enterprise Bridge 后端。`
+      });
+      scheduleReconnectWithBackoff();
+      return;
+    }
+  } catch (_) {
+    socketRuntime.connecting = false;
+    await setSessionStatus({
+      wsConnected: false,
+      lastError: `等待本地后端启动 (${httpBase})... 请确认 start.bat / server.py 正在运行。`
+    });
+    scheduleReconnectWithBackoff();
+    return;
+  }
+
+  const latestSettingsAfterProbe = await getSettings();
+  if (!socketRuntime.connecting || !latestSettingsAfterProbe.enabled) {
+    socketRuntime.connecting = false;
+    return;
+  }
+
   const clientId = await getClientId();
-  let targetUrl = settings.wsUrl.trim() || DEFAULT_SETTINGS.wsUrl;
-  const separator = targetUrl.includes("?") ? "&" : "?";
-  targetUrl = `${targetUrl}${separator}client_id=${encodeURIComponent(clientId)}`;
+  const separator = rawWsUrl.includes("?") ? "&" : "?";
+  const targetUrl = `${rawWsUrl}${separator}client_id=${encodeURIComponent(clientId)}`;
 
   try {
     const ws = new WebSocket(targetUrl);
@@ -560,7 +601,7 @@ async function prepareTabForBackgroundExecution(tab) {
     await reloadWait;
     await new Promise((r) => setTimeout(r, 650));
     await ensureScriptsInjected(freshTab.id);
-    injectedTabVersions.set(freshTab.id, "2.5");
+    injectedTabVersions.set(freshTab.id, "2.6");
     try {
       freshTab = await chrome.tabs.get(freshTab.id);
     } catch (_) {}
@@ -603,7 +644,7 @@ async function spawnParallelWorkerTab(baseUrlHint = "") {
   await waitForTabComplete(created.id, 14000);
   await new Promise((r) => setTimeout(r, 600));
   await ensureScriptsInjected(created.id);
-  injectedTabVersions.set(created.id, "2.5");
+  injectedTabVersions.set(created.id, "2.6");
 
   let latest = created;
   try {
@@ -662,6 +703,9 @@ async function resetTabChatWithFallback(tab) {
     (inPageResult && inPageResult.cleanUrl) || preCleanUrl;
   if (targetCleanUrl && targetCleanUrl !== tab.url) {
     await appendLog("info", "Navigating tab to clean New Chat URL: " + targetCleanUrl);
+    try {
+      await chrome.tabs.sendMessage(tab.id, { type: "GEB_PREPARE_UNLOAD" });
+    } catch (_) {}
     const loadPromise = waitForTabComplete(tab.id, 12000);
     await chrome.tabs.update(tab.id, { url: targetCleanUrl });
     await loadPromise;
@@ -1104,9 +1148,9 @@ async function handleBackendCommand(msg) {
     );
 
     // Ensure hot-swapped latest page-driver.js & content-bridge.js are active on this tab (race-free per-tab map)
-    if (injectedTabVersions.get(tab.id) !== "2.5") {
+    if (injectedTabVersions.get(tab.id) !== "2.6") {
       await ensureScriptsInjected(tab.id);
-      injectedTabVersions.set(tab.id, "2.5");
+      injectedTabVersions.set(tab.id, "2.6");
     }
 
     let remainingResetChat = Boolean(msg.reset_chat);
@@ -1275,6 +1319,10 @@ chrome.tabs.onActivated.addListener(() => {
 
 // Keep-alive port from hidden/background Gemini Enterprise content scripts
 chrome.runtime.onConnect.addListener((port) => {
+  port.onDisconnect.addListener(() => {
+    // Consume runtime.lastError when tab navigates or enters bfcache
+    void chrome.runtime?.lastError;
+  });
   if (port.name !== "geb-keepalive") return;
   port.onMessage.addListener((msg) => {
     if (msg && msg.type === "keepalive_ping") {
@@ -1286,12 +1334,21 @@ chrome.runtime.onConnect.addListener((port) => {
   });
 });
 
-let tabActivationMutex = Promise.resolve();
-
-function withTabActivationLock(fn) {
-  const next = tabActivationMutex.then(fn, fn);
-  tabActivationMutex = next.catch(() => {});
-  return next;
+let tabActivationTail = Promise.resolve();
+async function withTabActivationLock(fn) {
+  const prev = tabActivationTail;
+  let release;
+  tabActivationTail = new Promise((resolve) => {
+    release = resolve;
+  });
+  try {
+    await prev;
+  } catch (_) {}
+  try {
+    return await fn();
+  } finally {
+    release();
+  }
 }
 
 chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {

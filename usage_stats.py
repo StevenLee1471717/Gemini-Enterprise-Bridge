@@ -36,7 +36,7 @@ from schemas import resolve_target_web_model
 logger = logging.getLogger("gemini_bridge.usage")
 
 DEFAULT_CONTEXT_WINDOW = 1_048_576
-DEFAULT_USD_TO_CNY = 7.25
+DEFAULT_USD_TO_CNY = 6.8
 MAX_RECENT_REQUESTS = 20
 MAX_STORED_DAYS = 90
 

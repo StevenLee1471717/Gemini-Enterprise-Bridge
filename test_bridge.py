@@ -1698,7 +1698,7 @@ def test_usage_tracker_official_pricing_persistence_and_reset(tmp_path: Path) ->
     from usage_stats import UsageTracker
 
     ledger_file = tmp_path / "usage_stats.json"
-    tracker = UsageTracker(storage_path=ledger_file, usd_to_cny_rate=7.25)
+    tracker = UsageTracker(storage_path=ledger_file)
 
     # 1) Gemini 4 Carbon intro rate (2026-11-15): $2.00 input, $0.10 cached, $10.00 output
     rec_c1 = tracker.record_request(
@@ -1714,7 +1714,7 @@ def test_usage_tracker_official_pricing_persistence_and_reset(tmp_path: Path) ->
     assert abs(rec_c1["equivalent_cost_usd"] - 0.30) < 1e-6
     # Cached: 0.08M * $0.10 ($0.008) + 0.02M * $2.00 ($0.04) + 0.01M * $10.00 ($0.10) = $0.148
     assert abs(rec_c1["cached_equivalent_cost_usd"] - 0.148) < 1e-6
-    assert abs(rec_c1["equivalent_cost_cny"] - round(0.30 * 7.25, 4)) < 1e-4
+    assert abs(rec_c1["equivalent_cost_cny"] - round(0.30 * 6.8, 4)) < 1e-4
 
     # 2) Gemini 4 Carbon post-intro rate (2026-12-05): $4.00 input, $0.20 cached, $20.00 output
     rec_c2 = tracker.record_request(
@@ -1757,8 +1757,9 @@ def test_usage_tracker_official_pricing_persistence_and_reset(tmp_path: Path) ->
     assert ledger_file.is_file()
 
     # Reload from disk into a fresh UsageTracker instance
-    reloaded = UsageTracker(storage_path=ledger_file, usd_to_cny_rate=7.25)
+    reloaded = UsageTracker(storage_path=ledger_file)
     snap = reloaded.snapshot(active_model_hint="4 Carbon", as_of_date="2026-11-15", include_catalog=True)
+    assert abs(snap["usd_to_cny_rate"] - 6.8) < 1e-6
     assert snap["all_time"]["requests"] == 5
     assert snap["current_session"]["requests"] == 0
     assert "gemini-4-carbon" in snap["by_model"]

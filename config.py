@@ -77,6 +77,8 @@ class BridgeSettings:
     include_citations: bool = True
     cors_allow_origins: List[str] = field(default_factory=lambda: ["*"])
     auto_export_extension: bool = True
+    usage_stats_path: str = ""
+    usd_to_cny_rate: float = 7.25
 
     # Optional Option-1 (Official GCloud CLI / Vertex AI / Discovery Engine) settings
     gcp_project_id: str = ""
@@ -122,6 +124,8 @@ class BridgeSettings:
             include_citations=_env_bool("BRIDGE_INCLUDE_CITATIONS", True),
             cors_allow_origins=origins,
             auto_export_extension=_env_bool("BRIDGE_AUTO_EXPORT_EXTENSION", True),
+            usage_stats_path=os.getenv("BRIDGE_USAGE_STATS_PATH", "").strip(),
+            usd_to_cny_rate=_env_float("BRIDGE_USD_TO_CNY_RATE", 7.25),
             gcp_project_id=os.getenv("GCP_PROJECT_ID", "").strip(),
             gcp_location=os.getenv("GCP_LOCATION", "global").strip() or "global",
             gcp_vertex_location=os.getenv("GCP_VERTEX_LOCATION", "us-central1").strip()

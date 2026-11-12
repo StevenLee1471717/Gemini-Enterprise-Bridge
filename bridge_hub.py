@@ -9,7 +9,7 @@ import re
 import time
 import uuid
 from dataclasses import dataclass, field
-from typing import Any, AsyncIterator, Dict, List, Optional, Sequence, Set
+from typing import Any, AsyncIterator, Callable, Dict, List, Optional, Sequence, Set
 
 from fastapi import WebSocket
 
@@ -179,6 +179,9 @@ class BrowserBridgeHub:
         self._total_requests = 0
         self._total_errors = 0
         self._recent_logs: List[Dict[str, Any]] = []
+        self.usage_snapshot_provider: Optional[Callable[[], Dict[str, Any]]] = None
+        self.on_slot_removed: Optional[Callable[[str], None]] = None
+        self.on_slot_migrated: Optional[Callable[[str, str], None]] = None
 
     def add_log(self, level: str, message: str, client_id: Optional[str] = None) -> None:
         entry = {
@@ -217,6 +220,11 @@ class BrowserBridgeHub:
             for sid, mapped_key in list(self._session_affinity.items()):
                 if mapped_key == default_key:
                     self._session_affinity[sid] = skey
+            if self.on_slot_migrated is not None:
+                try:
+                    self.on_slot_migrated(default_key, skey)
+                except Exception:
+                    pass
 
         slot = self._slots.get(skey)
         if slot is None:
@@ -245,6 +253,11 @@ class BrowserBridgeHub:
 
     def _remove_slot(self, slot_key: str, reason: str = "tab_closed") -> None:
         self._slots.pop(slot_key, None)
+        if self.on_slot_removed is not None:
+            try:
+                self.on_slot_removed(slot_key)
+            except Exception:
+                pass
         for sid, mapped in list(self._session_affinity.items()):
             if mapped == slot_key:
                 self._session_affinity.pop(sid, None)
@@ -351,17 +364,37 @@ class BrowserBridgeHub:
             except Exception:
                 pass
         self.add_log("info", f"Extension WebSocket connected ({cid})", cid)
-        await self._safe_ws_send(
-            state,
-            {
-                "type": "welcome",
-                "client_id": cid,
-                "server_time": int(time.time()),
-                "max_parallel_tabs": self.max_parallel_tabs,
-                "auto_spawn_tabs": self.auto_spawn_tabs,
-            },
-        )
+        welcome_payload: Dict[str, Any] = {
+            "type": "welcome",
+            "client_id": cid,
+            "server_time": int(time.time()),
+            "max_parallel_tabs": self.max_parallel_tabs,
+            "auto_spawn_tabs": self.auto_spawn_tabs,
+        }
+        if self.usage_snapshot_provider is not None:
+            try:
+                welcome_payload["usage_snapshot"] = self.usage_snapshot_provider()
+            except Exception:
+                pass
+        await self._safe_ws_send(state, welcome_payload)
         return state
+
+    async def broadcast_ws_event(
+        self,
+        payload: Dict[str, Any],
+        required_capability: Optional[str] = "usage_push",
+    ) -> None:
+        """Broadcast a JSON event frame (such as `usage_update`) to live WebSocket clients opting in."""
+        now = time.time()
+        targets = [
+            c
+            for c in list(self._clients.values())
+            if c.transport == "websocket"
+            and c.is_alive(now)
+            and (not required_capability or required_capability in c.capabilities)
+        ]
+        for client in targets:
+            await self._safe_ws_send(client, payload)
 
     def unregister_client(
         self,
@@ -575,9 +608,16 @@ class BrowserBridgeHub:
                     else:
                         self._sync_client_tabs(client_id, [])
 
-            if msg_type == "heartbeat":
-                return {"type": "pong", "server_time": int(time.time())}
-            return {"type": "ack", "server_time": int(time.time())}
+            resp_frame: Dict[str, Any] = {
+                "type": "pong" if msg_type == "heartbeat" else "ack",
+                "server_time": int(time.time()),
+            }
+            if self.usage_snapshot_provider is not None:
+                try:
+                    resp_frame["usage_snapshot"] = self.usage_snapshot_provider()
+                except Exception:
+                    pass
+            return resp_frame
 
         if msg_type == "log":
             self.add_log(

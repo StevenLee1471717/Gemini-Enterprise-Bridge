@@ -19,9 +19,11 @@ build/
 *.pem
 *.key
 
-# Runtime Logs & OS/IDE Artifacts
+# Runtime Logs, Usage Ledger & OS/IDE Artifacts
 logs/
 *.log
+usage_stats.json
+usage_stats.json.tmp
 .vscode/
 .idea/
 .DS_Store

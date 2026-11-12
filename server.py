@@ -34,9 +34,11 @@ from schemas import (
     build_chat_completion_chunk,
     build_chat_completion_response,
     build_usage,
+    estimate_tokens,
     parse_model_and_session,
     resolve_target_web_model,
 )
+from usage_stats import UsageTracker
 from tool_calling import (
     ToolStreamProcessor,
     build_sse_tool_call_deltas,
@@ -88,7 +90,40 @@ def create_app(settings: Optional[BridgeSettings] = None) -> FastAPI:
         default_mode=cfg.context_mode,
         auto_reset_new_chat=cfg.auto_reset_new_chat,
     )
+    usage_tracker = UsageTracker(
+        storage_path=cfg.usage_stats_path or None,
+        usd_to_cny_rate=cfg.usd_to_cny_rate,
+    )
     gcloud = GCloudVertexProvider(cfg)
+
+    def _resolve_active_model_hint(hub_snap: Optional[Dict[str, Any]] = None) -> str:
+        snap = hub_snap if hub_snap is not None else hub.status_snapshot()
+        active_client = snap.get("active_client")
+        if isinstance(active_client, dict) and active_client.get("active_model"):
+            return str(active_client["active_model"])
+        for ws_slot in snap.get("worker_slots") or []:
+            if isinstance(ws_slot, dict) and ws_slot.get("active_model"):
+                return str(ws_slot["active_model"])
+        return ""
+
+    def build_live_usage_snapshot(include_catalog: bool = False) -> Dict[str, Any]:
+        hub_snap = hub.status_snapshot()
+        ctx_monitor = context_builder.get_context_snapshot(hub_snap.get("worker_slots") or [])
+        model_hint = _resolve_active_model_hint(hub_snap) or str(
+            (ctx_monitor.get("primary") or {}).get("active_model") or ""
+        )
+        usage_snap = usage_tracker.snapshot(
+            active_model_hint=model_hint,
+            include_catalog=include_catalog,
+        )
+        return {
+            "usage": usage_snap,
+            "context_monitor": ctx_monitor,
+        }
+
+    hub.usage_snapshot_provider = lambda: build_live_usage_snapshot(include_catalog=False)
+    hub.on_slot_removed = context_builder.drop_slot
+    hub.on_slot_migrated = context_builder.migrate_slot_key
 
     @asynccontextmanager
     async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
@@ -117,6 +152,7 @@ def create_app(settings: Optional[BridgeSettings] = None) -> FastAPI:
     app.state.settings = cfg
     app.state.hub = hub
     app.state.context_builder = context_builder
+    app.state.usage_tracker = usage_tracker
     app.state.gcloud = gcloud
 
     app.add_middleware(
@@ -176,12 +212,51 @@ def create_app(settings: Optional[BridgeSettings] = None) -> FastAPI:
 
     @app.get("/api/status")
     async def api_status() -> Dict[str, Any]:
+        hub_snap = hub.status_snapshot()
+        ctx_monitor = context_builder.get_context_snapshot(hub_snap.get("worker_slots") or [])
+        model_hint = _resolve_active_model_hint(hub_snap) or str(
+            (ctx_monitor.get("primary") or {}).get("active_model") or ""
+        )
         return {
             "status": "ok",
             "backend_mode": cfg.backend_mode,
             "context_mode": cfg.context_mode,
             "gcloud_configured": gcloud.is_configured(),
-            "hub": hub.status_snapshot(),
+            "hub": hub_snap,
+            "usage": usage_tracker.snapshot(active_model_hint=model_hint, include_catalog=False),
+            "context_monitor": ctx_monitor,
+        }
+
+    @app.get("/api/usage")
+    async def api_usage() -> Dict[str, Any]:
+        live = build_live_usage_snapshot(include_catalog=True)
+        return {
+            "status": "ok",
+            "usage": live["usage"],
+            "context_monitor": live["context_monitor"],
+        }
+
+    @app.post("/api/usage/reset")
+    async def api_usage_reset(request: Request, scope: Optional[str] = None) -> Dict[str, Any]:
+        resolved_scope = scope or ""
+        if not resolved_scope:
+            try:
+                body = await request.json()
+                if isinstance(body, dict) and body.get("scope"):
+                    resolved_scope = str(body["scope"])
+            except Exception:
+                pass
+        resolved_scope = (resolved_scope or "all").strip().lower()
+        if resolved_scope not in {"session", "today", "all"}:
+            resolved_scope = "all"
+        usage_tracker.reset(scope=resolved_scope)
+        live = build_live_usage_snapshot(include_catalog=True)
+        await hub.broadcast_ws_event({"type": "usage_update", "usage_snapshot": live})
+        return {
+            "ok": True,
+            "scope": resolved_scope,
+            "usage": live["usage"],
+            "context_monitor": live["context_monitor"],
         }
 
     # ------------------------------------------------------------------
@@ -229,14 +304,22 @@ def create_app(settings: Optional[BridgeSettings] = None) -> FastAPI:
     async def poll_http_bridge(client_id: str, timeout: float = 18.0) -> Dict[str, Any]:
         bounded = max(1.0, min(timeout, 25.0))
         command = await hub.poll_http_command(client_id=client_id, timeout=bounded)
-        return {"ok": True, "command": command}
+        return {
+            "ok": True,
+            "command": command,
+            "usage_snapshot": build_live_usage_snapshot(include_catalog=False),
+        }
 
     @app.post("/api/bridge/event")
     async def receive_http_bridge_event(payload: BridgeEventPayload) -> Dict[str, Any]:
         raw = payload.model_dump() if hasattr(payload, "model_dump") else payload.dict()
         raw["type"] = payload.event
         ack = await hub.handle_browser_event(payload.client_id, raw)
-        return {"ok": True, "ack": ack}
+        return {
+            "ok": True,
+            "ack": ack,
+            "usage_snapshot": build_live_usage_snapshot(include_catalog=False),
+        }
 
     @app.post("/api/bridge/callback")
     async def receive_async_bridge_callback(payload: BridgeCallbackPayload) -> Dict[str, Any]:
@@ -335,6 +418,7 @@ def create_app(settings: Optional[BridgeSettings] = None) -> FastAPI:
         target_web_model = resolve_target_web_model(model_name)
         completion_id = uuid.uuid4().hex
         created_ts = int(time.time())
+        req_started_mono = time.monotonic()
         include_usage = bool(request.stream_options and request.stream_options.include_usage)
 
         norm_tools = normalize_request_tools(request.tools, request.functions)
@@ -379,7 +463,7 @@ def create_app(settings: Optional[BridgeSettings] = None) -> FastAPI:
                     parallel_tool_calls=request.parallel_tool_calls,
                     response_format=request.response_format,
                 )
-                return build_chat_completion_response(
+                resp_obj = build_chat_completion_response(
                     request_id=completion_id,
                     model=model_name,
                     reply_text=parsed.content,
@@ -388,6 +472,20 @@ def create_app(settings: Optional[BridgeSettings] = None) -> FastAPI:
                     tool_calls=parsed.tool_calls or None,
                     finish_reason=parsed.finish_reason,
                 )
+                u_info = resp_obj.get("usage") or {}
+                usage_tracker.record_request(
+                    requested_model=model_name,
+                    prompt_tokens=int(u_info.get("prompt_tokens") or estimate_tokens(prompt_for_usage)),
+                    completion_tokens=int(u_info.get("completion_tokens") or 0),
+                    gcloud_fallback_model=cfg.gcloud_model,
+                    strategy="gcloud_direct",
+                    slot_key="gcloud",
+                    duration_ms=int((time.monotonic() - req_started_mono) * 1000),
+                )
+                await hub.broadcast_ws_event(
+                    {"type": "usage_update", "usage_snapshot": build_live_usage_snapshot()}
+                )
+                return resp_obj
 
             async def gcloud_sse() -> AsyncIterator[str]:
                 initial = build_chat_completion_chunk(
@@ -448,6 +546,19 @@ def create_app(settings: Optional[BridgeSettings] = None) -> FastAPI:
                         completion_usage_str = json.dumps(parsed.tool_calls, ensure_ascii=False)
                     else:
                         completion_usage_str = parsed.content or ""
+                    gcloud_u = build_usage(prompt_for_usage, completion_usage_str)
+                    usage_tracker.record_request(
+                        requested_model=model_name,
+                        prompt_tokens=gcloud_u["prompt_tokens"],
+                        completion_tokens=gcloud_u["completion_tokens"],
+                        gcloud_fallback_model=cfg.gcloud_model,
+                        strategy="gcloud_stream",
+                        slot_key="gcloud",
+                        duration_ms=int((time.monotonic() - req_started_mono) * 1000),
+                    )
+                    await hub.broadcast_ws_event(
+                        {"type": "usage_update", "usage_snapshot": build_live_usage_snapshot()}
+                    )
                 except GCloudUpstreamError as exc:
                     err_chunk = build_chat_completion_chunk(
                         request_id=completion_id,
@@ -551,14 +662,42 @@ def create_app(settings: Optional[BridgeSettings] = None) -> FastAPI:
                     slot.pending_tool_call_until = (
                         time.time() + 60.0 if parsed.has_tool_calls else 0.0
                     )
+                    effective_slot_model = slot.active_model or target_web_model
                     context_builder.record_completed_turn(
                         session_key=session_key,
                         sent_history=prepared.normalized_history,
                         assistant_reply=parsed.content or "",
                         assistant_tool_calls=parsed.tool_calls or None,
-                        active_model=target_web_model,
+                        active_model=effective_slot_model,
                         tools_fingerprint=prepared.tools_fingerprint,
                         system_fingerprint=prepared.system_fingerprint,
+                        system_tokens=prepared.system_tokens,
+                        tools_tokens=prepared.tools_tokens,
+                        last_delta_tokens=prepared.delta_prompt_tokens,
+                        last_strategy=prepared.strategy_used,
+                    )
+                    comp_text_for_stats = parsed.content or ""
+                    if parsed.has_tool_calls:
+                        comp_text_for_stats += " " + json.dumps(
+                            parsed.tool_calls, ensure_ascii=False
+                        )
+                    slot_ctx = context_builder.get_slot_context_metrics(session_key) or {}
+                    usage_tracker.record_request(
+                        requested_model=model_name,
+                        prompt_tokens=max(
+                            prepared.logical_prompt_tokens,
+                            estimate_tokens(prompt_for_usage),
+                        ),
+                        completion_tokens=estimate_tokens(comp_text_for_stats),
+                        browser_active_model=effective_slot_model,
+                        strategy=prepared.strategy_used,
+                        cached_tokens=prepared.cached_prefix_tokens,
+                        delta_prompt_tokens=prepared.delta_prompt_tokens,
+                        slot_key=session_key,
+                        tab_id=slot.tab_id,
+                        context_tokens=slot_ctx.get("total_context_tokens"),
+                        context_limit=slot_ctx.get("context_limit_tokens"),
+                        duration_ms=int((time.monotonic() - req_started_mono) * 1000),
                     )
                     slot_header_val = slot.slot_key
             except BridgeUnavailableError as exc:
@@ -576,6 +715,9 @@ def create_app(settings: Optional[BridgeSettings] = None) -> FastAPI:
                 created=created_ts,
                 tool_calls=parsed.tool_calls or None,
                 finish_reason=parsed.finish_reason,
+            )
+            await hub.broadcast_ws_event(
+                {"type": "usage_update", "usage_snapshot": build_live_usage_snapshot()}
             )
             resp_headers = {"X-Bridge-Slot": slot_header_val}
             if explicit_session_id:
@@ -674,7 +816,8 @@ def create_app(settings: Optional[BridgeSettings] = None) -> FastAPI:
                     slot.pending_tool_call_until = (
                         time.time() + 60.0 if parsed.has_tool_calls else 0.0
                     )
-
+                    effective_slot_model = slot.active_model or target_web_model
+                    turn_recorded = False
                     if parsed.has_tool_calls:
                         finish_reason = "tool_calls"
                         for tc_batch in build_sse_tool_call_deltas(parsed.tool_calls):
@@ -693,10 +836,15 @@ def create_app(settings: Optional[BridgeSettings] = None) -> FastAPI:
                             sent_history=prepared.normalized_history,
                             assistant_reply=parsed.content or "",
                             assistant_tool_calls=parsed.tool_calls,
-                            active_model=target_web_model,
+                            active_model=effective_slot_model,
                             tools_fingerprint=prepared.tools_fingerprint,
                             system_fingerprint=prepared.system_fingerprint,
+                            system_tokens=prepared.system_tokens,
+                            tools_tokens=prepared.tools_tokens,
+                            last_delta_tokens=prepared.delta_prompt_tokens,
+                            last_strategy=prepared.strategy_used,
                         )
+                        turn_recorded = True
                     else:
                         full_reply = (parsed.content or "").strip()
                         completion_usage_str = full_reply
@@ -705,10 +853,37 @@ def create_app(settings: Optional[BridgeSettings] = None) -> FastAPI:
                                 session_key=session_key,
                                 sent_history=prepared.normalized_history,
                                 assistant_reply=full_reply,
-                                active_model=target_web_model,
+                                active_model=effective_slot_model,
                                 tools_fingerprint=prepared.tools_fingerprint,
                                 system_fingerprint=prepared.system_fingerprint,
+                                system_tokens=prepared.system_tokens,
+                                tools_tokens=prepared.tools_tokens,
+                                last_delta_tokens=prepared.delta_prompt_tokens,
+                                last_strategy=prepared.strategy_used,
                             )
+                            turn_recorded = True
+                    if turn_recorded:
+                        slot_ctx = context_builder.get_slot_context_metrics(session_key) or {}
+                        usage_tracker.record_request(
+                            requested_model=model_name,
+                            prompt_tokens=max(
+                                prepared.logical_prompt_tokens,
+                                estimate_tokens(prompt_for_usage_str),
+                            ),
+                            completion_tokens=estimate_tokens(completion_usage_str),
+                            browser_active_model=effective_slot_model,
+                            strategy=prepared.strategy_used,
+                            cached_tokens=prepared.cached_prefix_tokens,
+                            delta_prompt_tokens=prepared.delta_prompt_tokens,
+                            slot_key=session_key,
+                            tab_id=slot.tab_id,
+                            context_tokens=slot_ctx.get("total_context_tokens"),
+                            context_limit=slot_ctx.get("context_limit_tokens"),
+                            duration_ms=int((time.monotonic() - req_started_mono) * 1000),
+                        )
+                        await hub.broadcast_ws_event(
+                            {"type": "usage_update", "usage_snapshot": build_live_usage_snapshot()}
+                        )
             except (BridgeUnavailableError, BridgeTimeoutError, BridgeExecutionError) as exc:
                 err_chunk = build_chat_completion_chunk(
                     request_id=completion_id,

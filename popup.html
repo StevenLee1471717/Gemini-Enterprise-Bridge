@@ -35,6 +35,61 @@
       <p class="error-banner" id="errorBanner" hidden></p>
     </section>
 
+    <section class="telemetry-card" aria-label="官方 API 等价价值与上下文监控">
+      <div class="hero-header">
+        <div class="hero-title-group">
+          <span class="eyebrow">官方 API 等价价值 · Google Gemini 定价</span>
+          <span class="rate-badge" id="activeRateBadge">4 Carbon: $2/$10 / 1M</span>
+        </div>
+        <button type="button" id="resetUsageBtn" class="link-btn subtle" title="清空本地累计用量统计">重置统计</button>
+      </div>
+
+      <div class="cost-grid">
+        <div class="cost-main">
+          <span class="cost-caption">累计无缓存等价节省</span>
+          <div class="cost-amount-row">
+            <strong class="cost-usd" id="allTimeUsdText">$0.00</strong>
+            <span class="cost-cny" id="allTimeCnyText">≈ ¥0.00</span>
+          </div>
+          <span class="cost-subline" id="cachedSublineText">含隐式缓存折算: $0.00 · 累计 0 次</span>
+        </div>
+        <div class="cost-today">
+          <span class="cost-caption">今日等价消耗</span>
+          <strong class="today-usd" id="todayUsdText">$0.00</strong>
+          <span class="cost-subline" id="todayMetaText">≈ ¥0.00 · 0 次调用</span>
+        </div>
+      </div>
+
+      <div class="token-strip" id="tokenSummaryStrip">
+        <span>输入 <strong id="totalPromptTokensText">0</strong></span>
+        <span class="dot-sep">·</span>
+        <span>缓存命中 <strong id="totalCachedTokensText">0</strong></span>
+        <span class="dot-sep">·</span>
+        <span>输出 <strong id="totalCompletionTokensText">0</strong> Tokens</span>
+      </div>
+
+      <div class="context-monitor">
+        <div class="context-header">
+          <span class="context-title">实时上下文窗口 · Context</span>
+          <span class="context-summary" id="contextSummaryText">0 / 1.05M (0.0%)</span>
+        </div>
+        <progress id="contextProgressBar" class="ctx-progress tier-low" max="100" value="0"></progress>
+        <div class="context-meta-row">
+          <span id="contextTurnMetaText">空闲待命 · 尚未建立会话</span>
+          <span id="contextBreakdownText">Sys 0 · Tools 0 · Hist 0</span>
+        </div>
+        <div id="slotContextPills" class="slot-pills" hidden></div>
+      </div>
+
+      <details class="model-breakdown" id="modelBreakdownDetails">
+        <summary>
+          <span>按模型用量与官方单价明细</span>
+          <span class="summary-hint" id="modelCountHint">0 个模型</span>
+        </summary>
+        <div id="modelBreakdownList" class="model-list"></div>
+      </details>
+    </section>
+
     <section class="form-section">
       <label class="field">
         <span>会话调度模式（支持多窗口 / 多智能体并行）</span>
@@ -56,8 +111,8 @@
           <select id="maxTabsSelect">
             <option value="1">1 个标签页</option>
             <option value="2">2 个标签页</option>
-            <option value="4" selected>4 个标签页</option>
-            <option value="6">6 个标签页</option>
+            <option value="4">4 个标签页</option>
+            <option value="6" selected>6 个标签页</option>
             <option value="8">8 个标签页</option>
           </select>
         </label>

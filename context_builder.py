@@ -6,7 +6,9 @@ import re
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
-from schemas import ChatMessage, model_requests_new_chat, resolve_target_web_model
+import time
+from schemas import ChatMessage, estimate_tokens, model_requests_new_chat, resolve_target_web_model
+from usage_stats import DEFAULT_CONTEXT_WINDOW, get_context_window_for_model
 from tool_calling import (
     build_response_format_instructions,
     build_tool_delta_reminder,
@@ -44,6 +46,12 @@ class PreparedPrompt:
     target_model: Optional[str] = None
     tools_fingerprint: str = ""
     system_fingerprint: str = ""
+    system_tokens: int = 0
+    tools_tokens: int = 0
+    history_tokens: int = 0
+    logical_prompt_tokens: int = 0
+    cached_prefix_tokens: int = 0
+    delta_prompt_tokens: int = 0
 
 
 class ConversationContextBuilder:
@@ -57,12 +65,35 @@ class ConversationContextBuilder:
         self._session_models: Dict[str, Optional[str]] = {}
         self._session_tools_fp: Dict[str, str] = {}
         self._session_system_fp: Dict[str, str] = {}
+        self._session_metrics: Dict[str, Dict[str, Any]] = {}
+        self._session_compactions: Dict[str, int] = {}
 
     def clear_session(self, session_key: str = "default") -> None:
         self._session_turns.pop(session_key, None)
         self._session_models.pop(session_key, None)
         self._session_tools_fp.pop(session_key, None)
         self._session_system_fp.pop(session_key, None)
+        self._session_metrics.pop(session_key, None)
+
+    def drop_slot(self, session_key: str) -> None:
+        self.clear_session(session_key)
+        self._session_compactions.pop(session_key, None)
+
+    def migrate_slot_key(self, old_key: str, new_key: str) -> None:
+        if old_key == new_key:
+            return
+        if old_key in self._session_turns:
+            self._session_turns[new_key] = self._session_turns.pop(old_key)
+        if old_key in self._session_models:
+            self._session_models[new_key] = self._session_models.pop(old_key)
+        if old_key in self._session_tools_fp:
+            self._session_tools_fp[new_key] = self._session_tools_fp.pop(old_key)
+        if old_key in self._session_system_fp:
+            self._session_system_fp[new_key] = self._session_system_fp.pop(old_key)
+        if old_key in self._session_metrics:
+            self._session_metrics[new_key] = self._session_metrics.pop(old_key)
+        if old_key in self._session_compactions:
+            self._session_compactions[new_key] = self._session_compactions.pop(old_key)
 
     def get_session_model(self, session_key: str = "default") -> Optional[str]:
         return self._session_models.get(session_key)
@@ -198,6 +229,10 @@ class ConversationContextBuilder:
         active_model: Optional[str] = None,
         tools_fingerprint: Optional[str] = None,
         system_fingerprint: Optional[str] = None,
+        system_tokens: Optional[int] = None,
+        tools_tokens: Optional[int] = None,
+        last_delta_tokens: Optional[int] = None,
+        last_strategy: Optional[str] = None,
     ) -> None:
         updated = list(sent_history)
         if assistant_tool_calls:
@@ -212,6 +247,41 @@ class ConversationContextBuilder:
             self._session_tools_fp[session_key] = tools_fingerprint
         if system_fingerprint is not None:
             self._session_system_fp[session_key] = system_fingerprint
+
+        prev_meta = self._session_metrics.get(session_key) or {}
+        eff_sys_tokens = (
+            int(system_tokens)
+            if system_tokens is not None
+            else int(prev_meta.get("system_tokens") or estimate_tokens(self._session_system_fp.get(session_key) or ""))
+        )
+        eff_tools_tokens = (
+            int(tools_tokens)
+            if tools_tokens is not None
+            else int(prev_meta.get("tools_tokens") or 0)
+        )
+        hist_tokens = sum(estimate_tokens(txt) for _, txt in updated)
+        comp_tokens = estimate_tokens(canon)
+        total_ctx = eff_sys_tokens + eff_tools_tokens + hist_tokens
+        eff_model = active_model or self._session_models.get(session_key)
+        ctx_limit = get_context_window_for_model(eff_model)
+        util_pct = round(min(100.0, (total_ctx / max(ctx_limit, 1)) * 100.0), 2)
+        self._session_metrics[session_key] = {
+            "slot_key": session_key,
+            "turn_count": len(updated),
+            "user_turns": sum(1 for r, _ in updated if r == "user"),
+            "system_tokens": eff_sys_tokens,
+            "tools_tokens": eff_tools_tokens,
+            "history_tokens": hist_tokens,
+            "total_context_tokens": total_ctx,
+            "last_delta_tokens": int(last_delta_tokens if last_delta_tokens is not None else prev_meta.get("last_delta_tokens") or 0),
+            "last_completion_tokens": comp_tokens,
+            "context_limit_tokens": ctx_limit,
+            "utilization_pct": util_pct,
+            "last_strategy": last_strategy or str(prev_meta.get("last_strategy") or "smart_single_turn"),
+            "compaction_count": int(self._session_compactions.get(session_key) or 0),
+            "active_model": eff_model or "",
+            "updated_at": int(time.time()),
+        }
 
     def build(
         self,
@@ -246,20 +316,72 @@ class ConversationContextBuilder:
 
         combined_sys_sections = [s for s in (user_system_text, tool_sys_text, fmt_sys_text) if s]
         combined_system_text = "\n\n".join(combined_sys_sections).strip()
+        sys_tokens = estimate_tokens("\n\n".join(s for s in (user_system_text, fmt_sys_text) if s))
+        tools_tokens = estimate_tokens(tool_sys_text)
+        dialogue_tokens = sum(estimate_tokens(txt) for _, txt in dialogue)
+        logical_prompt_tokens = sys_tokens + tools_tokens + dialogue_tokens
+        prev_tracked_before = list(self._session_turns.get(session_key) or [])
+
+        def _finalize_prepared(
+            prompt_str: str,
+            reset_flag: bool,
+            strategy: str,
+            norm_hist: List[Tuple[str, str]],
+            cached_prefix: int = 0,
+        ) -> PreparedPrompt:
+            delta_toks = estimate_tokens(prompt_str)
+            eff_hist_toks = sum(estimate_tokens(t) for _, t in norm_hist)
+            eff_logical = max(sys_tokens + tools_tokens + eff_hist_toks, 1)
+            eff_cached = min(eff_logical, max(0, cached_prefix))
+            eff_model = target_model or self._session_models.get(session_key)
+            ctx_limit = get_context_window_for_model(eff_model)
+            total_ctx = sys_tokens + tools_tokens + eff_hist_toks
+            util_pct = round(min(100.0, (total_ctx / max(ctx_limit, 1)) * 100.0), 2)
+            self._session_metrics[session_key] = {
+                "slot_key": session_key,
+                "turn_count": len(norm_hist),
+                "user_turns": sum(1 for r, _ in norm_hist if r == "user"),
+                "system_tokens": sys_tokens,
+                "tools_tokens": tools_tokens,
+                "history_tokens": eff_hist_toks,
+                "total_context_tokens": total_ctx,
+                "last_delta_tokens": delta_toks,
+                "last_completion_tokens": int(
+                    (self._session_metrics.get(session_key) or {}).get("last_completion_tokens") or 0
+                ),
+                "context_limit_tokens": ctx_limit,
+                "utilization_pct": util_pct,
+                "last_strategy": strategy,
+                "compaction_count": int(self._session_compactions.get(session_key) or 0),
+                "active_model": eff_model or "",
+                "updated_at": int(time.time()),
+            }
+            return PreparedPrompt(
+                prompt=prompt_str,
+                reset_chat=reset_flag,
+                strategy_used=strategy,
+                normalized_history=norm_hist,
+                target_model=target_model,
+                tools_fingerprint=tools_fp,
+                system_fingerprint=user_system_text,
+                system_tokens=sys_tokens,
+                tools_tokens=tools_tokens,
+                history_tokens=eff_hist_toks,
+                logical_prompt_tokens=eff_logical,
+                cached_prefix_tokens=eff_cached,
+                delta_prompt_tokens=delta_toks,
+            )
 
         if not dialogue:
             fallback_prompt = combined_system_text or "Hello"
             reset_only_sys = explicit_new_chat or self.auto_reset_new_chat
             if reset_only_sys:
                 self.clear_session(session_key)
-            return PreparedPrompt(
-                prompt=fallback_prompt,
-                reset_chat=reset_only_sys,
-                strategy_used="system_only",
-                normalized_history=[("user", fallback_prompt)],
-                target_model=target_model,
-                tools_fingerprint=tools_fp,
-                system_fingerprint=user_system_text,
+            return _finalize_prepared(
+                prompt_str=fallback_prompt,
+                reset_flag=reset_only_sys,
+                strategy="system_only",
+                norm_hist=[("user", fallback_prompt)],
             )
 
         # Check inline [NEW_CHAT] directive on trailing user turn
@@ -297,14 +419,11 @@ class ConversationContextBuilder:
                 system_text=combined_system_text,
                 is_first_turn=len(dialogue) == 1,
             )
-            return PreparedPrompt(
-                prompt=prompt,
-                reset_chat=reset_last,
-                strategy_used="last_message",
-                normalized_history=dialogue,
-                target_model=target_model,
-                tools_fingerprint=tools_fp,
-                system_fingerprint=user_system_text,
+            return _finalize_prepared(
+                prompt_str=prompt,
+                reset_flag=reset_last,
+                strategy="last_message",
+                norm_hist=dialogue,
             )
 
         if mode == "transcript":
@@ -316,14 +435,11 @@ class ConversationContextBuilder:
                 dialogue=dialogue,
                 trailing_reminder=delta_reminder,
             )
-            return PreparedPrompt(
-                prompt=prompt,
-                reset_chat=reset_trans,
-                strategy_used="transcript",
-                normalized_history=dialogue,
-                target_model=target_model,
-                tools_fingerprint=tools_fp,
-                system_fingerprint=user_system_text,
+            return _finalize_prepared(
+                prompt_str=prompt,
+                reset_flag=reset_trans,
+                strategy="transcript",
+                norm_hist=dialogue,
             )
 
         # Smart mode:
@@ -342,14 +458,11 @@ class ConversationContextBuilder:
                 system_text=combined_system_text,
                 is_first_turn=True,
             )
-            return PreparedPrompt(
-                prompt=prompt,
-                reset_chat=reset_chat,
-                strategy_used="smart_single_turn",
-                normalized_history=dialogue,
-                target_model=target_model,
-                tools_fingerprint=tools_fp,
-                system_fingerprint=user_system_text,
+            return _finalize_prepared(
+                prompt_str=prompt,
+                reset_flag=reset_chat,
+                strategy="smart_single_turn",
+                norm_hist=dialogue,
             )
 
         # 2) Multi-turn continuation of the SAME local conversation (including tool_result loops!)
@@ -384,37 +497,42 @@ class ConversationContextBuilder:
             if inc_reminder:
                 extra_blocks.append(inc_reminder)
 
+            cached_prefix = (
+                sys_tokens
+                + (tools_tokens if (not tools_fp or tools_fp == prev_fp) else 0)
+                + sum(estimate_tokens(t) for _, t in tracked)
+            )
             prompt = self._format_delta_entries(delta_entries, extra_instructions=extra_blocks)
-            return PreparedPrompt(
-                prompt=prompt,
-                reset_chat=False,
-                strategy_used="smart_incremental_delta",
-                normalized_history=dialogue,
-                target_model=target_model,
-                tools_fingerprint=tools_fp,
-                system_fingerprint=user_system_text,
+            return _finalize_prepared(
+                prompt_str=prompt,
+                reset_flag=False,
+                strategy="smart_incremental_delta",
+                norm_hist=dialogue,
+                cached_prefix=cached_prefix,
             )
 
         # 3) Switched to a DIFFERENT multi-turn local conversation not matching current browser tab:
         #    Start a clean web session (`reset_chat=True` when auto_reset_new_chat=True) and pack its history.
+        if prev_tracked_before and not explicit_new_chat:
+            self._session_compactions[session_key] = (
+                int(self._session_compactions.get(session_key) or 0) + 1
+            )
         reset_packed = explicit_new_chat or self.auto_reset_new_chat
         if reset_packed:
             self.clear_session(session_key)
             if target_model is not None:
                 self._session_models[session_key] = target_model
+
         prompt = self._format_full_transcript(
             system_text=combined_system_text,
             dialogue=dialogue,
             trailing_reminder=delta_reminder,
         )
-        return PreparedPrompt(
-            prompt=prompt,
-            reset_chat=reset_packed,
-            strategy_used="smart_packed_context",
-            normalized_history=dialogue,
-            target_model=target_model,
-            tools_fingerprint=tools_fp,
-            system_fingerprint=user_system_text,
+        return _finalize_prepared(
+            prompt_str=prompt,
+            reset_flag=reset_packed,
+            strategy="smart_packed_context",
+            norm_hist=dialogue,
         )
 
     @staticmethod
@@ -512,3 +630,92 @@ class ConversationContextBuilder:
         )
         sections.append(f"{heading}\n{current_body}")
         return "\n\n".join(sections)
+
+    def get_slot_context_metrics(self, session_key: str) -> Optional[Dict[str, Any]]:
+        meta = self._session_metrics.get(session_key)
+        return dict(meta) if meta else None
+
+    def get_context_snapshot(
+        self,
+        worker_slots: Optional[Sequence[Dict[str, Any]]] = None,
+    ) -> Dict[str, Any]:
+        """Return live per-tab context occupancy and primary active session metrics."""
+        slot_info_map: Dict[str, Dict[str, Any]] = {}
+        for item in worker_slots or []:
+            if isinstance(item, dict) and item.get("slot_key"):
+                slot_info_map[str(item["slot_key"])] = item
+
+        all_keys: List[str] = list(slot_info_map.keys())
+        for k in self._session_metrics.keys():
+            if k not in slot_info_map:
+                all_keys.append(k)
+
+        tabs_out: List[Dict[str, Any]] = []
+        for skey in all_keys:
+            s_info = slot_info_map.get(skey) or {}
+            meta = self._session_metrics.get(skey) or {}
+            browser_model = str(s_info.get("active_model") or meta.get("active_model") or "")
+            ctx_limit = int(
+                meta.get("context_limit_tokens")
+                or get_context_window_for_model(meta.get("active_model"), browser_model)
+                or DEFAULT_CONTEXT_WINDOW
+            )
+            total_ctx = int(meta.get("total_context_tokens") or 0)
+            util_pct = round(min(100.0, (total_ctx / max(ctx_limit, 1)) * 100.0), 2)
+            tabs_out.append(
+                {
+                    "slot_key": skey,
+                    "tab_id": s_info.get("tab_id"),
+                    "tab_title": s_info.get("tab_title") or "",
+                    "busy": bool(s_info.get("busy", False)),
+                    "pinned_session_id": s_info.get("pinned_session_id"),
+                    "active_model": browser_model or str(self._session_models.get(skey) or "Auto"),
+                    "turn_count": int(meta.get("turn_count") or len(self._session_turns.get(skey) or [])),
+                    "user_turns": int(meta.get("user_turns") or 0),
+                    "system_tokens": int(meta.get("system_tokens") or 0),
+                    "tools_tokens": int(meta.get("tools_tokens") or 0),
+                    "history_tokens": int(meta.get("history_tokens") or 0),
+                    "total_context_tokens": total_ctx,
+                    "last_delta_tokens": int(meta.get("last_delta_tokens") or 0),
+                    "last_completion_tokens": int(meta.get("last_completion_tokens") or 0),
+                    "context_limit_tokens": ctx_limit,
+                    "utilization_pct": util_pct,
+                    "last_strategy": str(meta.get("last_strategy") or "idle"),
+                    "compaction_count": int(self._session_compactions.get(skey) or 0),
+                    "updated_at": int(meta.get("updated_at") or s_info.get("last_used_at") or 0),
+                }
+            )
+
+        tabs_out.sort(
+            key=lambda x: (
+                1 if x["busy"] else 0,
+                x["updated_at"],
+                x["total_context_tokens"],
+            ),
+            reverse=True,
+        )
+        primary = tabs_out[0] if tabs_out else {
+            "slot_key": "",
+            "tab_id": None,
+            "busy": False,
+            "active_model": "Auto",
+            "turn_count": 0,
+            "system_tokens": 0,
+            "tools_tokens": 0,
+            "history_tokens": 0,
+            "total_context_tokens": 0,
+            "last_delta_tokens": 0,
+            "last_completion_tokens": 0,
+            "context_limit_tokens": DEFAULT_CONTEXT_WINDOW,
+            "utilization_pct": 0.0,
+            "last_strategy": "idle",
+            "compaction_count": 0,
+            "updated_at": 0,
+        }
+        return {
+            "default_context_limit": DEFAULT_CONTEXT_WINDOW,
+            "active_sessions": sum(1 for t in tabs_out if t["turn_count"] > 0),
+            "total_compactions": sum(int(t["compaction_count"]) for t in tabs_out),
+            "primary": primary,
+            "slots": tabs_out,
+        }

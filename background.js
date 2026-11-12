@@ -195,7 +195,7 @@ async function reportTabStatusToBackend() {
   const tabsSnapshot = await buildReportedTabsSnapshot();
   const primary = tabsSnapshot[0] || null;
   const { preferredTabId } = await chrome.storage.session.get("preferredTabId");
-  const capabilities = ["multi_tab"];
+  const capabilities = ["multi_tab", "usage_push"];
   if (settings.autoSpawnTabs !== false && !preferredTabId) {
     capabilities.push("spawn_tab");
   }
@@ -253,7 +253,7 @@ function startHeartbeatInterval() {
       const tabsSnapshot = await buildReportedTabsSnapshot();
       const primary = tabsSnapshot[0] || null;
       const { preferredTabId } = await chrome.storage.session.get("preferredTabId");
-      const capabilities = ["multi_tab"];
+      const capabilities = ["multi_tab", "usage_push"];
       if (settings.autoSpawnTabs !== false && !preferredTabId) {
         capabilities.push("spawn_tab");
       }
@@ -651,7 +651,12 @@ async function deliverResultToBackend(eventData) {
 
 async function handleBackendCommand(msg) {
   const type = msg.type || "";
-  if (type === "welcome" || type === "pong" || type === "ack") {
+  if (msg && msg.usage_snapshot && typeof msg.usage_snapshot === "object") {
+    try {
+      await chrome.storage.session.set({ usageSnapshot: msg.usage_snapshot });
+    } catch (_) {}
+  }
+  if (type === "welcome" || type === "pong" || type === "ack" || type === "usage_update") {
     return;
   }
   if (type === "ping") {
@@ -1014,7 +1019,8 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
         "capturedRpc",
         "activeModel",
         "logs",
-        "preferredTabId"
+        "preferredTabId",
+        "usageSnapshot"
       ]);
       const allTabs = await chrome.tabs.query({ url: VERTEX_MATCH_PATTERN });
       sendResponse({
@@ -1025,6 +1031,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
         capturedRpc: Boolean(session.capturedRpc),
         activeModel: session.activeModel || "",
         preferredTabId: session.preferredTabId || null,
+        usageSnapshot: session.usageSnapshot || null,
         activeTab: tab
           ? { id: tab.id, url: tab.url || "", title: tab.title || "" }
           : null,

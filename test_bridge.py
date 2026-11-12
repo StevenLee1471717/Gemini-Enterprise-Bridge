@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import json
 import struct
+import tempfile
 import threading
 import time
 from pathlib import Path
@@ -117,10 +118,12 @@ def test_png_icon_generation_and_bundle_export(tmp_path: Path) -> None:
 
 
 def _make_test_settings(**overrides: Any) -> BridgeSettings:
+    tmp_dir = Path(tempfile.mkdtemp(prefix="geb_test_usage_"))
     defaults: Dict[str, Any] = {
         "auto_export_extension": False,
         "request_timeout_seconds": 10.0,
         "queue_timeout_seconds": 10.0,
+        "usage_stats_path": str(tmp_dir / "usage_stats.json"),
     }
     defaults.update(overrides)
     return BridgeSettings(**defaults)
@@ -1684,3 +1687,211 @@ def test_sliding_activity_timeout_and_sse_keepalive_and_aux_compaction_isolation
 
     assert dispatched_slots == [301, 302, 301], f"Aux compaction must not evict main tool tab: {dispatched_slots}"
     assert dispatched_resets == [True, True, False], f"Main tool tab must stay incremental on Turn 2: {dispatched_resets}"
+
+
+# ---------------------------------------------------------------------------
+# 7. Official Pricing Engine, Persistent Usage Ledger & Live Context Monitor
+# ---------------------------------------------------------------------------
+
+
+def test_usage_tracker_official_pricing_persistence_and_reset(tmp_path: Path) -> None:
+    from usage_stats import UsageTracker
+
+    ledger_file = tmp_path / "usage_stats.json"
+    tracker = UsageTracker(storage_path=ledger_file, usd_to_cny_rate=7.25)
+
+    # 1) Gemini 4 Carbon intro rate (2026-11-15): $2.00 input, $0.10 cached, $10.00 output
+    rec_c1 = tracker.record_request(
+        requested_model="gemini-4-carbon",
+        prompt_tokens=100_000,
+        completion_tokens=10_000,
+        strategy="smart_incremental_delta",
+        cached_tokens=80_000,
+        delta_prompt_tokens=20_000,
+        as_of_date="2026-11-15",
+    )
+    # Uncached: 0.1M * $2.00 ($0.20) + 0.01M * $10.00 ($0.10) = $0.30
+    assert abs(rec_c1["equivalent_cost_usd"] - 0.30) < 1e-6
+    # Cached: 0.08M * $0.10 ($0.008) + 0.02M * $2.00 ($0.04) + 0.01M * $10.00 ($0.10) = $0.148
+    assert abs(rec_c1["cached_equivalent_cost_usd"] - 0.148) < 1e-6
+    assert abs(rec_c1["equivalent_cost_cny"] - round(0.30 * 7.25, 4)) < 1e-4
+
+    # 2) Gemini 4 Carbon post-intro rate (2026-12-05): $4.00 input, $0.20 cached, $20.00 output
+    rec_c2 = tracker.record_request(
+        requested_model="4carbon",
+        prompt_tokens=100_000,
+        completion_tokens=10_000,
+        strategy="smart_single_turn",
+        as_of_date="2026-12-05",
+    )
+    assert abs(rec_c2["equivalent_cost_usd"] - 0.60) < 1e-6
+
+    # 3) Gemini 3.1 Pro tiered pricing: <=200k ($2/$12) vs >200k ($4/$18)
+    rec_p_low = tracker.record_request(
+        requested_model="gemini-3.1-pro",
+        prompt_tokens=150_000,
+        completion_tokens=10_000,
+        as_of_date="2026-11-15",
+    )
+    assert abs(rec_p_low["equivalent_cost_usd"] - (0.15 * 2.0 + 0.01 * 12.0)) < 1e-6
+
+    rec_p_high = tracker.record_request(
+        requested_model="gemini-3.1-pro",
+        prompt_tokens=250_000,
+        completion_tokens=10_000,
+        as_of_date="2026-11-15",
+    )
+    assert abs(rec_p_high["equivalent_cost_usd"] - (0.25 * 4.0 + 0.01 * 18.0)) < 1e-6
+
+    # 4) Gemini 3.8 Flash intro rate ($0.75 / $3.75) + Auto resolved from browser slot model
+    rec_flash = tracker.record_request(
+        requested_model="gemini-enterprise-web",
+        browser_active_model="3.8 Flash",
+        prompt_tokens=200_000,
+        completion_tokens=20_000,
+        as_of_date="2026-11-15",
+    )
+    assert rec_flash["model"] == "gemini-3.8-flash"
+    assert abs(rec_flash["equivalent_cost_usd"] - (0.2 * 0.75 + 0.02 * 3.75)) < 1e-6
+
+    assert ledger_file.is_file()
+
+    # Reload from disk into a fresh UsageTracker instance
+    reloaded = UsageTracker(storage_path=ledger_file, usd_to_cny_rate=7.25)
+    snap = reloaded.snapshot(active_model_hint="4 Carbon", as_of_date="2026-11-15", include_catalog=True)
+    assert snap["all_time"]["requests"] == 5
+    assert snap["current_session"]["requests"] == 0
+    assert "gemini-4-carbon" in snap["by_model"]
+    assert "gemini-3.1-pro" in snap["by_model"]
+    assert "gemini-3.8-flash" in snap["by_model"]
+    assert len(snap["pricing_catalog"]) >= 6
+
+    # Scoped reset: today vs all
+    reloaded.reset(scope="today", as_of_date="2026-11-15")
+    assert reloaded.snapshot(as_of_date="2026-11-15")["today"]["requests"] == 0
+    assert reloaded.snapshot(as_of_date="2026-11-15")["all_time"]["requests"] == 5
+
+    reloaded.reset(scope="all", as_of_date="2026-11-15")
+    assert reloaded.snapshot(as_of_date="2026-11-15")["all_time"]["requests"] == 0
+    assert reloaded.snapshot(as_of_date="2026-11-15")["by_model"] == {}
+
+
+def test_e2e_context_monitor_and_usage_api_sync_and_sse(tmp_path: Path) -> None:
+    ledger_path = tmp_path / "e2e_usage.json"
+    app = create_app(_make_test_settings(usage_stats_path=str(ledger_path)))
+    ws_updates: List[Dict[str, Any]] = []
+
+    with TestClient(app) as client:
+        ready = threading.Event()
+        with client.websocket_connect("/ws/browser?client_id=ext-telemetry") as ws:
+            welcome = ws.receive_json()
+            assert welcome["type"] == "welcome"
+            assert "usage_snapshot" in welcome
+
+            ws.send_json(
+                {
+                    "type": "tab_status",
+                    "tab_id": 77,
+                    "tab_url": "https://vertexaisearch.cloud.google.com/u/3/home/cid/ctx1",
+                    "tab_title": "Gemini Enterprise",
+                    "active_model": "4 Carbon",
+                    "capabilities": ["multi_tab", "usage_push"],
+                    "ready": True,
+                }
+            )
+            ack = ws.receive_json()
+            assert ack["type"] == "ack"
+            assert "usage_snapshot" in ack
+
+            def recv_next_command() -> Dict[str, Any]:
+                while True:
+                    msg = ws.receive_json()
+                    if msg.get("type") == "usage_update":
+                        ws_updates.append(msg)
+                        continue
+                    return msg
+
+            def worker() -> None:
+                ready.set()
+                # Turn 1 (non-streaming)
+                c1 = recv_next_command()
+                ws.send_json(
+                    {
+                        "type": "request_complete",
+                        "request_id": c1["request_id"],
+                        "tab_id": 77,
+                        "active_model": "4 Carbon",
+                        "reply": "First turn architectural response with detailed analysis.",
+                    }
+                )
+                # Turn 2 (streaming SSE incremental delta)
+                c2 = recv_next_command()
+                assert c2["reset_chat"] is False
+                for delta in ("Second turn ", "streaming follow-up ", "complete."):
+                    ws.send_json({"type": "stream_chunk", "request_id": c2["request_id"], "delta": delta})
+                ws.send_json(
+                    {
+                        "type": "request_complete",
+                        "request_id": c2["request_id"],
+                        "tab_id": 77,
+                        "active_model": "4 Carbon",
+                        "reply": "Second turn streaming follow-up complete.",
+                    }
+                )
+
+            th = threading.Thread(target=worker, daemon=True)
+            th.start()
+            ready.wait(timeout=3.0)
+
+            history: List[Dict[str, Any]] = [
+                {"role": "system", "content": "You are a principal distributed systems architect."},
+                {"role": "user", "content": "Design a multi-tab browser worker pool with sticky session affinity."},
+            ]
+            r1 = client.post(
+                "/v1/chat/completions",
+                json={"model": "gemini-4-carbon", "messages": history, "tools": SAMPLE_TOOLS},
+            )
+            assert r1.status_code == 200
+            history.append({"role": "assistant", "content": r1.json()["choices"][0]["message"]["content"]})
+
+            history.append({"role": "user", "content": "Now add real-time context window monitoring."})
+            with client.stream(
+                "POST",
+                "/v1/chat/completions",
+                json={"model": "gemini-4-carbon", "stream": True, "messages": history, "tools": SAMPLE_TOOLS},
+            ) as stream_resp:
+                assert stream_resp.status_code == 200
+                sse_lines = [ln for ln in stream_resp.iter_lines() if ln]
+            assert sse_lines[-1] == "data: [DONE]"
+
+            th.join(timeout=3.0)
+
+            status_data = client.get("/api/status").json()
+            usage_data = client.get("/api/usage").json()
+
+            assert status_data["usage"]["all_time"]["requests"] == 2
+            assert status_data["usage"]["today"]["requests"] == 2
+            assert status_data["usage"]["all_time"]["equivalent_cost_usd"] > 0
+            assert (
+                status_data["usage"]["all_time"]["cached_equivalent_cost_usd"]
+                < status_data["usage"]["all_time"]["equivalent_cost_usd"]
+            )
+            assert "gemini-4-carbon" in usage_data["usage"]["by_model"]
+            assert "pricing_catalog" in usage_data["usage"]
+
+            ctx_mon = status_data["context_monitor"]
+            assert ctx_mon["active_sessions"] == 1
+            prim = ctx_mon["primary"]
+            assert prim["tab_id"] == 77
+            assert prim["turn_count"] == 4  # 2 user + 2 assistant
+            assert prim["user_turns"] == 2
+            assert prim["total_context_tokens"] > prim["history_tokens"] > 0
+            assert prim["tools_tokens"] > 0
+            assert prim["context_limit_tokens"] == 1_048_576
+            assert prim["utilization_pct"] >= 0.0
+            assert prim["last_strategy"] == "smart_incremental_delta"
+
+            # Reset via POST /api/usage/reset
+            reset_resp = client.post("/api/usage/reset", json={"scope": "all"})
+            assert reset_resp.status_code == 200
+            assert reset_resp.json()["usage"]["all_time"]["requests"] == 0

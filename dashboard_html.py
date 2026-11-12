@@ -183,6 +183,55 @@ DASHBOARD_HTML = """<!DOCTYPE html>
     }
     .log-item { padding: 3px 0; border-bottom: 1px solid rgba(128,128,128,0.12); }
     .muted { color: var(--muted); font-size: 0.85rem; }
+    .num-tab { font-variant-numeric: tabular-nums; }
+    .cost-hero {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(210px, 1fr));
+      gap: 12px;
+      margin-bottom: 14px;
+    }
+    .stat-tile {
+      padding: 12px 14px;
+      border-radius: 10px;
+      background: var(--code-bg);
+      border: 1px solid var(--card-border);
+    }
+    .stat-tile .label { font-size: 0.8rem; color: var(--muted); }
+    .stat-tile .big {
+      font-size: 1.45rem;
+      font-weight: 800;
+      color: var(--ok);
+      margin: 2px 0;
+    }
+    .stat-tile .sub { font-size: 0.8rem; color: var(--muted); }
+    .ctx-bar {
+      width: 100%;
+      height: 8px;
+      appearance: none;
+      -webkit-appearance: none;
+      border: none;
+      border-radius: 999px;
+      overflow: hidden;
+      background: var(--code-bg);
+      margin: 6px 0;
+    }
+    .ctx-bar::-webkit-progress-bar { background: var(--code-bg); border-radius: 999px; }
+    .ctx-bar::-webkit-progress-value { background: linear-gradient(90deg, var(--ok), var(--accent)); border-radius: 999px; }
+    .ctx-bar.warn::-webkit-progress-value { background: var(--warn); }
+    .ctx-bar.danger::-webkit-progress-value { background: var(--err); }
+    table.usage-table {
+      width: 100%;
+      border-collapse: collapse;
+      font-size: 0.85rem;
+      margin-top: 10px;
+    }
+    table.usage-table th,
+    table.usage-table td {
+      padding: 7px 8px;
+      text-align: left;
+      border-bottom: 1px solid var(--card-border);
+    }
+    table.usage-table th { color: var(--muted); font-weight: 600; }
   </style>
 </head>
 <body>
@@ -218,6 +267,56 @@ DASHBOARD_HTML = """<!DOCTYPE html>
       </section>
     </div>
 
+    <section class="card num-tab" style="margin-bottom: 18px;">
+      <div style="display:flex;justify-content:space-between;align-items:center;gap:12px;flex-wrap:wrap;margin-bottom:10px;">
+        <h2 style="margin:0;">Context 实时窗口监控 &amp; 官方 Google Gemini API 等价账单</h2>
+        <div style="display:flex;gap:8px;align-items:center;">
+          <span class="mono" id="dashActivePricingBadge">4 Carbon 官方价: $2/$10 / 1M</span>
+          <button id="resetUsageDashBtn" class="secondary" type="button" style="padding:4px 10px;font-size:0.8rem;">重置统计</button>
+        </div>
+      </div>
+      <div class="cost-hero">
+        <div class="stat-tile">
+          <div class="label">累计官方无缓存等价节省</div>
+          <div class="big" id="dashAllUsd">$0.00</div>
+          <div class="sub" id="dashAllSub">≈ ¥0.00 · 含缓存折算 $0.00</div>
+        </div>
+        <div class="stat-tile">
+          <div class="label">今日等价消耗</div>
+          <div class="big" style="color:var(--text);" id="dashTodayUsd">$0.00</div>
+          <div class="sub" id="dashTodaySub">≈ ¥0.00 · 0 次请求</div>
+        </div>
+        <div class="stat-tile">
+          <div class="label">累计输入 / 缓存命中 / 输出 Tokens</div>
+          <div class="big" style="color:var(--accent);font-size:1.2rem;" id="dashTokenTotals">0 / 0 / 0</div>
+          <div class="sub" id="dashSessionSub">本次服务启动: $0.00 (0 次)</div>
+        </div>
+      </div>
+      <div>
+        <div style="display:flex;justify-content:space-between;align-items:center;font-size:0.88rem;">
+          <span id="dashCtxTitle">主会话 Context 窗口占用: 空闲待命</span>
+          <strong id="dashCtxPct" class="mono">0 / 1.05M (0.0%)</strong>
+        </div>
+        <progress id="dashCtxBar" class="ctx-bar" max="100" value="0"></progress>
+        <div id="dashSlotsCtxList" class="muted" style="margin-top:4px;"></div>
+      </div>
+      <table class="usage-table">
+        <thead>
+          <tr>
+            <th>计费模型</th>
+            <th>官方单价 (In / Cache / Out per 1M)</th>
+            <th>请求数</th>
+            <th>输入 / 输出 Tokens</th>
+            <th>标准等价 USD (CNY)</th>
+            <th>含缓存等价 USD</th>
+          </tr>
+        </thead>
+        <tbody id="dashModelTableBody">
+          <tr><td colspan="6" class="muted">暂无模型调用记录</td></tr>
+        </tbody>
+      </table>
+    </section>
+
     <section class="card" style="margin-bottom: 18px;">
       <h2>在线流式联调测试 (SSE `/v1/chat/completions`)</h2>
       <div class="chat-box">
@@ -249,6 +348,95 @@ DASHBOARD_HTML = """<!DOCTYPE html>
   <script>
     const baseOrigin = window.location.origin;
     document.getElementById('baseUrlVal').textContent = baseOrigin + '/v1';
+
+    function fmtTok(n) {
+      const v = Number(n || 0);
+      if (v >= 1000000) return (v / 1000000).toFixed(2) + 'M';
+      if (v >= 1000) return (v / 1000).toFixed(1) + 'K';
+      return String(Math.round(v));
+    }
+    function fmtUsd(n) {
+      const v = Number(n || 0);
+      if (v <= 0) return '$0.00';
+      return v < 0.01 ? ('$' + v.toFixed(4)) : ('$' + v.toFixed(2));
+    }
+    function fmtCny(n) {
+      const v = Number(n || 0);
+      if (v <= 0) return '¥0.00';
+      return v < 0.01 ? ('¥' + v.toFixed(3)) : ('¥' + v.toFixed(2));
+    }
+    function renderDashboardUsage(usage, ctxMon) {
+      const allT = usage.all_time || {};
+      const todayT = usage.today || {};
+      const sessT = usage.current_session || {};
+      const ap = usage.active_pricing || {};
+      if (ap.display_name) {
+        document.getElementById('dashActivePricingBadge').textContent =
+          ap.display_name + ' 官方价: $' + ap.input_per_1m + '/$' + ap.output_per_1m + ' / 1M';
+      }
+      document.getElementById('dashAllUsd').textContent = fmtUsd(allT.equivalent_cost_usd);
+      document.getElementById('dashAllSub').textContent =
+        '≈ ' + fmtCny(allT.equivalent_cost_cny) + ' · 含缓存折算 ' + fmtUsd(allT.cached_equivalent_cost_usd) + ' · 共 ' + (allT.requests || 0) + ' 次';
+      document.getElementById('dashTodayUsd').textContent = fmtUsd(todayT.equivalent_cost_usd);
+      document.getElementById('dashTodaySub').textContent =
+        '≈ ' + fmtCny(todayT.equivalent_cost_cny) + ' · ' + (todayT.requests || 0) + ' 次请求';
+      document.getElementById('dashTokenTotals').textContent =
+        fmtTok(allT.prompt_tokens) + ' / ' + fmtTok(allT.cached_tokens) + ' / ' + fmtTok(allT.completion_tokens);
+      document.getElementById('dashSessionSub').textContent =
+        '本次进程启动: ' + fmtUsd(sessT.equivalent_cost_usd) + ' (' + (sessT.requests || 0) + ' 次)';
+
+      const prim = ctxMon.primary || {};
+      const cTok = Number(prim.total_context_tokens || 0);
+      const cLim = Number(prim.context_limit_tokens || 1048576);
+      const pct = Number(prim.utilization_pct || 0);
+      document.getElementById('dashCtxPct').textContent =
+        fmtTok(cTok) + ' / ' + fmtTok(cLim) + ' (' + pct.toFixed(1) + '%)';
+      const bar = document.getElementById('dashCtxBar');
+      bar.value = Math.min(100, Math.max(0, pct));
+      bar.className = pct >= 85 ? 'ctx-bar danger' : (pct >= 60 ? 'ctx-bar warn' : 'ctx-bar');
+      document.getElementById('dashCtxTitle').textContent =
+        (prim.turn_count || 0) > 0
+          ? ('主活跃会话 (' + (prim.active_model || 'Auto') + ' · 第 ' + (prim.user_turns || prim.turn_count) + ' 轮 · ' + (prim.last_strategy || '') + ')')
+          : '主会话 Context 窗口占用: 空闲待命';
+      const slotItems = Array.isArray(ctxMon.slots) ? ctxMon.slots : [];
+      document.getElementById('dashSlotsCtxList').textContent =
+        slotItems.length > 0
+          ? slotItems.map(function (s) {
+              return (s.tab_id ? ('Tab #' + s.tab_id) : s.slot_key) + ' [' + (s.active_model || 'Auto') + ']: ' + fmtTok(s.total_context_tokens) + ' (' + Number(s.utilization_pct || 0).toFixed(1) + '%)';
+            }).join('  |  ')
+          : '';
+
+      const tbody = document.getElementById('dashModelTableBody');
+      tbody.replaceChildren();
+      const entries = Object.entries(usage.by_model || {});
+      if (entries.length === 0) {
+        const tr = document.createElement('tr');
+        const td = document.createElement('td');
+        td.colSpan = 6;
+        td.className = 'muted';
+        td.textContent = '暂无模型调用记录';
+        tr.appendChild(td);
+        tbody.appendChild(tr);
+      } else {
+        for (const [mKey, info] of entries) {
+          const tr = document.createElement('tr');
+          const cells = [
+            info.display_name || mKey,
+            '$' + info.input_rate_per_1m + ' / $' + info.cached_input_rate_per_1m + ' / $' + info.output_rate_per_1m,
+            String(info.requests || 0),
+            fmtTok(info.prompt_tokens) + ' / ' + fmtTok(info.completion_tokens),
+            fmtUsd(info.equivalent_cost_usd) + ' (' + fmtCny(info.equivalent_cost_cny) + ')',
+            fmtUsd(info.cached_equivalent_cost_usd)
+          ];
+          for (const val of cells) {
+            const td = document.createElement('td');
+            td.textContent = val;
+            tr.appendChild(td);
+          }
+          tbody.appendChild(tr);
+        }
+      }
+    }
 
     async function refreshStatus() {
       try {
@@ -302,6 +490,8 @@ DASHBOARD_HTML = """<!DOCTYPE html>
           (hub.active_slots_busy || 0) + ' 并发 / ' +
           (hub.queued_requests || 0) + ' 排队 / ' +
           (hub.total_requests || 0) + ' 总计';
+
+        renderDashboardUsage(data.usage || {}, data.context_monitor || {});
 
         const logs = hub.recent_logs || [];
         const logsBox = document.getElementById('logsBox');
@@ -386,6 +576,14 @@ DASHBOARD_HTML = """<!DOCTYPE html>
 
     document.getElementById('sendBtn').addEventListener('click', sendTestPrompt);
     document.getElementById('refreshBtn').addEventListener('click', refreshStatus);
+    document.getElementById('resetUsageDashBtn').addEventListener('click', async function () {
+      await fetch('/api/usage/reset', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ scope: 'all' })
+      });
+      await refreshStatus();
+    });
     refreshStatus();
     setInterval(refreshStatus, 3000);
   </script>

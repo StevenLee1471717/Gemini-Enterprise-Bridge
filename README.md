@@ -184,8 +184,9 @@ I:\Projects\Gemini-Enterprise-Bridge\
 ├── config.py                         # 环境变量与 .env 配置加载
 ├── schemas.py                        # OpenAI 兼容模型、工具参数与网页模型别名解析器
 ├── tool_calling.py                   # DOM 免疫工具调用协议、多级容错解析与 SSE 流式拦截器
-├── context_builder.py                # 多轮对话与 Agentic Loop 智能增量上下文构建器
-├── bridge_hub.py                     # WebSocket + HTTP 双通道桥接中心与 FIFO 队列锁
+├── context_builder.py                # 多轮对话与 Agentic Loop 智能增量上下文构建器 + 实时窗口水位监控
+├── usage_stats.py                    # 官方 Google Gemini API 定价引擎与持久化用量等价账本
+├── bridge_hub.py                     # WebSocket + HTTP 双通道桥接中心与多标签页并行池
 ├── gcloud_provider.py                # 方案一：官方 GCloud CLI / Vertex AI & Agentspace 上游
 ├── dashboard_html.py                 # http://127.0.0.1:8000/ 本地可视化控制台与模型测试台
 ├── extension_exporter.py             # 纯标准库 PNG 图标渲染与独立 extension/ 导出器

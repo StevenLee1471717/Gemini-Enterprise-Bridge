@@ -38,6 +38,29 @@
 
   let activeJob = null;
   let badgeEl = null;
+  let latestBadgeMetrics = "";
+
+  function formatMiniTok(n) {
+    const v = Number(n || 0);
+    if (v >= 1000000) return (v / 1000000).toFixed(2) + "M";
+    if (v >= 1000) return (v / 1000).toFixed(1) + "k";
+    return String(Math.round(v));
+  }
+
+  function updateBadgeFromUsageSnapshot(snap) {
+    if (!snap || typeof snap !== "object") return;
+    const usage = snap.usage || {};
+    const allT = usage.all_time || {};
+    const ctxMon = snap.context_monitor || {};
+    const slots = Array.isArray(ctxMon.slots) ? ctxMon.slots : [];
+    const mySlot = slots.find((s) => s && s.slot_key === clientId) || ctxMon.primary || {};
+    const ctxTok = Number(mySlot.total_context_tokens || 0);
+    const ctxPct = Number(mySlot.utilization_pct || 0);
+    const eqUsd = Number(allT.equivalent_cost_usd || 0);
+    const usdStr = eqUsd <= 0 ? "$0.00" : eqUsd < 0.01 ? "$" + eqUsd.toFixed(4) : "$" + eqUsd.toFixed(2);
+    latestBadgeMetrics = ` | Ctx: ${formatMiniTok(ctxTok)}/1M (${ctxPct.toFixed(1)}%) | Eq: ${usdStr}`;
+    setStatusBadge("Bridge 已挂载", true);
+  }
 
   function setStatusBadge(text, ok) {
     if (!document.body) return;
@@ -48,19 +71,20 @@
         "right:14px",
         "bottom:14px",
         "z-index:2147483647",
-        "padding:5px 10px",
+        "padding:5px 11px",
         "border-radius:999px",
         "font:600 12px/1.3 system-ui,-apple-system,sans-serif",
+        "font-variant-numeric:tabular-nums",
         "background:#0f172a",
         "color:#e2e8f0",
         "border:1px solid #334155",
         "box-shadow:0 4px 14px rgba(0,0,0,0.3)",
         "pointer-events:none",
-        "opacity:0.88"
+        "opacity:0.9"
       ].join(";");
       document.body.appendChild(badgeEl);
     }
-    badgeEl.textContent = (ok ? "🟢 " : "🟠 ") + text;
+    badgeEl.textContent = (ok ? "🟢 " : "🟠 ") + text + (ok ? latestBadgeMetrics : "");
   }
 
   function gmRequest(method, path, bodyObj = null, timeout = 25000) {
@@ -94,7 +118,7 @@
 
   async function sendBridgeEvent(event, extra = {}) {
     try {
-      await gmRequest("POST", "/api/bridge/event", {
+      const res = await gmRequest("POST", "/api/bridge/event", {
         client_id: clientId,
         event,
         tab_url: pageWin.location.href,
@@ -102,6 +126,9 @@
         ready: true,
         ...extra
       });
+      if (res && res.usage_snapshot) {
+        updateBadgeFromUsageSnapshot(res.usage_snapshot);
+      }
     } catch (_) {}
   }
 
@@ -579,6 +606,9 @@
             null,
             26000
           );
+          if (res && res.usage_snapshot) {
+            updateBadgeFromUsageSnapshot(res.usage_snapshot);
+          }
           if (res && res.command) {
             if (res.command.type === "execute_prompt") {
               void executePrompt(res.command);

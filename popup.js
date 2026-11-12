@@ -16,6 +16,24 @@ const elSendSel = document.getElementById("sendSelector");
 const elReplySel = document.getElementById("replySelector");
 const elDiagOut = document.getElementById("diagOutput");
 
+const elActiveRateBadge = document.getElementById("activeRateBadge");
+const elResetUsageBtn = document.getElementById("resetUsageBtn");
+const elAllTimeUsd = document.getElementById("allTimeUsdText");
+const elAllTimeCny = document.getElementById("allTimeCnyText");
+const elCachedSubline = document.getElementById("cachedSublineText");
+const elTodayUsd = document.getElementById("todayUsdText");
+const elTodayMeta = document.getElementById("todayMetaText");
+const elTotalPromptTokens = document.getElementById("totalPromptTokensText");
+const elTotalCachedTokens = document.getElementById("totalCachedTokensText");
+const elTotalCompletionTokens = document.getElementById("totalCompletionTokensText");
+const elContextSummary = document.getElementById("contextSummaryText");
+const elContextProgress = document.getElementById("contextProgressBar");
+const elContextTurnMeta = document.getElementById("contextTurnMetaText");
+const elContextBreakdown = document.getElementById("contextBreakdownText");
+const elSlotPills = document.getElementById("slotContextPills");
+const elModelCountHint = document.getElementById("modelCountHint");
+const elModelBreakdownList = document.getElementById("modelBreakdownList");
+
 let initialFormHydrated = false;
 
 function formatLogs(logs) {
@@ -42,6 +60,194 @@ function deriveHttpConsoleUrl(wsUrl) {
   }
 }
 
+function formatTokensCompact(n) {
+  const num = Number(n || 0);
+  if (!Number.isFinite(num) || num <= 0) return "0";
+  if (num >= 1_000_000) return `${(num / 1_000_000).toFixed(2)}M`;
+  if (num >= 1_000) return `${(num / 1_000).toFixed(1)}K`;
+  return String(Math.round(num));
+}
+
+function formatUsd(val) {
+  const num = Number(val || 0);
+  if (!Number.isFinite(num) || num <= 0) return "$0.00";
+  if (num < 0.01) return `$${num.toFixed(4)}`;
+  return `$${num.toFixed(2)}`;
+}
+
+function formatCny(val) {
+  const num = Number(val || 0);
+  if (!Number.isFinite(num) || num <= 0) return "¥0.00";
+  if (num < 0.01) return `¥${num.toFixed(3)}`;
+  return `¥${num.toFixed(2)}`;
+}
+
+function formatStrategyLabel(strategy) {
+  const map = {
+    smart_incremental_delta: "增量续聊",
+    smart_single_turn: "首轮/单轮",
+    smart_packed_context: "全量重装",
+    gcloud_direct: "GCloud 直连",
+    gcloud_stream: "GCloud 流式",
+    idle: "待命"
+  };
+  return map[strategy] || strategy || "待命";
+}
+
+function renderUsageAndContext(snapshot) {
+  if (!snapshot || typeof snapshot !== "object") {
+    return;
+  }
+  const usage = snapshot.usage || {};
+  const ctxMon = snapshot.context_monitor || {};
+  const allTime = usage.all_time || {};
+  const today = usage.today || {};
+  const activePricing = usage.active_pricing || {};
+
+  if (elActiveRateBadge && activePricing.display_name) {
+    const shortName = String(activePricing.display_name).replace(/^Gemini\s+/i, "");
+    elActiveRateBadge.textContent = `${shortName} 官方价: $${activePricing.input_per_1m}/$${activePricing.output_per_1m} / 1M`;
+    elActiveRateBadge.title = `${activePricing.display_name} · 输入 $${activePricing.input_per_1m}/1M · 缓存 $${activePricing.cached_input_per_1m}/1M · 输出 $${activePricing.output_per_1m}/1M (${activePricing.rate_note || ""})`;
+  }
+
+  if (elAllTimeUsd) elAllTimeUsd.textContent = formatUsd(allTime.equivalent_cost_usd);
+  if (elAllTimeCny) elAllTimeCny.textContent = `≈ ${formatCny(allTime.equivalent_cost_cny)}`;
+  if (elCachedSubline) {
+    elCachedSubline.textContent = `含缓存折算: ${formatUsd(allTime.cached_equivalent_cost_usd)} · 累计 ${allTime.requests || 0} 次`;
+  }
+
+  if (elTodayUsd) elTodayUsd.textContent = formatUsd(today.equivalent_cost_usd);
+  if (elTodayMeta) {
+    elTodayMeta.textContent = `≈ ${formatCny(today.equivalent_cost_cny)} · ${today.requests || 0} 次调用`;
+  }
+
+  if (elTotalPromptTokens) elTotalPromptTokens.textContent = formatTokensCompact(allTime.prompt_tokens);
+  if (elTotalCachedTokens) elTotalCachedTokens.textContent = formatTokensCompact(allTime.cached_tokens);
+  if (elTotalCompletionTokens) elTotalCompletionTokens.textContent = formatTokensCompact(allTime.completion_tokens);
+
+  const primary = ctxMon.primary || {};
+  const totalCtx = Number(primary.total_context_tokens || 0);
+  const limitCtx = Number(primary.context_limit_tokens || 1048576);
+  const utilPct = Number(primary.utilization_pct || 0);
+
+  if (elContextSummary) {
+    elContextSummary.textContent = `${formatTokensCompact(totalCtx)} / ${formatTokensCompact(limitCtx)} (${utilPct.toFixed(1)}%)`;
+  }
+  if (elContextProgress) {
+    elContextProgress.value = Math.min(100, Math.max(0, utilPct));
+    elContextProgress.classList.remove("tier-low", "tier-mid", "tier-high");
+    if (utilPct >= 85) {
+      elContextProgress.classList.add("tier-high");
+    } else if (utilPct >= 60) {
+      elContextProgress.classList.add("tier-mid");
+    } else {
+      elContextProgress.classList.add("tier-low");
+    }
+  }
+
+  if (elContextTurnMeta) {
+    if ((primary.turn_count || 0) > 0) {
+      const tabTag = primary.tab_id ? `#${primary.tab_id} ` : "";
+      const modelTag = primary.active_model ? `${primary.active_model} · ` : "";
+      const compactTag = primary.compaction_count ? ` · 重装${primary.compaction_count}次` : "";
+      elContextTurnMeta.textContent = `${tabTag}${modelTag}第 ${primary.user_turns || primary.turn_count} 轮 · ${formatStrategyLabel(primary.last_strategy)}${compactTag}`;
+    } else {
+      elContextTurnMeta.textContent = "空闲待命 · 发送首条请求后实时追踪";
+    }
+  }
+  if (elContextBreakdown) {
+    elContextBreakdown.textContent = `Sys ${formatTokensCompact(primary.system_tokens)} · Tools ${formatTokensCompact(primary.tools_tokens)} · Hist ${formatTokensCompact(primary.history_tokens)}`;
+  }
+
+  if (elSlotPills) {
+    const slots = Array.isArray(ctxMon.slots) ? ctxMon.slots : [];
+    elSlotPills.replaceChildren();
+    if (slots.length > 1 || (slots.length === 1 && (slots[0].turn_count || 0) > 0)) {
+      elSlotPills.hidden = false;
+      for (const s of slots.slice(0, 6)) {
+        const pill = document.createElement("span");
+        pill.className = s.busy ? "slot-pill busy" : "slot-pill";
+        const tid = s.tab_id ? `Tab #${s.tab_id}` : s.slot_key || "Slot";
+        const mShort = String(s.active_model || "Auto").replace(/^Gemini\s+/i, "");
+        pill.textContent = `${tid} (${mShort}): ${formatTokensCompact(s.total_context_tokens)} (${Number(s.utilization_pct || 0).toFixed(1)}%)`;
+        pill.title = `轮次: ${s.turn_count || 0} | 策略: ${formatStrategyLabel(s.last_strategy)} | 增量: ${formatTokensCompact(s.last_delta_tokens)}`;
+        elSlotPills.appendChild(pill);
+      }
+    } else {
+      elSlotPills.hidden = true;
+    }
+  }
+
+  if (elModelBreakdownList && elModelCountHint) {
+    const byModel = usage.by_model || {};
+    const entries = Object.entries(byModel);
+    elModelCountHint.textContent = entries.length > 0 ? `${entries.length} 个模型` : "暂无记录";
+    elModelBreakdownList.replaceChildren();
+    if (entries.length === 0) {
+      const emptyRow = document.createElement("div");
+      emptyRow.className = "cost-subline";
+      emptyRow.textContent = "发起对话后自动按模型统计官方 API 等价账单。";
+      elModelBreakdownList.appendChild(emptyRow);
+    } else {
+      for (const [modelKey, info] of entries) {
+        const row = document.createElement("div");
+        row.className = "model-item";
+
+        const left = document.createElement("div");
+        left.className = "model-item-left";
+        const nameEl = document.createElement("span");
+        nameEl.className = "model-item-name";
+        nameEl.textContent = info.display_name || modelKey;
+        const subEl = document.createElement("span");
+        subEl.className = "model-item-sub";
+        subEl.textContent = `$${info.input_rate_per_1m}/$${info.output_rate_per_1m} · ${info.requests || 0}次 · In ${formatTokensCompact(info.prompt_tokens)} / Out ${formatTokensCompact(info.completion_tokens)}`;
+        left.appendChild(nameEl);
+        left.appendChild(subEl);
+
+        const right = document.createElement("div");
+        right.className = "model-item-right";
+        const usdEl = document.createElement("span");
+        usdEl.className = "model-item-usd";
+        usdEl.textContent = formatUsd(info.equivalent_cost_usd);
+        const cnyEl = document.createElement("span");
+        cnyEl.className = "model-item-sub";
+        cnyEl.textContent = `Cached ${formatUsd(info.cached_equivalent_cost_usd)}`;
+        right.appendChild(usdEl);
+        right.appendChild(cnyEl);
+
+        row.appendChild(left);
+        row.appendChild(right);
+        elModelBreakdownList.appendChild(row);
+      }
+    }
+  }
+}
+
+async function refreshBackendUsageLive(wsUrl, fallbackSnapshot) {
+  const baseHttp = deriveHttpConsoleUrl(wsUrl);
+  try {
+    const ctrl = new AbortController();
+    const timer = setTimeout(() => ctrl.abort(), 1600);
+    const resp = await fetch(`${baseHttp}api/status`, { signal: ctrl.signal });
+    clearTimeout(timer);
+    if (resp.ok) {
+      const data = await resp.json();
+      if (data && data.usage) {
+        renderUsageAndContext({
+          usage: data.usage,
+          context_monitor: data.context_monitor || {}
+        });
+        return;
+      }
+    }
+  } catch (_) {
+    // Fall back to cached WebSocket snapshot when backend HTTP is unreachable
+  }
+  if (fallbackSnapshot) {
+    renderUsageAndContext(fallbackSnapshot);
+  }
+}
+
 async function loadState(overwriteInputs = false) {
   try {
     const state = await chrome.runtime.sendMessage({ type: "GEB_POPUP_GET_STATE" });
@@ -49,13 +255,13 @@ async function loadState(overwriteInputs = false) {
       return;
     }
 
-    const { settings, wsConnected, lastError, capturedRpc, activeModel, activeTab, vertexTabs, preferredTabId, logs } = state;
+    const { settings, wsConnected, lastError, capturedRpc, activeModel, activeTab, vertexTabs, preferredTabId, usageSnapshot, logs } = state;
 
     if (!initialFormHydrated || overwriteInputs) {
       elEnabled.checked = Boolean(settings.enabled);
       elModeSelect.value = settings.driverMode || "auto";
       if (elAutoSpawn) elAutoSpawn.value = settings.autoSpawnTabs === false ? "false" : "true";
-      if (elMaxTabs) elMaxTabs.value = String(settings.maxParallelTabs || 4);
+      if (elMaxTabs) elMaxTabs.value = String(settings.maxParallelTabs || 6);
       elWsUrl.value = settings.wsUrl || "ws://127.0.0.1:8000/ws/browser";
       if (elModelSel) elModelSel.value = settings.customModelSelector || "";
       elInputSel.value = settings.customInputSelector || "";
@@ -119,6 +325,11 @@ async function loadState(overwriteInputs = false) {
       elErrorBanner.hidden = true;
       elErrorBanner.textContent = "";
     }
+
+    if (usageSnapshot) {
+      renderUsageAndContext(usageSnapshot);
+    }
+    void refreshBackendUsageLive(settings.wsUrl, usageSnapshot);
 
     if (!elDiagOut.dataset.showingDiag) {
       elDiagOut.textContent = formatLogs(logs);
@@ -216,6 +427,30 @@ document.getElementById("clearLogsBtn").addEventListener("click", () => {
     await loadState(false);
   })();
 });
+
+if (elResetUsageBtn) {
+  elResetUsageBtn.addEventListener("click", () => {
+    void (async () => {
+      const baseHttp = deriveHttpConsoleUrl(elWsUrl.value);
+      try {
+        const resp = await fetch(`${baseHttp}api/usage/reset`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ scope: "all" })
+        });
+        if (resp.ok) {
+          const data = await resp.json();
+          renderUsageAndContext({
+            usage: data.usage,
+            context_monitor: data.context_monitor || {}
+          });
+        }
+      } catch (err) {
+        elDiagOut.textContent = "重置用量统计失败: " + err.message;
+      }
+    })();
+  });
+}
 
 void loadState(true);
 setInterval(() => {

@@ -128,7 +128,7 @@ class ChatMessage(_FlexibleModel):
 
 
 class ChatCompletionRequest(_FlexibleModel):
-    model: str = Field(default="gemini-enterprise-web")
+    model: str = Field(default="")
     messages: List[ChatMessage]
     stream: bool = False
     stream_options: Optional[StreamOptions] = None
@@ -167,6 +167,8 @@ class BridgeEventPayload(_FlexibleModel):
     delta: Optional[str] = None
     reply: Optional[str] = None
     error: Optional[str] = None
+    output_images: Optional[List[Dict[str, Any]]] = None
+    output_files: Optional[List[Dict[str, Any]]] = None
     citations: Optional[List[Dict[str, Any]]] = None
     source: Optional[str] = None
     tab_url: Optional[str] = None
@@ -190,6 +192,8 @@ class BridgeCallbackPayload(_FlexibleModel):
     request_id: str
     reply: Optional[str] = None
     error: Optional[str] = None
+    output_images: Optional[List[Dict[str, Any]]] = None
+    output_files: Optional[List[Dict[str, Any]]] = None
     citations: Optional[List[Dict[str, Any]]] = None
     source: Optional[str] = "http_callback"
     active_model: Optional[str] = None
@@ -229,17 +233,15 @@ def extract_text_content(content: Optional[Union[str, List[Any]]]) -> str:
     return str(content)
 
 
-_CJK_RE = re.compile(r"[\u3400-\u9fff\uf900-\ufaff]")
-_WORD_RE = re.compile(r"[A-Za-z0-9_]+|[^\sA-Za-z0-9_\u3400-\u9fff\uf900-\ufaff]")
+_NON_ASCII_RE = re.compile(r"[^\x00-\x7f]")
 
 
 def estimate_tokens(text: str) -> int:
-    """Character-based token count approximation without JSON punctuation inflation."""
+    """Gemini CLI-style conservative estimate; not Google usage or billing."""
     if not text:
         return 0
-    cjk_count = len(_CJK_RE.findall(text))
-    non_cjk = _CJK_RE.sub("", text)
-    return max(1, int(cjk_count * 0.65 + len(non_cjk) / 4.2))
+    non_ascii = len(_NON_ASCII_RE.findall(text))
+    return max(1, int(non_ascii * 1.5 + (len(text) - non_ascii) / 4))
 
 
 def build_usage(prompt_text: str, completion_text: str) -> Dict[str, int]:
@@ -260,6 +262,7 @@ def build_chat_completion_response(
     created: Optional[int] = None,
     tool_calls: Optional[List[Dict[str, Any]]] = None,
     finish_reason: Optional[str] = None,
+    attachments: Optional[List[Dict[str, Any]]] = None,
 ) -> Dict[str, Any]:
     ts = created if created is not None else int(time.time())
     has_tools = bool(tool_calls)
@@ -271,6 +274,8 @@ def build_chat_completion_response(
     }
     if has_tools:
         message_obj["tool_calls"] = tool_calls
+    if attachments:
+        message_obj["attachments"] = attachments
 
     completion_for_usage = reply_text or ""
     if has_tools:

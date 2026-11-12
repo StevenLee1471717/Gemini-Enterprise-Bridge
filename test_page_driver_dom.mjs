@@ -970,5 +970,71 @@ assert.equal(dynamicMenuCapturedFiles.length, 1, "Must intercept dynamic file in
 assert.equal(dynamicMenuCapturedFiles[0].name, "meeting.wav");
 assert.equal(dynamicMenuCapturedFiles[0].type, "audio/wav");
 
+// Real upload completion can show only an image preview and a Remove file button, without a filename.
+const fileInput = new MockElement("input", { attrs: { type: "file" } });
+searchShadow.appendChild(fileInput);
+let changedFiles = null;
+fileInput.addEventListener("change", () => {
+  changedFiles = fileInput.files;
+  searchShadow.appendChild(new MockElement("button", { attrs: { "aria-label": "Remove file" } }));
+});
+await api.attachImagesToComposer([{ data_url: "data:image/png;base64,iVBORw0KGgo=", name: "never-visible.png", mime_type: "image/png" }]);
+assert.equal(changedFiles.length, 1);
+assert.equal(changedFiles[0].name, "never-visible.png");
+assert.equal(changedFiles[0].type, "image/png");
+
+// A cancelled job must never submit, even when the Send button is available.
+let unexpectedSends = 0;
+sendBtn._listeners.set("click", [() => { unexpectedSends += 1; }]);
+await assert.rejects(api.submitComposerWithVerification(proseMirror, "cancelled", {cancelled: true, networkText: ""}), /取消/);
+assert.equal(unexpectedSends, 0);
+
+// The request can be sent before any reply or DOM acknowledgement arrives.
+let submittedOnce = 0;
+const slowJob = {cancelled:false, networkText:"", networkDone:false};
+sendBtn._listeners.set("click", [() => { submittedOnce += 1; slowJob.submissionStarted = true; }]);
+await api.submitComposerWithVerification(proseMirror, "slow network headers", slowJob, api.collectAssistantReplyTexts().length);
+assert.equal(submittedOnce, 1, "an in-flight network request must prevent fallback resubmissions");
+
+// An interrupted network stream must not become a successful DOM fallback.
+let stopClicks = 0;
+const stopBtn = new MockElement("button", {attrs: {"aria-label": "Stop generating"}});
+stopBtn.addEventListener("click", () => { stopClicks += 1; stopBtn.parentNode.removeChild(stopBtn); });
+sendBtn._listeners.set("click", [() => {
+  const job = sandbox.__GEB_MAIN_STATE__.getActiveJob();
+  job.networkText = "partial answer";
+  job.networkError = "simulated dropped stream";
+  chatShadow.appendChild(new MockElement("ucs-markdown", {text: "partial answer"}));
+  chatShadow.appendChild(stopBtn);
+}]);
+await api.executePromptJob({request_id: "req-network-failure", prompt: "must fail", reset_chat: false});
+assert.ok(emittedEvents.some(e => e.type === "request_error" && e.request_id === "req-network-failure" && /dropped/.test(e.error)));
+assert.ok(!emittedEvents.some(e => e.type === "request_complete" && e.request_id === "req-network-failure"));
+assert.equal(stopClicks, 1, "an error must stop the actual page generation");
+
+// Cancel while the page is generating: click Stop and emit no completion.
+sendBtn._listeners.set("click", [() => {
+  chatShadow.appendChild(stopBtn);
+  doc.dispatchEvent(Object.assign(new MockEvent("message"), {
+    source: vmWindow, origin: mockLocation.origin,
+    data: {channel:"GEB_ISOLATED_TO_MAIN", action:"cancel_request", payload:{request_id:"req-cancel-generation"}}
+  }));
+}]);
+await api.executePromptJob({request_id: "req-cancel-generation", prompt: "cancel after submit", reset_chat: false});
+assert.equal(stopClicks, 2);
+assert.ok(!emittedEvents.some(e => e.type === "request_complete" && e.request_id === "req-cancel-generation"));
+sendBtn._listeners.set("click", savedSendListeners);
+
+// Missing input chunks must fail before entering anything in the composer.
+for (const [action, payload] of [
+  ["prompt_chunk", {request_id:"req-missing-chunk", chunk_index:0, total_chunks:2, data:"only half"}],
+  ["execute_prompt", {request_id:"req-missing-chunk", chunked:true, total_chunks:2}]
+]) doc.dispatchEvent(Object.assign(new MockEvent("message"), {
+  source:vmWindow, origin:mockLocation.origin, data:{channel:"GEB_ISOLATED_TO_MAIN", action, payload}
+}));
+await new Promise(r => realSetTimeout(r, 30));
+assert.ok(emittedEvents.some(e => e.type === "request_error" && e.request_id === "req-missing-chunk" && /分段/.test(e.error)));
+
+
 console.log("ALL_SHADOW_DOM_DRIVER_TESTS_PASSED");
 process.exit(0);

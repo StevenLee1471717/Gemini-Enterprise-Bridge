@@ -1521,7 +1521,7 @@ def test_gemini_4_carbon_deduplicated_and_context_window_metadata() -> None:
     # ~7800 chars of JSON should be ~1800-2200 tokens, never >4000 tokens
     assert 1200 <= tokens <= 2600
 
-    # Verify >12 tools automatically compacts verbose descriptions while preserving schema structure
+    # Tool instructions and schema constraints must survive large tool catalogs.
     from tool_calling import build_tool_system_instructions
 
     many_tools = [
@@ -1542,7 +1542,8 @@ def test_gemini_4_carbon_deduplicated_and_context_window_metadata() -> None:
         for i in range(20)
     ]
     rendered_tools = build_tool_system_instructions(many_tools)
-    assert len(rendered_tools) < 12000
+    assert many_tools[0]["function"]["description"] in rendered_tools
+    assert many_tools[0]["function"]["parameters"]["properties"]["arg1"]["description"] in rendered_tools
     assert '"enum":["a","b"]' in rendered_tools
     assert '"required":["arg1"]' in rendered_tools
 

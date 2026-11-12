@@ -10,6 +10,7 @@ import time
 from multimodal import NormalizedAttachment, deduplicate_attachments, estimate_attachment_tokens
 from schemas import ChatMessage, estimate_tokens, model_requests_new_chat, resolve_target_web_model
 from usage_stats import DEFAULT_CONTEXT_WINDOW, get_context_window_for_model
+from agent_policy import CODING_WORKFLOW, has_coding_tools, reading_diagnostics, reading_reminder, deduplicate_tool_text
 from tool_calling import (
     build_response_format_instructions,
     build_tool_delta_reminder,
@@ -45,6 +46,7 @@ class _DialogueEntry:
     match_text: str
     history_text: str
     attachments: List[NormalizedAttachment] = field(default_factory=list)
+    msg_index: int = -1
 
 
 @dataclass
@@ -63,6 +65,7 @@ class PreparedPrompt:
     cached_prefix_tokens: int = 0
     delta_prompt_tokens: int = 0
     attachments: List[NormalizedAttachment] = field(default_factory=list)
+    active_message_indices: List[int] = field(default_factory=list)
 
 
 class ConversationContextBuilder:
@@ -155,18 +158,21 @@ class ConversationContextBuilder:
     @staticmethod
     def _normalize_message_entries(
         messages: Sequence[ChatMessage],
-    ) -> Tuple[str, List[_DialogueEntry], List[NormalizedAttachment]]:
+    ) -> Tuple[str, List[_DialogueEntry], List[NormalizedAttachment], List[int]]:
         system_parts: List[str] = []
         system_attachments: List[NormalizedAttachment] = []
+        system_indices: List[int] = []
         entries: List[_DialogueEntry] = []
         call_id_to_name: Dict[str, str] = {}
+        seen_tool_outputs: Dict[str, str] = {}
 
-        for msg in messages:
+        for msg_idx, msg in enumerate(messages):
             role = (msg.role or "user").strip().lower()
             text = msg.text_content().strip()
             atts = msg.extract_attachments()
 
             if role in {"system", "developer"}:
+                system_indices.append(msg_idx)
                 if text:
                     system_parts.append(text)
                 for att in atts:
@@ -194,6 +200,7 @@ class ConversationContextBuilder:
                             display_text=canon_asst,
                             match_text=canon_asst,
                             history_text=canon_asst,
+                            msg_index=msg_idx,
                         )
                     )
                 elif text:
@@ -203,6 +210,7 @@ class ConversationContextBuilder:
                             display_text=text,
                             match_text=text,
                             history_text=text,
+                            msg_index=msg_idx,
                         )
                     )
                 continue
@@ -211,6 +219,8 @@ class ConversationContextBuilder:
                 resolved_name = msg.name or (
                     call_id_to_name.get(msg.tool_call_id) if msg.tool_call_id else None
                 )
+                if isinstance(msg.content, str):
+                    text = deduplicate_tool_text(text, msg.tool_call_id or "", seen_tool_outputs)
                 eff_tool_text = text or ("[Attached file(s) in tool output]" if atts else "")
                 formatted_tool = format_tool_result_entry(
                     eff_tool_text,
@@ -228,6 +238,7 @@ class ConversationContextBuilder:
                         match_text=match_t,
                         history_text=hist_t,
                         attachments=atts,
+                        msg_index=msg_idx,
                     )
                 )
                 continue
@@ -244,14 +255,15 @@ class ConversationContextBuilder:
                         match_text=match_t,
                         history_text=hist_t,
                         attachments=atts,
+                        msg_index=msg_idx,
                     )
                 )
 
-        return ("\n\n".join(system_parts).strip(), entries, system_attachments)
+        return ("\n\n".join(system_parts).strip(), entries, system_attachments, system_indices)
 
     @classmethod
     def _normalize_messages(cls, messages: Sequence[ChatMessage]) -> Tuple[str, List[Tuple[str, str]]]:
-        sys_text, entries, _ = cls._normalize_message_entries(messages)
+        sys_text, entries, _, _ = cls._normalize_message_entries(messages)
         return (sys_text, [(e.role, e.match_text) for e in entries])
 
     def find_matching_slots(
@@ -372,7 +384,7 @@ class ConversationContextBuilder:
             else ""
         )
 
-        user_system_text, entries, system_attachments = self._normalize_message_entries(messages)
+        user_system_text, entries, system_attachments, system_indices = self._normalize_message_entries(messages)
         dialogue = [(e.role, e.match_text) for e in entries]
         all_dialogue_atts = deduplicate_attachments(
             [*system_attachments, *(a for e in entries for a in e.attachments)]
@@ -384,6 +396,8 @@ class ConversationContextBuilder:
             tool_choice=tool_choice,
             parallel_tool_calls=parallel_tool_calls,
         )
+        if has_coding_tools(norm_tools) and tool_sys_text and CODING_WORKFLOW.strip() not in user_system_text:
+            tool_sys_text += "\n\n" + CODING_WORKFLOW
         fmt_sys_text = build_response_format_instructions(response_format)
 
         combined_sys_sections = [s for s in (user_system_text, tool_sys_text, fmt_sys_text) if s]
@@ -400,6 +414,7 @@ class ConversationContextBuilder:
             norm_hist: List[Tuple[str, str]],
             cached_prefix: int = 0,
             selected_attachments: Optional[List[NormalizedAttachment]] = None,
+            active_indices: Optional[List[int]] = None,
         ) -> PreparedPrompt:
             eff_atts = list(selected_attachments or [])
             delta_att_toks = sum(estimate_attachment_tokens(a) for a in eff_atts)
@@ -445,6 +460,7 @@ class ConversationContextBuilder:
                 cached_prefix_tokens=eff_cached,
                 delta_prompt_tokens=delta_toks,
                 attachments=eff_atts,
+                active_message_indices=list(range(len(messages))) if active_indices is None else list(active_indices),
             )
 
         if not entries:
@@ -458,6 +474,7 @@ class ConversationContextBuilder:
                 strategy="system_only",
                 norm_hist=[("user", fallback_prompt or "[System Attachments]")],
                 selected_attachments=deduplicate_attachments(system_attachments),
+                active_indices=system_indices,
             )
 
         # Check inline [NEW_CHAT] directive on trailing user turn
@@ -479,6 +496,7 @@ class ConversationContextBuilder:
                 match_text=f"{stripped_user}\n{att_fp}".strip() if att_fp else stripped_user,
                 history_text=f"{stripped_user}\n{att_notes}".strip() if att_notes else stripped_user,
                 attachments=entries[-1].attachments,
+                msg_index=entries[-1].msg_index,
             )
             dialogue = [(e.role, e.match_text) for e in entries]
 
@@ -492,6 +510,10 @@ class ConversationContextBuilder:
             tool_choice=tool_choice,
             has_tool_results=has_trailing_tool_results,
         )
+        if has_coding_tools(norm_tools):
+            read_hint = reading_reminder(reading_diagnostics(messages))
+            if read_hint:
+                delta_reminder = "\n\n".join(filter(None, [delta_reminder, read_hint]))
 
         # Track target_model transition on this session_key (UI switches model in-place cleanly)
         if target_model is not None:
@@ -525,6 +547,7 @@ class ConversationContextBuilder:
                 strategy="last_message",
                 norm_hist=dialogue,
                 selected_attachments=tail_atts,
+                active_indices=[*(system_indices if len(entries) == 1 else []), *(e.msg_index for e in chosen_tail if e.msg_index >= 0)],
             )
 
         if mode == "transcript":
@@ -596,6 +619,9 @@ class ConversationContextBuilder:
                 tool_choice=tool_choice,
                 has_tool_results=delta_has_tools,
             )
+            if has_coding_tools(norm_tools):
+                read_hint = reading_reminder(reading_diagnostics(messages))
+                inc_reminder = "\n\n".join(filter(None, [inc_reminder, read_hint]))
             if inc_reminder:
                 extra_blocks.append(inc_reminder)
 
@@ -628,6 +654,7 @@ class ConversationContextBuilder:
                 norm_hist=dialogue,
                 cached_prefix=cached_prefix,
                 selected_attachments=delta_atts,
+                active_indices=[e.msg_index for e in delta_slice if e.msg_index >= 0],
             )
 
         # 3) Switched to a DIFFERENT multi-turn local conversation not matching current browser tab:

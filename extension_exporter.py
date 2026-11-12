@@ -162,6 +162,8 @@ BACKEND_EXCLUDED_DIRS = {
     "dist",
     "build",
     "logs",
+    "generated",
+    ".cache",
 }
 
 BACKEND_EXCLUDED_FILES = {

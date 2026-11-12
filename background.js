@@ -192,17 +192,23 @@ async function updateActionBadge(status) {
   }
 }
 
+async function getPreferredTabId() {
+  const local = await chrome.storage.local.get("preferredTabId");
+  if (local.preferredTabId !== undefined) return local.preferredTabId;
+  const session = await chrome.storage.session.get("preferredTabId");
+  if (session.preferredTabId) await chrome.storage.local.set({ preferredTabId: session.preferredTabId });
+  return session.preferredTabId || null;
+}
+
 async function getEligibleVertexTabs() {
   const tabs = await chrome.tabs.query({ url: VERTEX_MATCH_PATTERN });
   if (!tabs || tabs.length === 0) {
     return [];
   }
-  const { preferredTabId } = await chrome.storage.session.get("preferredTabId");
+  const preferredTabId = await getPreferredTabId();
   if (preferredTabId) {
     const pinned = tabs.find((t) => t.id === preferredTabId);
-    if (pinned) {
-      return [pinned];
-    }
+    return pinned ? [pinned] : [];
   }
   return tabs.filter((t) => Boolean(t.id));
 }
@@ -210,11 +216,13 @@ async function getEligibleVertexTabs() {
 async function findTargetVertexTab(requestedTabId = null) {
   if (requestedTabId !== null && requestedTabId !== undefined) {
     try {
-      const exact = await chrome.tabs.get(Number(requestedTabId));
+      const eligible = await getEligibleVertexTabs();
+      const exact = eligible.find((tab) => tab.id === Number(requestedTabId));
       if (exact && exact.id) {
         return exact;
       }
     } catch (_) {}
+    return null;
   }
   return await findBestVertexTab();
 }
@@ -253,6 +261,29 @@ async function ensureScriptsInjected(tabId) {
   }
 }
 
+async function ensureTabBridgeReady(tabId) {
+  const probe = async () => {
+    const response = await chrome.tabs.sendMessage(tabId, { type: "GEB_GET_VISIBILITY" });
+    if (!response || !response.ok) throw new Error("Page bridge did not respond");
+  };
+  try {
+    await probe();
+    return;
+  } catch (_) {}
+  await ensureScriptsInjected(tabId);
+  try {
+    await probe();
+    return;
+  } catch (_) {}
+  await appendLog("warn", `Recovering unavailable page bridge on tab #${tabId}`);
+  const loaded = waitForTabComplete(tabId, 20000);
+  await chrome.tabs.reload(tabId);
+  await loaded;
+  await ensureScriptsInjected(tabId);
+  await probe();
+  injectedTabVersions.set(tabId, "2.6.5");
+}
+
 async function injectIntoExistingTabs() {
   const tabs = await chrome.tabs.query({ url: VERTEX_MATCH_PATTERN });
   for (const tab of tabs) {
@@ -286,7 +317,7 @@ async function reportTabStatusToBackend() {
   const settings = await getSettings();
   const tabsSnapshot = await buildReportedTabsSnapshot();
   const primary = tabsSnapshot[0] || null;
-  const { preferredTabId } = await chrome.storage.session.get("preferredTabId");
+  const preferredTabId = await getPreferredTabId();
   const capabilities = ["multi_tab", "usage_push", "auto_update"];
   if (settings.autoSpawnTabs !== false && !preferredTabId) {
     capabilities.push("spawn_tab");
@@ -345,7 +376,7 @@ function startHeartbeatInterval() {
       const settings = await getSettings();
       const tabsSnapshot = await buildReportedTabsSnapshot();
       const primary = tabsSnapshot[0] || null;
-      const { preferredTabId } = await chrome.storage.session.get("preferredTabId");
+      const preferredTabId = await getPreferredTabId();
       const capabilities = ["multi_tab", "usage_push", "auto_update"];
       if (settings.autoSpawnTabs !== false && !preferredTabId) {
         capabilities.push("spawn_tab");
@@ -601,7 +632,7 @@ async function prepareTabForBackgroundExecution(tab) {
     await reloadWait;
     await new Promise((r) => setTimeout(r, 650));
     await ensureScriptsInjected(freshTab.id);
-    injectedTabVersions.set(freshTab.id, "2.6.0");
+    injectedTabVersions.set(freshTab.id, "2.6.5");
     try {
       freshTab = await chrome.tabs.get(freshTab.id);
     } catch (_) {}
@@ -644,7 +675,7 @@ async function spawnParallelWorkerTab(baseUrlHint = "") {
   await waitForTabComplete(created.id, 14000);
   await new Promise((r) => setTimeout(r, 600));
   await ensureScriptsInjected(created.id);
-  injectedTabVersions.set(created.id, "2.6.0");
+  injectedTabVersions.set(created.id, "2.6.5");
 
   let latest = created;
   try {
@@ -719,6 +750,19 @@ async function resetTabChatWithFallback(tab) {
 
 const LARGE_REPLY_THRESHOLD = 24576;
 const TAB_IPC_CHUNK_SIZE = 24576;
+const ATTACHMENT_IPC_CHUNK_SIZE = 196608;
+
+function assembleChunks(entry, total) {
+  if (!entry || !Number.isInteger(total) || total < 1 || total > 10000 || entry.total !== total || entry.parts.length !== total) {
+    throw new Error("传输分段缺失或数量不一致，已停止处理不完整内容。");
+  }
+  const parts = Array.from({ length: total }, (_, index) => entry.parts[index]);
+  if (parts.some((part) => typeof part !== "string")) {
+    throw new Error("传输分段缺失，已停止处理不完整内容。");
+  }
+  return parts.join("");
+}
+
 const swPromptReassembly = new Map();
 const swReplyReassembly = new Map();
 
@@ -1032,9 +1076,65 @@ async function checkUpdatesAndAutoSync(force = false) {
   }
 }
 
+async function prepareAttachmentsForTab(tabId, requestId, rawAttachments, wsUrl) {
+  const list = Array.isArray(rawAttachments) ? rawAttachments : [];
+  if (list.length === 0) return [];
+  const prepared = [];
+  for (let idx = 0; idx < list.length; idx += 1) {
+    const att = { ...(list[idx] || {}) };
+    let dataUrl = String(att.data_url || "");
+    if (!dataUrl && typeof att.data_b64 === "string" && att.data_b64.length > 0) {
+      const mime = att.mime_type || "application/octet-stream";
+      dataUrl = `data:${mime};base64,${att.data_b64}`;
+    }
+    if (!dataUrl && (att.fetch_url || att.url || att.path)) {
+      const targetUrl = att.fetch_url || resolveAttachmentUrl(att, wsUrl);
+      const resp = await fetch(targetUrl);
+      if (!resp.ok) {
+        throw new Error(`拉取本地暂存附件失败 (${att.name || att.filename || idx}): HTTP ${resp.status}`);
+      }
+      const buf = await resp.arrayBuffer();
+      const mime = att.mime_type || (resp.headers && resp.headers.get ? resp.headers.get("content-type") : "") || "application/octet-stream";
+      dataUrl = `data:${mime};base64,${uint8ArrayToBase64(new Uint8Array(buf))}`;
+    }
+    if (dataUrl.length > ATTACHMENT_IPC_CHUNK_SIZE) {
+      const attKey = `${requestId}:${idx}`;
+      const totalChunks = Math.ceil(dataUrl.length / ATTACHMENT_IPC_CHUNK_SIZE);
+      for (let c = 0; c < totalChunks; c += 1) {
+        await chrome.tabs.sendMessage(tabId, {
+          type: "GEB_ATTACHMENT_CHUNK",
+          att_key: attKey,
+          request_id: requestId,
+          attachment_id: att.id || String(idx),
+          chunk_index: c,
+          total_chunks: totalChunks,
+          data: dataUrl.slice(c * ATTACHMENT_IPC_CHUNK_SIZE, (c + 1) * ATTACHMENT_IPC_CHUNK_SIZE)
+        });
+      }
+      prepared.push({
+        ...att,
+        name: att.name || att.filename || `attachment-${idx + 1}.bin`,
+        filename: att.filename || att.name || `attachment-${idx + 1}.bin`,
+        data_url: "",
+        chunked_att_key: attKey,
+        total_chunks: totalChunks
+      });
+    } else {
+      prepared.push({
+        ...att,
+        name: att.name || att.filename || `attachment-${idx + 1}.bin`,
+        filename: att.filename || att.name || `attachment-${idx + 1}.bin`,
+        data_url: dataUrl
+      });
+    }
+  }
+  return prepared;
+}
+
 async function deliverResultToBackend(eventData) {
   const replyStr = String(eventData.reply || "");
-  if (eventData.type === "request_complete" && replyStr.length > LARGE_REPLY_THRESHOLD) {
+  const hasMediaOutputs = (eventData.output_images || []).length > 0 || (eventData.output_files || []).length > 0;
+  if (eventData.type === "request_complete" && (replyStr.length > LARGE_REPLY_THRESHOLD || hasMediaOutputs)) {
     const settings = await getSettings();
     const clientId = await getClientId();
     const callbackUrl = eventData.callback_url || deriveCallbackUrlFromWs(settings.wsUrl);
@@ -1049,15 +1149,15 @@ async function deliverResultToBackend(eventData) {
           reply: replyStr,
           citations: eventData.citations || [],
           source: eventData.source || "http_callback",
+          output_images: eventData.output_images || [],
+          output_files: eventData.output_files || [],
           active_model: eventData.active_model || null
         })
       });
       if (resp.ok) {
         return;
       }
-    } catch (_) {
-      // Fallback to chunked WebSocket frames below if HTTP callback fails
-    }
+    } catch (_) {}
 
     if (!socketRuntime.ws || socketRuntime.ws.readyState !== WebSocket.OPEN) {
       await ensureWebSocketConnected(false);
@@ -1178,178 +1278,118 @@ async function handleBackendCommand(msg) {
 
   if (type === "execute_prompt") {
     const requestId = msg.request_id;
-    let assembledPrompt = String(msg.prompt || "");
-    if (msg.chunked) {
-      const entry = swPromptReassembly.get(requestId);
-      swPromptReassembly.delete(requestId);
-      const total = msg.total_chunks || (entry ? entry.total : 0);
-      assembledPrompt = entry
-        ? Array.from({ length: total }, (_, idx) => entry.parts[idx] || "").join("")
-        : "";
-    }
+    try {
+      let assembledPrompt = String(msg.prompt || "");
+      if (msg.chunked) {
+        const entry = swPromptReassembly.get(requestId);
+        swPromptReassembly.delete(requestId);
+        const total = msg.total_chunks || (entry ? entry.total : 0);
+        assembledPrompt = assembleChunks(entry, total);
+      }
 
-    const rawTab = await findTargetVertexTab(msg.tab_id);
-    if (!rawTab || !rawTab.id) {
+      const rawTab = await findTargetVertexTab(msg.tab_id);
+      if (!rawTab || !rawTab.id) {
+        sendWsJson({
+          type: "request_error",
+          request_id: requestId,
+          error: "未找到已打开的 https://vertexaisearch.cloud.google.com 标签页。"
+        });
+        return;
+      }
+
+      const reqTtlMs = Math.max(60000, Number(msg.timeout_ms) || 600000) + 15000;
+      activeInFlightRequests.set(requestId, Date.now() + reqTtlMs);
+      sendWsJson({ type: "request_ack", request_id: requestId, tab_id: rawTab.id });
+
+      const tab = await prepareTabForBackgroundExecution(rawTab);
+      const rawAttachments = Array.isArray(msg.attachments) ? msg.attachments : [];
+      await appendLog(
+        "info",
+        `Dispatching request ${String(requestId).slice(0, 8)} to tab #${tab.id}` +
+          ` [len=${assembledPrompt.length}]` +
+          (rawAttachments.length > 0 ? ` [files=${rawAttachments.length}]` : "") +
+          (tab.active ? "" : " [bg]") +
+          (msg.target_model ? ` [model=${msg.target_model}]` : "") +
+          (msg.reset_chat ? " [new_chat]" : "")
+      );
+
+      await ensureTabBridgeReady(tab.id);
+
+      let remainingResetChat = Boolean(msg.reset_chat);
+      if (remainingResetChat) {
+        const resetDone = await resetTabChatWithFallback(tab);
+        if (resetDone) {
+          remainingResetChat = false;
+        }
+      }
+
+      await ensureTabBridgeReady(tab.id);
+      const settings = await getSettings();
+      const callbackUrl = msg.callback_url || deriveCallbackUrlFromWs(settings.wsUrl);
+
+      const dispatchToReadyTab = async () => {
+        const tabAttachments = await prepareAttachmentsForTab(tab.id, requestId, rawAttachments, settings.wsUrl);
+        const driverConfigPayload = {
+          driverMode: settings.driverMode,
+          customModelSelector: settings.customModelSelector,
+          customInputSelector: settings.customInputSelector,
+          customSendSelector: settings.customSendSelector,
+          customReplySelector: settings.customReplySelector
+        };
+        if (assembledPrompt.length > TAB_IPC_CHUNK_SIZE) {
+          const totalChunks = Math.ceil(assembledPrompt.length / TAB_IPC_CHUNK_SIZE);
+          for (let i = 0; i < totalChunks; i += 1) {
+            await chrome.tabs.sendMessage(tab.id, {
+              type: "GEB_PROMPT_CHUNK",
+              request_id: requestId,
+              chunk_index: i,
+              total_chunks: totalChunks,
+              data: assembledPrompt.slice(i * TAB_IPC_CHUNK_SIZE, (i + 1) * TAB_IPC_CHUNK_SIZE)
+            });
+          }
+          await chrome.tabs.sendMessage(tab.id, {
+            type: "GEB_EXECUTE_PROMPT",
+            request_id: requestId,
+            prompt: "",
+            chunked: true,
+            total_chunks: totalChunks,
+            callback_url: callbackUrl,
+            attachments: tabAttachments,
+            image_generation: Boolean(msg.image_generation),
+            video_generation: Boolean(msg.video_generation),
+            target_model: msg.target_model || null,
+            reset_chat: remainingResetChat,
+            timeout_ms: msg.timeout_ms || 600000,
+            driver_config: driverConfigPayload
+          });
+        } else {
+          await chrome.tabs.sendMessage(tab.id, {
+            type: "GEB_EXECUTE_PROMPT",
+            request_id: requestId,
+            prompt: assembledPrompt,
+            chunked: false,
+            total_chunks: 0,
+            callback_url: callbackUrl,
+            attachments: tabAttachments,
+            image_generation: Boolean(msg.image_generation),
+            video_generation: Boolean(msg.video_generation),
+            target_model: msg.target_model || null,
+            reset_chat: remainingResetChat,
+            timeout_ms: msg.timeout_ms || 600000,
+            driver_config: driverConfigPayload
+          });
+        }
+      };
+
+      await dispatchToReadyTab();
+    } catch (err) {
+      activeInFlightRequests.delete(requestId);
       sendWsJson({
         type: "request_error",
         request_id: requestId,
-        error: "未找到已打开的 https://vertexaisearch.cloud.google.com 标签页。"
+        error: "Gemini 工作页面恢复或发送失败: " + (err && err.message ? err.message : String(err))
       });
-      return;
-    }
-
-    const reqTtlMs = Math.max(60000, Number(msg.timeout_ms) || 600000) + 15000;
-    activeInFlightRequests.set(requestId, Date.now() + reqTtlMs);
-    sendWsJson({ type: "request_ack", request_id: requestId, tab_id: rawTab.id });
-    const rawAttachments = Array.isArray(msg.attachments) ? msg.attachments : [];
-    const tab = await prepareTabForBackgroundExecution(rawTab);
-
-    await appendLog(
-      "info",
-      `Dispatching request ${String(requestId).slice(0, 8)} to tab #${tab.id}` +
-        ` [len=${assembledPrompt.length}]` +
-        (rawAttachments.length > 0 ? ` [files=${rawAttachments.length}]` : "") +
-        (tab.active ? "" : " [bg]") +
-        (msg.target_model ? ` [model=${msg.target_model}]` : "") +
-        (msg.reset_chat ? " [new_chat]" : "")
-    );
-
-    // Ensure hot-swapped latest page-driver.js & content-bridge.js are active on this tab (race-free per-tab map)
-    if (injectedTabVersions.get(tab.id) !== "2.6.0") {
-      await ensureScriptsInjected(tab.id);
-      injectedTabVersions.set(tab.id, "2.6.0");
-    }
-
-    let remainingResetChat = Boolean(msg.reset_chat);
-    if (remainingResetChat) {
-      const resetDone = await resetTabChatWithFallback(tab);
-      if (resetDone) {
-        remainingResetChat = false;
-      }
-    }
-
-    const settings = await getSettings();
-    const callbackUrl = msg.callback_url || deriveCallbackUrlFromWs(settings.wsUrl);
-
-    const preparedAttachments = [];
-    if (rawAttachments.length > 0) {
-      try {
-        for (let idx = 0; idx < rawAttachments.length; idx += 1) {
-          const att = rawAttachments[idx] || {};
-          const attId = String(att.id || `att-${idx}`);
-          const dataB64 = await fetchAttachmentAsBase64(att, settings.wsUrl, 60000);
-          preparedAttachments.push({
-            id: attId,
-            filename: String(att.filename || `attachment-${idx + 1}.bin`),
-            mime_type: String(att.mime_type || "application/octet-stream"),
-            kind: String(att.kind || "file"),
-            size_bytes: Number(att.size_bytes || 0),
-            data_b64: dataB64
-          });
-        }
-      } catch (attErr) {
-        activeInFlightRequests.delete(requestId);
-        sendWsJson({
-          type: "request_error",
-          request_id: requestId,
-          error:
-            "下载本地暂存多模态附件失败: " +
-            (attErr && attErr.message ? attErr.message : String(attErr))
-        });
-        await maybeReloadPendingExtensionUpdate();
-        return;
-      }
-    }
-
-    const dispatchToReadyTab = async () => {
-      const attachmentMetaList = [];
-      for (const att of preparedAttachments) {
-        const b64 = att.data_b64 || "";
-        const totalAttChunks = Math.max(1, Math.ceil(b64.length / TAB_IPC_CHUNK_SIZE));
-        for (let c = 0; c < totalAttChunks; c += 1) {
-          await chrome.tabs.sendMessage(tab.id, {
-            type: "GEB_ATTACHMENT_CHUNK",
-            request_id: requestId,
-            attachment_id: att.id,
-            chunk_index: c,
-            total_chunks: totalAttChunks,
-            data: b64.slice(c * TAB_IPC_CHUNK_SIZE, (c + 1) * TAB_IPC_CHUNK_SIZE)
-          });
-        }
-        attachmentMetaList.push({
-          id: att.id,
-          filename: att.filename,
-          mime_type: att.mime_type,
-          kind: att.kind,
-          size_bytes: att.size_bytes,
-          total_chunks: totalAttChunks
-        });
-      }
-
-      const driverConfigPayload = {
-        driverMode: settings.driverMode,
-        customModelSelector: settings.customModelSelector,
-        customInputSelector: settings.customInputSelector,
-        customSendSelector: settings.customSendSelector,
-        customReplySelector: settings.customReplySelector
-      };
-
-      if (assembledPrompt.length > TAB_IPC_CHUNK_SIZE) {
-        const totalChunks = Math.ceil(assembledPrompt.length / TAB_IPC_CHUNK_SIZE);
-        for (let i = 0; i < totalChunks; i += 1) {
-          await chrome.tabs.sendMessage(tab.id, {
-            type: "GEB_PROMPT_CHUNK",
-            request_id: requestId,
-            chunk_index: i,
-            total_chunks: totalChunks,
-            data: assembledPrompt.slice(i * TAB_IPC_CHUNK_SIZE, (i + 1) * TAB_IPC_CHUNK_SIZE)
-          });
-        }
-        await chrome.tabs.sendMessage(tab.id, {
-          type: "GEB_EXECUTE_PROMPT",
-          request_id: requestId,
-          prompt: "",
-          chunked: true,
-          total_chunks: totalChunks,
-          attachments: attachmentMetaList,
-          callback_url: callbackUrl,
-          target_model: msg.target_model || null,
-          reset_chat: remainingResetChat,
-          timeout_ms: msg.timeout_ms || 600000,
-          driver_config: driverConfigPayload
-        });
-      } else {
-        await chrome.tabs.sendMessage(tab.id, {
-          type: "GEB_EXECUTE_PROMPT",
-          request_id: requestId,
-          prompt: assembledPrompt,
-          chunked: false,
-          total_chunks: 0,
-          attachments: attachmentMetaList,
-          callback_url: callbackUrl,
-          target_model: msg.target_model || null,
-          reset_chat: remainingResetChat,
-          timeout_ms: msg.timeout_ms || 600000,
-          driver_config: driverConfigPayload
-        });
-      }
-    };
-
-    try {
-      await dispatchToReadyTab();
-    } catch (_) {
-      await ensureScriptsInjected(tab.id);
-      try {
-        await dispatchToReadyTab();
-      } catch (retryErr) {
-        activeInFlightRequests.delete(requestId);
-        sendWsJson({
-          type: "request_error",
-          request_id: requestId,
-          error: "无法向 Gemini Enterprise 标签页注入桥接脚本，请刷新该网页后重试: " + retryErr.message
-        });
-        await maybeReloadPendingExtensionUpdate();
-      }
+      await maybeReloadPendingExtensionUpdate();
     }
     return;
   }
@@ -1565,13 +1605,20 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
             activeInFlightRequests.set(eventData.request_id, Date.now() + 180000);
           }
         }
-        if (eventData.type === "request_complete" && eventData.chunked) {
+        if (eventData.type === "request_complete" && eventData.json_envelope_chunked) {
+          const rkey = eventData.stream_key || (eventData.request_id + ":json");
+          const entry = swReplyReassembly.get(rkey);
+          swReplyReassembly.delete(rkey);
+          const total = eventData.total_chunks || (entry ? entry.total : 0);
+          const mergedJson = assembleChunks(entry, total);
+          const unpacked = JSON.parse(mergedJson);
+          if (senderTabId !== null && !unpacked.tab_id) unpacked.tab_id = senderTabId;
+          await deliverResultToBackend(unpacked);
+        } else if (eventData.type === "request_complete" && eventData.chunked) {
           const entry = swReplyReassembly.get(eventData.request_id);
           swReplyReassembly.delete(eventData.request_id);
           const total = eventData.total_chunks || (entry ? entry.total : 0);
-          const merged = entry
-            ? Array.from({ length: total }, (_, idx) => entry.parts[idx] || "").join("")
-            : "";
+          const merged = assembleChunks(entry, total);
           await deliverResultToBackend({ ...eventData, reply: merged, chunked: false });
         } else {
           await deliverResultToBackend(eventData);
@@ -1611,7 +1658,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
         lastError: session.lastError || "",
         capturedRpc: Boolean(session.capturedRpc),
         activeModel: session.activeModel || "",
-        preferredTabId: session.preferredTabId || null,
+        preferredTabId: await getPreferredTabId(),
         usageSnapshot: session.usageSnapshot || null,
         activeTab: tab
           ? { id: tab.id, url: tab.url || "", title: tab.title || "" }
@@ -1645,6 +1692,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
       const updated = { ...current, ...patch };
       await chrome.storage.local.set(updated);
       if (message.preferredTabId !== undefined) {
+        await chrome.storage.local.set({ preferredTabId: message.preferredTabId });
         await chrome.storage.session.set({ preferredTabId: message.preferredTabId });
       }
       const wsChanged = patch.wsUrl !== undefined && patch.wsUrl !== current.wsUrl;

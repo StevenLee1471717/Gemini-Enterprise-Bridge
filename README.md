@@ -253,3 +253,19 @@ I:\Projects\Gemini-Enterprise-Bridge\
 2. **网页改版导致找不到输入框或回复容器**：
    - 在 Gemini Enterprise 页面点击扩展弹窗中的 **检测页面元素** 查看自动识别结果；
    - 若企业定制版更换了标签名，可在弹窗 **高级：自定义 Shadow DOM 选择器** 中填入对应的 CSS 选择器（驱动会自动穿透所有层级的 Shadow Root 查找该选择器），无需修改代码即可热更新。
+
+## Codex Responses 接入、多模态增强与稳定性加固
+
+### 1. OpenAI Responses API 与会话持久存储
+- **Responses 端点**：新增 `POST /v1/responses`（流式 SSE 与非流式）、`GET/DELETE /v1/responses/{id}`、`POST /v1/responses/input_tokens`、`POST /v1/responses/compact`，支持命名空间工具、自由格式 `apply_patch`、图片输入与内置生图调用。
+- **本地 SQLite 持久存储**：`previous_response_id` 与压缩检查点默认保存在 `.cache/response_store/responses.sqlite3`（权限 `0600`，单条上限 32 MB、总有效负载上限 512 MB；普通回复默认保留 24 小时，`bridge_compact_*` 压缩检查点跨重启保留；`store: false` 不落盘）。
+- **Codex 配置同步**：内置 `codex-models.json`（含 `input_modalities: ["text", "image"]`、1,048,576 上下文窗口与 524,288 整理门槛，参考 Google Gemini CLI 50% 策略，非 Google 官方公开的网页端固定压缩阈值）与 `configure_codex_context.py`（默认仅预览，加 `--apply --backup-dir <备份目录>` 后更新本地 Gemini 条目，不修改其他模型供应商）。
+
+### 2. 多模态文件存取、自动转码与媒体生成
+- **文件与媒体接口**：新增 `POST/GET /v1/files`、`GET /v1/files/{id}`、`GET /v1/files/{id}/content`、`DELETE /v1/files/{id}`、`POST /v1/images/generations`、`POST /v1/images/edits`、`GET /v1/images/files/{filename}`、`POST /v1/videos/generations`、`POST /v1/audio/transcriptions`、`POST /v1/audio/translations`，并提供零外部依赖的 stdio MCP 工具 `imagegen_mcp.py`（`generate_image`、`generate_video`、`analyze_media`）。
+- **本机自动兼容转换**：针对网页输入框限制，当本机存在 `sips` / `afconvert` / `textutil` / `ffmpeg` 时，自动将 `HEIC/HEIF/TIFF/BMP/ICO/AVIF/JP2` 转为 `PNG`、`WAV/AIFF/FLAC/OGG/OPUS/AAC/WEBM/AMR` 转为 `M4A`、`MOV/WEBM/MKV/AVI/MPEG/3GP/FLV` 转为 `MP4`、`RTF` 转为 `DOCX`；超过 1 MB 的附件自动走本地暂存拉取与分片传输。
+- **已知边界**：网页内部文档卡片（如网页内生成的 PDF/Word 预览卡）无公开下载流，亦不提供原生 TTS 语音合成导出；非原生格式转换依赖宿主机对应系统工具或 `ffmpeg`。
+
+### 3. 流式工具完整性与多标签页并发加固
+- **工具与思考草稿防护**：状态机解析 `[TOOL_CALL]...[/TOOL_CALL]`（忽略参数字符串字面量内的同名标记），拦截中英文明确内部思考草稿标题（如 `Thinking Process:`、`思考过程：`）及未闭合工具块并触发单次修复；剥离网页 `[[section:...]]` 与 `[[suggested_questions]]` 装饰块后再做末尾 `summaryText` 快照去重（`page-driver.js` `v2.6.5`）。
+- **全局并发信号量与保活**：`BrowserBridgeHub` 强制执行 `max_parallel_tabs` 全局信号量硬上限，取消/异常时自动停止页面生成并清理槽位增量历史，长耗时工具与媒体生成全程发送 SSE `: keepalive`。

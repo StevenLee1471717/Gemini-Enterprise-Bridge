@@ -334,6 +334,10 @@ async function loadState(overwriteInputs = false) {
     const { extensionVersion, updateState, settings, wsConnected, lastError, capturedRpc, activeModel, activeTab, vertexTabs, preferredTabId, usageSnapshot, logs } = state;
     renderUpdateBanner(extensionVersion, updateState, null);
 
+    const currentSelected = !initialFormHydrated || overwriteInputs
+      ? (preferredTabId ? String(preferredTabId) : "")
+      : elTabSelect.value;
+
     if (!initialFormHydrated || overwriteInputs) {
       elEnabled.checked = Boolean(settings.enabled);
       elModeSelect.value = settings.driverMode || "auto";
@@ -348,7 +352,6 @@ async function loadState(overwriteInputs = false) {
     }
 
     // Populate open Vertex AI Search tabs dropdown (Trusted-Types safe)
-    const currentSelected = preferredTabId ? String(preferredTabId) : "";
     elTabSelect.replaceChildren();
     const autoOpt = document.createElement("option");
     autoOpt.value = "";
@@ -384,7 +387,7 @@ async function loadState(overwriteInputs = false) {
       elTabStatus.textContent = `固定单页 #${activeTab.id} · ${activeTab.title || activeTab.url}`;
       elTabStatus.title = activeTab.url;
     } else if (tabTotal > 0) {
-      elTabStatus.textContent = `${tabTotal} 个工作页就绪 (上限 ${settings.maxParallelTabs || 4})`;
+      elTabStatus.textContent = `${tabTotal} 个工作页 · 自动开页上限 ${settings.maxParallelTabs || 4}`;
       elTabStatus.title = (vertexTabs || []).map((t) => `#${t.id}: ${t.url}`).join("\n");
     } else {
       elTabStatus.textContent = "未打开 vertexaisearch.cloud.google.com";
@@ -439,7 +442,6 @@ async function saveSettings() {
     settings,
     preferredTabId
   });
-  await chrome.runtime.sendMessage({ type: "GEB_POPUP_RECONNECT" });
   await loadState(true);
 }
 

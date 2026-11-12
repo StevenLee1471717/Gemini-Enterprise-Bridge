@@ -28,6 +28,17 @@
     }
   } catch (_) {}
 
+  function assembleChunks(entry, total) {
+    if (!entry || !Number.isInteger(total) || total < 1 || total > 10000 || entry.total !== total || entry.parts.length !== total) {
+      throw new Error("传输分段缺失或数量不一致，已停止处理不完整内容。");
+    }
+    const parts = Array.from({length: total}, (_, index) => entry.parts[index]);
+    if (parts.some(part => typeof part !== "string")) {
+      throw new Error("传输分段缺失，已停止处理不完整内容。");
+    }
+    return parts.join("");
+  }
+
   class ReassemblyBuffer {
     constructor() {
       this._store = new Map();
@@ -44,9 +55,8 @@
     assemble(requestId, expectedTotal = 0) {
       const entry = this._store.get(requestId);
       this._store.delete(requestId);
-      if (!entry) return "";
-      const total = expectedTotal || entry.total || entry.parts.length;
-      return Array.from({ length: total }, (_, idx) => entry.parts[idx] || "").join("");
+      const total = expectedTotal || (entry ? entry.total : 0);
+      return assembleChunks(entry, total);
     }
     clear() {
       this._store.clear();
@@ -54,8 +64,8 @@
   }
 
   const promptReassembly = new ReassemblyBuffer();
-  const attachmentReassembly = new ReassemblyBuffer();
   const replyReassembly = new ReassemblyBuffer();
+  const attachmentReassembly = new ReassemblyBuffer();
 
   function unwrapInlineToolChunks(text) {
     if (!text || !text.includes("[TOOL_CHUNK:")) return text;
@@ -63,74 +73,89 @@
   }
 
   function dispatchPromptToMain(message) {
-    if (message.driver_config) {
-      postToMain("configure", message.driver_config);
-    }
-    const rawAttachments = Array.isArray(message.attachments) ? message.attachments : [];
-    const mainAttachments = [];
-    for (const att of rawAttachments) {
-      if (!att || !att.id) continue;
-      const attKey = `${message.request_id}:${att.id}`;
-      const fullB64 =
-        typeof att.data_b64 === "string" && att.data_b64.length > 0
-          ? att.data_b64
-          : attachmentReassembly.assemble(attKey, att.total_chunks || 0);
-      const totalAttChunks = Math.max(1, Math.ceil(fullB64.length / MAIN_POSTMSG_CHUNK_SIZE));
-      for (let i = 0; i < totalAttChunks; i += 1) {
-        postToMain("attachment_chunk", {
-          request_id: message.request_id,
-          attachment_id: att.id,
-          chunk_index: i,
-          total_chunks: totalAttChunks,
-          data: fullB64.slice(i * MAIN_POSTMSG_CHUNK_SIZE, (i + 1) * MAIN_POSTMSG_CHUNK_SIZE)
-        });
+    try {
+      if (message.driver_config) {
+        postToMain("configure", message.driver_config);
       }
-      mainAttachments.push({
-        id: att.id,
-        filename: att.filename || "attachment.bin",
-        mime_type: att.mime_type || "application/octet-stream",
-        kind: att.kind || "file",
-        size_bytes: Number(att.size_bytes || 0),
-        total_chunks: totalAttChunks
+      const rawPrompt = message.chunked
+        ? promptReassembly.assemble(message.request_id, message.total_chunks)
+        : String(message.prompt || "");
+      const fullPrompt = unwrapInlineToolChunks(rawPrompt);
+
+      const hydratedAttachments = (message.attachments || []).map((att) => {
+        if (att && (att.chunked_att_key || att.total_chunks)) {
+          const key = att.chunked_att_key || `${message.request_id}:${att.id}`;
+          const assembled = attachmentReassembly.assemble(key, att.total_chunks);
+          const dataUrl = assembled.startsWith("data:") ? assembled : `data:${att.mime_type || "application/octet-stream"};base64,${assembled}`;
+          const copy = { ...att, data_url: dataUrl };
+          delete copy.chunked_att_key;
+          delete copy.total_chunks;
+          return copy;
+        }
+        if (att && !att.data_url && att.data_b64) {
+          return { ...att, data_url: `data:${att.mime_type || "application/octet-stream"};base64,${att.data_b64}` };
+        }
+        return att;
       });
-    }
 
-    const rawPrompt = message.chunked
-      ? promptReassembly.assemble(message.request_id, message.total_chunks)
-      : String(message.prompt || "");
-    const fullPrompt = unwrapInlineToolChunks(rawPrompt);
+      const mainAttachments = hydratedAttachments.map((att, idx) => {
+        const dUrl = String((att && att.data_url) || "");
+        if (dUrl.length > 131072) {
+          const attKey = `${message.request_id}:att:${idx}`;
+          const aTotal = Math.ceil(dUrl.length / 131072);
+          for (let i = 0; i < aTotal; i += 1) {
+            postToMain("attachment_chunk", {
+              att_key: attKey,
+              chunk_index: i,
+              total_chunks: aTotal,
+              data: dUrl.slice(i * 131072, (i + 1) * 131072)
+            });
+          }
+          return { ...att, data_url: "", chunked_att_key: attKey, total_chunks: aTotal };
+        }
+        return att;
+      });
 
-    if (fullPrompt.length > MAIN_POSTMSG_CHUNK_SIZE) {
-      const total = Math.ceil(fullPrompt.length / MAIN_POSTMSG_CHUNK_SIZE);
-      for (let i = 0; i < total; i += 1) {
-        postToMain("prompt_chunk", {
+      if (fullPrompt.length > MAIN_POSTMSG_CHUNK_SIZE) {
+        const total = Math.ceil(fullPrompt.length / MAIN_POSTMSG_CHUNK_SIZE);
+        for (let i = 0; i < total; i += 1) {
+          postToMain("prompt_chunk", {
+            request_id: message.request_id,
+            chunk_index: i,
+            total_chunks: total,
+            data: fullPrompt.slice(i * MAIN_POSTMSG_CHUNK_SIZE, (i + 1) * MAIN_POSTMSG_CHUNK_SIZE)
+          });
+        }
+        postToMain("execute_prompt", {
           request_id: message.request_id,
-          chunk_index: i,
+          prompt: "",
+          chunked: true,
           total_chunks: total,
-          data: fullPrompt.slice(i * MAIN_POSTMSG_CHUNK_SIZE, (i + 1) * MAIN_POSTMSG_CHUNK_SIZE)
+          callback_url: message.callback_url || "",
+          attachments: mainAttachments,
+          image_generation: Boolean(message.image_generation),
+          video_generation: Boolean(message.video_generation),
+          target_model: message.target_model || null,
+          reset_chat: Boolean(message.reset_chat),
+          timeout_ms: message.timeout_ms || 600000
+        });
+      } else {
+        postToMain("execute_prompt", {
+          request_id: message.request_id,
+          prompt: fullPrompt,
+          callback_url: message.callback_url || "",
+          attachments: mainAttachments,
+          image_generation: Boolean(message.image_generation),
+          video_generation: Boolean(message.video_generation),
+          target_model: message.target_model || null,
+          reset_chat: Boolean(message.reset_chat),
+          timeout_ms: message.timeout_ms || 600000
         });
       }
-      postToMain("execute_prompt", {
-        request_id: message.request_id,
-        prompt: "",
-        chunked: true,
-        total_chunks: total,
-        attachments: mainAttachments,
-        callback_url: message.callback_url || "",
-        target_model: message.target_model || null,
-        reset_chat: Boolean(message.reset_chat),
-        timeout_ms: message.timeout_ms || 600000
-      });
-    } else {
-      postToMain("execute_prompt", {
-        request_id: message.request_id,
-        prompt: fullPrompt,
-        attachments: mainAttachments,
-        callback_url: message.callback_url || "",
-        target_model: message.target_model || null,
-        reset_chat: Boolean(message.reset_chat),
-        timeout_ms: message.timeout_ms || 600000
-      });
+    } catch (error) {
+      void chrome.runtime.sendMessage({type: "GEB_DRIVER_EVENT", payload: {
+        type: "request_error", request_id: message.request_id, error: error.message
+      }}).catch(() => {});
     }
   }
 
@@ -156,21 +181,9 @@
   }
 
   function disconnectKeepalivePort() {
-    if (hiddenKeepaliveTimer !== null) {
-      clearInterval(hiddenKeepaliveTimer);
-      hiddenKeepaliveTimer = null;
-    }
-    if (portRetryTimer !== null) {
-      clearTimeout(portRetryTimer);
-      portRetryTimer = null;
-    }
-    if (keepalivePort) {
-      const closingPort = keepalivePort;
-      keepalivePort = null;
-      try {
-        closingPort.disconnect();
-      } catch (_) {}
-    }
+    if (hiddenKeepaliveTimer !== null) { clearInterval(hiddenKeepaliveTimer); hiddenKeepaliveTimer = null; }
+    if (portRetryTimer !== null) { clearTimeout(portRetryTimer); portRetryTimer = null; }
+    if (keepalivePort) { const p = keepalivePort; keepalivePort = null; try { p.disconnect(); } catch (_) {} }
   }
 
   function schedulePortReconnect() {
@@ -187,28 +200,23 @@
   function ensureKeepalivePort() {
     if (disposed || pageInBfcache || !chrome.runtime?.id || keepalivePort) return;
     try {
-      const port = chrome.runtime.connect({ name: "geb-keepalive" });
-      keepalivePort = port;
+      keepalivePort = chrome.runtime.connect({ name: "geb-keepalive" });
       portRetryAttempts = 0;
       if (portRetryTimer !== null) {
         clearTimeout(portRetryTimer);
         portRetryTimer = null;
       }
-      port.onDisconnect.addListener(() => {
-        // Always touch chrome.runtime.lastError so bfcache / navigation disconnects never log Unchecked runtime.lastError
-        void chrome.runtime?.lastError;
-        if (keepalivePort === port) {
-          keepalivePort = null;
-        }
+      keepalivePort.onDisconnect.addListener(() => {
+        // Page navigation closes this port normally; consume Chrome's diagnostic.
+        void chrome.runtime.lastError;
+        keepalivePort = null;
         if (!disposed && !pageInBfcache && chrome.runtime?.id) {
           schedulePortReconnect();
         }
       });
     } catch (_) {
       keepalivePort = null;
-      if (!pageInBfcache) {
-        schedulePortReconnect();
-      }
+      schedulePortReconnect();
     }
   }
 
@@ -349,16 +357,50 @@
 
       let outgoingPayload = data.payload;
       if (outgoingPayload.type === "request_complete" && outgoingPayload.chunked) {
-        const mergedReply = replyReassembly.assemble(
-          outgoingPayload.request_id,
-          outgoingPayload.total_chunks
-        );
-        outgoingPayload = { ...outgoingPayload, reply: mergedReply, chunked: false };
+        try {
+          const mergedReply = replyReassembly.assemble(outgoingPayload.request_id, outgoingPayload.total_chunks);
+          outgoingPayload = { ...outgoingPayload, reply: mergedReply, chunked: false };
+        } catch (error) {
+          outgoingPayload = {type: "request_error", request_id: outgoingPayload.request_id, error: error.message};
+        }
       }
 
       void (async () => {
         try {
           // Chunk large replies (>24KB) across chrome.runtime.sendMessage to SW for HTTP callback upload
+          const hasLargeMedia = ((outgoingPayload.output_images || []).length > 0) || ((outgoingPayload.output_files || []).length > 0);
+          if (outgoingPayload.type === "request_complete" && hasLargeMedia) {
+            const fullJson = JSON.stringify(outgoingPayload);
+            if (fullJson.length > 196608) {
+              const sliceLen = 196608;
+              const totalJsonChunks = Math.ceil(fullJson.length / sliceLen);
+              const streamKey = outgoingPayload.request_id + ":json";
+              for (let i = 0; i < totalJsonChunks; i += 1) {
+                await chrome.runtime.sendMessage({
+                  type: "GEB_DRIVER_EVENT",
+                  payload: {
+                    type: "sw_reply_chunk",
+                    request_id: outgoingPayload.request_id,
+                    stream_key: streamKey,
+                    chunk_index: i,
+                    total_chunks: totalJsonChunks,
+                    data: fullJson.slice(i * sliceLen, (i + 1) * sliceLen)
+                  }
+                });
+              }
+              await chrome.runtime.sendMessage({
+                type: "GEB_DRIVER_EVENT",
+                payload: {
+                  type: "request_complete",
+                  request_id: outgoingPayload.request_id,
+                  stream_key: streamKey,
+                  json_envelope_chunked: true,
+                  total_chunks: totalJsonChunks
+                }
+              });
+              return;
+            }
+          }
           const fullReplyStr = String(outgoingPayload.reply || "");
           if (outgoingPayload.type === "request_complete" && fullReplyStr.length > 24576) {
             const swSliceSize = 24576;
@@ -396,26 +438,11 @@
     }
   }
 
-  function onPageHide() {
-    pageInBfcache = true;
-    disconnectKeepalivePort();
-  }
-
-  function onPageShow(event) {
-    pageInBfcache = false;
-    if (!disposed && event && event.persisted) {
-      updateVisibilityKeepalive();
-    }
-  }
-
   window.addEventListener("message", onWindowMessage);
-  window.addEventListener("pagehide", onPageHide);
-  window.addEventListener("pageshow", onPageShow);
   document.addEventListener("visibilitychange", updateVisibilityKeepalive);
 
   chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
     if (disposed) return false;
-
     (async () => {
       const msgType = message && message.type ? message.type : "";
 
@@ -428,7 +455,7 @@
 
       if (msgType === "GEB_ATTACHMENT_CHUNK") {
         attachmentReassembly.addChunk(
-          `${message.request_id}:${message.attachment_id}`,
+          message.att_key || `${message.request_id}:${message.attachment_id}`,
           message.chunk_index,
           message.total_chunks,
           message.data
@@ -548,14 +575,22 @@
   globalThis.__GEB_ISOLATED_CLEANUP__ = () => {
     disposed = true;
     window.removeEventListener("message", onWindowMessage);
-    window.removeEventListener("pagehide", onPageHide);
-    window.removeEventListener("pageshow", onPageShow);
     document.removeEventListener("visibilitychange", updateVisibilityKeepalive);
     clearInterval(heartbeatTimer);
-    disconnectKeepalivePort();
-    promptReassembly.clear();
-    attachmentReassembly.clear();
-    replyReassembly.clear();
+    if (hiddenKeepaliveTimer !== null) {
+      clearInterval(hiddenKeepaliveTimer);
+      hiddenKeepaliveTimer = null;
+    }
+    if (portRetryTimer !== null) {
+      clearTimeout(portRetryTimer);
+      portRetryTimer = null;
+    }
+    if (keepalivePort) {
+      try {
+        keepalivePort.disconnect();
+      } catch (_) {}
+      keepalivePort = null;
+    }
     for (const [, p] of pendingRpcCalls) {
       clearTimeout(p.timer);
     }
@@ -563,13 +598,12 @@
   };
 
   // Probe MAIN driver readiness immediately & sync config + visibility state
-  void (async () => {
-    try {
-      await callMainAsync("diagnose", {}, 1500);
+  callMainAsync("diagnose", {}, 1500)
+    .then(() => {
       mainReady = true;
       flushQueuedPrompts();
-    } catch (_) {}
-  })();
+    })
+    .catch(() => {});
   void syncDriverConfigFromStorage();
   updateVisibilityKeepalive();
 })();

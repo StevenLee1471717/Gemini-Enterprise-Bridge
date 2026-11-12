@@ -18,6 +18,21 @@ from tool_calling import (
 )
 
 _CALL_ID_IN_CANON_RE = re.compile(r'"id":\s*"[^"]*",\s*')
+_EPHEMERAL_WRAPPER_RE = re.compile(
+    r"<(?P<tag>system_reminder|system-reminder|current_datetime|app_user_message_source_json|canvas-context|environment_details|context_info)\b[^>]*>[\s\S]*?</(?P=tag)>",
+    re.IGNORECASE,
+)
+_WHITESPACE_RUN_RE = re.compile(r"\s+")
+
+
+def _canonicalize_for_match(role: str, text: str) -> str:
+    """Strip volatile per-turn client metadata tags and normalize whitespace for prefix comparison."""
+    if not text:
+        return ""
+    cleaned = _EPHEMERAL_WRAPPER_RE.sub("", text)
+    if role == "assistant" and "[TOOL_CALL]" in cleaned:
+        cleaned = _CALL_ID_IN_CANON_RE.sub("", cleaned)
+    return _WHITESPACE_RUN_RE.sub(" ", cleaned).strip()
 
 
 @dataclass
@@ -54,6 +69,46 @@ class ConversationContextBuilder:
 
     def has_active_conversation(self, session_key: str) -> bool:
         return bool(self._session_turns.get(session_key))
+
+    def has_active_tool_session(self, session_key: str) -> bool:
+        """Return True if `session_key` holds an active multi-turn tool-enabled conversation."""
+        return bool(self._session_tools_fp.get(session_key)) and len(
+            self._session_turns.get(session_key) or []
+        ) >= 2
+
+    @staticmethod
+    def _system_prompts_compatible(
+        prev_sys_fp: Optional[str],
+        cur_sys_text: str,
+        has_tracked_dialogue: bool = False,
+    ) -> Tuple[bool, str]:
+        """Return (compatible, appended_system_delta) tolerating volatile tags or appended skill blocks."""
+        if prev_sys_fp is None or prev_sys_fp == cur_sys_text:
+            return (True, "")
+        c_prev = _canonicalize_for_match("system", prev_sys_fp)
+        c_cur = _canonicalize_for_match("system", cur_sys_text)
+        if c_prev == c_cur:
+            return (True, "")
+        if has_tracked_dialogue:
+            if cur_sys_text.startswith(prev_sys_fp):
+                return (True, cur_sys_text[len(prev_sys_fp) :].strip())
+            # If the system prompt shares the primary prefix or only mutated dynamic sections, keep session alive
+            common_prefix_len = 0
+            for ch1, ch2 in zip(c_prev, c_cur):
+                if ch1 != ch2:
+                    break
+                common_prefix_len += 1
+            min_len = min(len(c_prev), len(c_cur))
+            if min_len > 0 and common_prefix_len >= int(min_len * 0.65):
+                prev_paras = {p.strip() for p in prev_sys_fp.split("\n\n") if p.strip()}
+                new_paras = [
+                    p.strip()
+                    for p in cur_sys_text.split("\n\n")
+                    if p.strip() and p.strip() not in prev_paras
+                ]
+                delta_sys = "\n\n".join(new_paras).strip()
+                return (True, f"[Updated System Instructions]\n{delta_sys}" if delta_sys else "")
+        return (False, "")
 
     @staticmethod
     def _normalize_messages(messages: Sequence[ChatMessage]) -> Tuple[str, List[Tuple[str, str]]]:
@@ -123,7 +178,10 @@ class ConversationContextBuilder:
             if not tracked or len(tracked) >= len(dialogue):
                 continue
             prev_sys_fp = self._session_system_fp.get(slot_key)
-            if prev_sys_fp is not None and prev_sys_fp != user_system_text:
+            sys_ok, _ = self._system_prompts_compatible(
+                prev_sys_fp, user_system_text, has_tracked_dialogue=len(tracked) >= 2
+            )
+            if not sys_ok:
                 continue
             if self._history_matches(tracked, dialogue[: len(tracked)]):
                 matched.append((len(tracked), slot_key))
@@ -297,7 +355,9 @@ class ConversationContextBuilder:
         # 2) Multi-turn continuation of the SAME local conversation (including tool_result loops!)
         tracked = self._session_turns.get(session_key)
         prev_sys_fp = self._session_system_fp.get(session_key)
-        system_matches = (prev_sys_fp is None) or (prev_sys_fp == user_system_text)
+        system_matches, sys_delta_block = self._system_prompts_compatible(
+            prev_sys_fp, user_system_text, has_tracked_dialogue=bool(tracked and len(tracked) >= 2)
+        )
         if (
             not explicit_new_chat
             and tracked
@@ -308,6 +368,8 @@ class ConversationContextBuilder:
             delta_entries = dialogue[len(tracked) :]
             prev_fp = self._session_tools_fp.get(session_key, "")
             extra_blocks: List[str] = []
+            if sys_delta_block:
+                extra_blocks.append(sys_delta_block)
             if tools_fp and tools_fp != prev_fp and tool_sys_text:
                 extra_blocks.append(tool_sys_text)
             if fmt_sys_text:
@@ -401,10 +463,8 @@ class ConversationContextBuilder:
             s2 = t2.strip()
             if s1 == s2:
                 continue
-            # Allow matching assistant tool_call turns even if a client rewrote tool_call IDs
-            if r1 == "assistant" and "[TOOL_CALL]" in s1 and "[TOOL_CALL]" in s2:
-                if _CALL_ID_IN_CANON_RE.sub("", s1) == _CALL_ID_IN_CANON_RE.sub("", s2):
-                    continue
+            if _canonicalize_for_match(r1, s1) == _canonicalize_for_match(r2, s2):
+                continue
             return False
         return True
 

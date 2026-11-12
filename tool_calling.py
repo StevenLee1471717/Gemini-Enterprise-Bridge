@@ -128,13 +128,43 @@ def build_tool_system_instructions(
     if not is_tool_generation_enabled(tools, tool_choice):
         return ""
 
+    compact_mode = len(tools) > 12
+
+    def _truncate_desc(text: Any, max_len: int) -> str:
+        if not isinstance(text, str):
+            return ""
+        cleaned = " ".join(text.split())
+        if not compact_mode or len(cleaned) <= max_len:
+            return cleaned if compact_mode else text
+        return cleaned[: max_len - 1].rstrip() + "…"
+
+    def _compact_schema(node: Any) -> Any:
+        if not compact_mode or not isinstance(node, dict):
+            return node
+        out: Dict[str, Any] = {}
+        for k, v in node.items():
+            if k == "description" and isinstance(v, str):
+                out[k] = _truncate_desc(v, 120)
+            elif k == "properties" and isinstance(v, dict):
+                out[k] = {pk: _compact_schema(pv) for pk, pv in v.items()}
+            elif k in ("items", "additionalProperties") and isinstance(v, dict):
+                out[k] = _compact_schema(v)
+            elif k in ("anyOf", "oneOf", "allOf") and isinstance(v, list):
+                out[k] = [_compact_schema(item) for item in v]
+            elif k == "$defs" and isinstance(v, dict):
+                out[k] = {dk: _compact_schema(dv) for dk, dv in v.items()}
+            else:
+                out[k] = v
+        return out
+
     tool_specs: List[Dict[str, Any]] = []
     for t in tools:
         fn = t.get("function") or {}
+        raw_params = fn.get("parameters") or {"type": "object", "properties": {}}
         spec: Dict[str, Any] = {
             "name": fn.get("name"),
-            "description": fn.get("description", ""),
-            "parameters": fn.get("parameters") or {"type": "object", "properties": {}},
+            "description": _truncate_desc(fn.get("description", ""), 240),
+            "parameters": _compact_schema(raw_params),
         }
         tool_specs.append(spec)
 

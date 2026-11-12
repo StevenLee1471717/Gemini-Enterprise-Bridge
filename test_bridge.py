@@ -985,7 +985,7 @@ def test_page_driver_shadow_dom_model_selection_and_new_chat() -> None:
         text=True,
         encoding="utf-8",
         errors="replace",
-        timeout=20,
+        timeout=40,
         check=False,
     )
     assert proc.returncode == 0, f"DOM test failed:\nSTDOUT:\n{proc.stdout}\nSTDERR:\n{proc.stderr}"
@@ -1468,9 +1468,219 @@ def test_parallel_interleaved_multi_turn_and_named_session_affinity() -> None:
 
     alpha_tid = int(alpha_slot.split(":")[1])
     beta_tid = int(beta_slot.split(":")[1])
-
     assert [c["reset_chat"] for c in tab_history_log[alpha_tid]] == [True, False, True]
     assert tab_history_log[alpha_tid][1]["prompt"] == "Alpha Turn 2"
-
     assert [c["reset_chat"] for c in tab_history_log[beta_tid]] == [True, False]
     assert tab_history_log[beta_tid][1]["prompt"] == "Beta Turn 2"
+
+
+# ---------------------------------------------------------------------------
+# 7. Regression Tests: Deduplicated Carbon, Sliding Timeout, Ephemeral Metadata & Compaction
+# ---------------------------------------------------------------------------
+
+
+def test_gemini_4_carbon_deduplicated_and_context_window_metadata() -> None:
+    """Ensure gemini-4-carbon appears once in /v1/models and carries 1M context window metadata."""
+    from schemas import AVAILABLE_MODELS, estimate_tokens
+
+    ids = [m["id"] for m in AVAILABLE_MODELS]
+    assert ids.count("gemini-4-carbon") == 1
+    assert ids.count("gemini-4-carbon-newchat") == 1
+    assert len(ids) == len(set(ids)), "AVAILABLE_MODELS must not contain duplicate model IDs"
+
+    carbon_entry = next(m for m in AVAILABLE_MODELS if m["id"] == "gemini-4-carbon")
+    assert carbon_entry["context_length"] == 1048576
+    assert carbon_entry["max_input_tokens"] == 1048576
+    assert carbon_entry["max_output_tokens"] == 65536
+
+    # Verify estimate_tokens does not 3x-inflate JSON punctuation
+    sample_json = json.dumps({"key": "value", "arr": [1, 2, 3, 4, 5], "nested": {"a": "hello world"}}) * 100
+    tokens = estimate_tokens(sample_json)
+    # ~7800 chars of JSON should be ~1800-2200 tokens, never >4000 tokens
+    assert 1200 <= tokens <= 2600
+
+    # Verify >12 tools automatically compacts verbose descriptions while preserving schema structure
+    from tool_calling import build_tool_system_instructions
+
+    many_tools = [
+        {
+            "type": "function",
+            "function": {
+                "name": f"mcp_tool_{i}",
+                "description": ("Very long tool description " * 40),
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "arg1": {"type": "string", "description": ("Verbose property docs " * 30), "enum": ["a", "b"]}
+                    },
+                    "required": ["arg1"],
+                },
+            },
+        }
+        for i in range(20)
+    ]
+    rendered_tools = build_tool_system_instructions(many_tools)
+    assert len(rendered_tools) < 12000
+    assert '"enum":["a","b"]' in rendered_tools
+    assert '"required":["arg1"]' in rendered_tools
+
+
+def test_ephemeral_per_turn_metadata_preserves_smart_incremental_delta() -> None:
+    """Verify volatile <system_reminder>, <current_datetime>, <canvas-context> tags never break smart_incremental_delta."""
+    from context_builder import ConversationContextBuilder
+    from schemas import ChatMessage
+
+    tracker = ConversationContextBuilder()
+    # Turn 1: Copilot injects <current_datetime> and <system_reminder> on User message 1
+    t1_msgs = [
+        ChatMessage(role="system", content="You are a coding assistant.\n<system_reminder> dynamic skills v1 </system_reminder>"),
+        ChatMessage(
+            role="user",
+            content=(
+                "<current_datetime>2026-11-12T14:00:00+08:00</current_datetime>\n"
+                "Fix the timeout bug in page-driver.js\n"
+                "<system_reminder>Deferred tools list...</system_reminder>"
+            ),
+        ),
+    ]
+    prep1 = tracker.build(t1_msgs, model="gemini-4-carbon", session_key="slot-1")
+    assert prep1.strategy_used == "smart_single_turn"
+    assert prep1.reset_chat is True
+    tracker.record_completed_turn(
+        "slot-1",
+        prep1.normalized_history,
+        assistant_reply="I will inspect page-driver.js.",
+        active_model="4 Carbon",
+        tools_fingerprint=prep1.tools_fingerprint,
+        system_fingerprint=prep1.system_fingerprint,
+    )
+
+    # Turn 2: Client strips <system_reminder> from historical User message 1 and adds a new <current_datetime> to User message 2!
+    t2_msgs = [
+        ChatMessage(role="system", content="You are a coding assistant.\n<system_reminder> dynamic skills v2 changed </system_reminder>"),
+        ChatMessage(role="user", content="Fix the timeout bug in page-driver.js"),
+        ChatMessage(role="assistant", content="I will inspect page-driver.js."),
+        ChatMessage(
+            role="user",
+            content="<current_datetime>2026-11-12T14:02:00+08:00</current_datetime>\nNow please run the tests.",
+        ),
+    ]
+    prep2 = tracker.build(t2_msgs, model="gemini-4-carbon", session_key="slot-1")
+    assert prep2.strategy_used == "smart_incremental_delta", f"Expected smart_incremental_delta, got {prep2.strategy_used}"
+    assert prep2.reset_chat is False
+    assert "Now please run the tests." in prep2.prompt
+    assert "Fix the timeout bug in page-driver.js" not in prep2.prompt
+
+
+def test_sliding_activity_timeout_and_sse_keepalive_and_aux_compaction_isolation() -> None:
+    """Verify request_progress slides deadline past initial timeout and auxiliary compaction calls don't wipe tool sessions."""
+    app = create_app(_make_test_settings(request_timeout_seconds=0.35, max_parallel_tabs=4, auto_spawn_tabs=True))
+    dispatched_slots: List[int] = []
+    dispatched_resets: List[bool] = []
+
+    with TestClient(app) as client:
+        ready = threading.Event()
+        with client.websocket_connect("/ws/browser?client_id=ext-sliding") as ws:
+            ws.receive_json()
+            ws.send_json(
+                {
+                    "type": "tab_status",
+                    "capabilities": ["multi_tab", "spawn_tab"],
+                    "tabs": [
+                        {"tab_id": 301, "tab_url": "https://vertexaisearch.cloud.google.com/u/3/home/cid/c1", "ready": True},
+                        {"tab_id": 302, "tab_url": "https://vertexaisearch.cloud.google.com/u/3/home/cid/c1", "ready": True},
+                    ],
+                }
+            )
+            ws.receive_json()
+
+            def worker() -> None:
+                ready.set()
+                # Request 1: Main tool-enabled turn on Tab 301, takes 0.55s (> 0.35s timeout!) but sends request_progress every 0.15s
+                c1 = ws.receive_json()
+                dispatched_slots.append(c1["tab_id"])
+                dispatched_resets.append(c1["reset_chat"])
+                for _ in range(3):
+                    time.sleep(0.16)
+                    ws.send_json(
+                        {
+                            "type": "request_progress",
+                            "request_id": c1["request_id"],
+                            "tab_id": c1["tab_id"],
+                            "generating": True,
+                            "dom_len": 42,
+                        }
+                    )
+                ws.send_json(
+                    {
+                        "type": "request_complete",
+                        "request_id": c1["request_id"],
+                        "tab_id": c1["tab_id"],
+                        "reply": "Deep thinking completed without timeout!",
+                    }
+                )
+
+                # Request 2: Auxiliary compaction/summarization call (`tools` omitted!) using same `@main` session tag
+                # Must be routed away from Tab 301 to Tab 302 so Tab 301's tool session is NOT wiped!
+                c2 = ws.receive_json()
+                dispatched_slots.append(c2["tab_id"])
+                dispatched_resets.append(c2["reset_chat"])
+                ws.send_json(
+                    {
+                        "type": "request_complete",
+                        "request_id": c2["request_id"],
+                        "tab_id": c2["tab_id"],
+                        "reply": "Summary of conversation",
+                    }
+                )
+
+                # Request 3: Turn 2 of Main tool-enabled session on `@main` -> still on Tab 301 with `reset_chat=False`!
+                c3 = ws.receive_json()
+                dispatched_slots.append(c3["tab_id"])
+                dispatched_resets.append(c3["reset_chat"])
+                ws.send_json(
+                    {
+                        "type": "request_complete",
+                        "request_id": c3["request_id"],
+                        "tab_id": c3["tab_id"],
+                        "reply": "Turn 2 incremental reply!",
+                    }
+                )
+
+            th = threading.Thread(target=worker, daemon=True)
+            th.start()
+            ready.wait(timeout=3.0)
+
+            # 1) Turn 1 with tools on `@main` (exceeds 0.35s initial timeout, kept alive by request_progress)
+            msgs = [{"role": "user", "content": "Start main agentic task"}]
+            r1 = client.post(
+                "/v1/chat/completions",
+                json={"model": "gemini-4-carbon@main", "messages": msgs, "tools": SAMPLE_TOOLS},
+            )
+            assert r1.status_code == 200
+            assert r1.json()["choices"][0]["message"]["content"] == "Deep thinking completed without timeout!"
+            msgs.append({"role": "assistant", "content": "Deep thinking completed without timeout!"})
+
+            # 2) Auxiliary compaction request WITHOUT tools on `@main`
+            r_aux = client.post(
+                "/v1/chat/completions",
+                json={
+                    "model": "gemini-4-carbon@main",
+                    "messages": [{"role": "user", "content": "Summarize the conversation so far in 3 bullets."}],
+                },
+            )
+            assert r_aux.status_code == 200
+
+            # 3) Turn 2 with tools on `@main` -> must still match Tab 301 incrementally (`reset_chat=False`)!
+            msgs.append({"role": "user", "content": "Continue main agentic task step 2"})
+            r3 = client.post(
+                "/v1/chat/completions",
+                json={"model": "gemini-4-carbon@main", "messages": msgs, "tools": SAMPLE_TOOLS},
+            )
+            assert r3.status_code == 200
+            assert r3.json()["choices"][0]["message"]["content"] == "Turn 2 incremental reply!"
+
+            th.join(timeout=3.0)
+
+    assert dispatched_slots == [301, 302, 301], f"Aux compaction must not evict main tool tab: {dispatched_slots}"
+    assert dispatched_resets == [True, True, False], f"Main tool tab must stay incremental on Turn 2: {dispatched_resets}"

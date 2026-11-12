@@ -88,12 +88,28 @@
   }
 
   const pendingIsolatedSleep = new Map();
-
+  const pendingBriefActivate = new Map();
   function requestIsolatedSleep(ms) {
     return new Promise((resolve) => {
       const sleepId = "slp-" + Math.random().toString(36).slice(2, 10) + "-" + Date.now();
       pendingIsolatedSleep.set(sleepId, resolve);
       emitToIsolated({ type: "sw_sleep", sleep_id: sleepId, ms });
+    });
+  }
+
+  function requestBriefTabActivation(holdMs = 240) {
+    return new Promise((resolve) => {
+      const reqId = "act-" + Math.random().toString(36).slice(2, 10) + "-" + Date.now();
+      let settled = false;
+      const finish = (val) => {
+        if (settled) return;
+        settled = true;
+        pendingBriefActivate.delete(reqId);
+        resolve(val || { ok: false });
+      };
+      pendingBriefActivate.set(reqId, finish);
+      emitToIsolated({ type: "briefly_activate_tab", req_id: reqId, hold_ms: holdMs });
+      sleep(2000).then(() => finish({ ok: false, timeout: true })).catch(() => {});
     });
   }
 
@@ -608,6 +624,32 @@
     return scored[0].el;
   }
 
+  function readButtonIconAndLabelText(btn) {
+    if (!btn) return "";
+    const parts = [
+      getElementTooltipOrLabel(btn),
+      btn.getAttribute ? btn.getAttribute("data-testid") || "" : "",
+      btn.getAttribute ? btn.getAttribute("data-test-id") || "" : "",
+      btn.getAttribute ? btn.getAttribute("name") || "" : "",
+      btn.getAttribute ? btn.getAttribute("icon") || "" : "",
+      getDeepVisibleText(btn),
+      btn.textContent || ""
+    ];
+    try {
+      const icons = querySelectorAllDeep(
+        "md-icon, mat-icon, .google-symbols, .material-symbols-outlined, .material-icons, svg, [slot=\"icon\"]",
+        btn.shadowRoot || btn
+      );
+      for (const ic of icons) {
+        parts.push(
+          ic.getAttribute ? ic.getAttribute("aria-label") || ic.getAttribute("name") || ic.getAttribute("data-icon") || "" : "",
+          ic.textContent || ""
+        );
+      }
+    } catch (_) {}
+    return parts.filter(Boolean).join(" ");
+  }
+
   function findSendButton(inputEl) {
     if (driverConfig.customSendSelector) {
       const customBtns = querySelectorAllDeep(driverConfig.customSendSelector).filter(
@@ -618,26 +660,28 @@
       }
     }
 
-    const sendHintRe = /\b(send|submit|ask|run|arrow_upward|arrow_forward)\b|发送|提交|提问/i;
-    const excludeHintRe = /attach|upload|mic|voice|audio|stop|clear|reset|copy|more|menu|settings|new chat|上传|语音|停止|清空|新建/i;
+    const sendHintRe =
+      /\b(send|submit|ask|run|arrow_upward|arrow_forward|north|submitting)\b|发送|提交|提问/i;
+    const excludeHintRe =
+      /attach|upload|mic|voice|audio|stop|clear|reset|copy|more|menu|settings|new chat|model|argon|carbon|pro|flash|auto|上传|语音|停止|清空|新建|模型/i;
 
     // Walk up shadow/DOM ancestors near inputEl first so we pick the composer's own button
     let container = inputEl;
-    for (let depth = 0; depth < 8 && container; depth += 1) {
+    for (let depth = 0; depth < 9 && container; depth += 1) {
       const scopeRoot = container.shadowRoot || container;
       const localButtons = querySelectorAllDeep(
-        'button, md-icon-button, md-filled-icon-button, [role="button"]',
+        'button, md-icon-button, md-filled-icon-button, ucs-icon-button, [role="button"]',
         scopeRoot
-      ).filter((btn) => isElementVisible(btn) && !btn.disabled && btn.getAttribute("aria-disabled") !== "true");
+      ).filter(
+        (btn) =>
+          isElementVisible(btn) &&
+          !btn.disabled &&
+          btn.getAttribute("aria-disabled") !== "true" &&
+          !btn.hasAttribute("disabled")
+      );
 
       const matched = localButtons.filter((btn) => {
-        const label = [
-          btn.getAttribute("aria-label") || "",
-          btn.getAttribute("title") || "",
-          btn.getAttribute("mattooltip") || "",
-          btn.getAttribute("data-testid") || "",
-          btn.textContent || ""
-        ].join(" ");
+        const label = readButtonIconAndLabelText(btn);
         if (excludeHintRe.test(label)) {
           return false;
         }
@@ -662,6 +706,18 @@
     return null;
   }
 
+  function readComposerCurrentText(inputEl) {
+    if (!inputEl) return "";
+    const tag = inputEl.tagName ? inputEl.tagName.toUpperCase() : "";
+    if (tag === "TEXTAREA" || tag === "INPUT") {
+      return String(inputEl.value || "").trim();
+    }
+    return (
+      getDeepVisibleText(inputEl).trim() ||
+      String(inputEl.innerText || inputEl.textContent || "").trim()
+    );
+  }
+
   async function fillInputWithPrompt(inputEl, promptText) {
     inputEl.focus();
     await nextAnimationFrame();
@@ -681,7 +737,7 @@
           bubbles: true,
           composed: true,
           inputType: "insertText",
-          data: promptText
+          data: promptText.length > 4000 ? null : promptText
         })
       );
       inputEl.dispatchEvent(new Event("change", { bubbles: true, composed: true }));
@@ -694,9 +750,8 @@
         document.visibilityState === "hidden" ||
         (typeof document.hasFocus === "function" && !document.hasFocus())
     );
-
-    const readEditorText = () =>
-      getDeepVisibleText(inputEl).trim() || (inputEl.innerText || inputEl.textContent || "").trim();
+    const isLargePrompt = promptText.length > 3000;
+    const readEditorText = () => readComposerCurrentText(inputEl);
 
     let insertedCleanly = false;
 
@@ -711,8 +766,9 @@
       } catch (_) {}
     }
 
-    // Strategy 1: Native `execCommand("insertText")` when focused
-    if (!isHiddenOrUnfocused) {
+    // Strategy 1: Native `execCommand("insertText")` only for short/medium prompts when focused
+    // (For >3000 chars, execCommand synchronously lays out every line in ProseMirror and freezes the tab!)
+    if (!isHiddenOrUnfocused && !isLargePrompt) {
       try {
         inputEl.dispatchEvent(
           new InputEvent("beforeinput", {
@@ -730,8 +786,12 @@
     }
 
     // Strategy 2: Synthetic plain-text `ClipboardEvent("paste")` + `InputEvent`
-    // ProseMirror handles `paste` with `text/plain` natively in memory even when tab is hidden!
-    if ((!insertedCleanly || (promptText.trim() && !readEditorText())) && typeof DataTransfer === "function" && typeof ClipboardEvent === "function") {
+    // ProseMirror handles `paste` with `text/plain` natively in memory in a single transaction!
+    if (
+      (!insertedCleanly || (promptText.trim() && !readEditorText())) &&
+      typeof DataTransfer === "function" &&
+      typeof ClipboardEvent === "function"
+    ) {
       try {
         const dt = new DataTransfer();
         dt.setData("text/plain", promptText);
@@ -749,13 +809,13 @@
       } catch (_) {}
     }
 
-    // Strategy 3: Safe `replaceChildren` + `cloneNode` / `textContent` paragraph nodes + `InputEvent`
+    // Strategy 3: Safe `replaceChildren` + `cloneNode` / `textContent` batched paragraph nodes + `InputEvent`
     if (!insertedCleanly || (promptText.trim() && !readEditorText())) {
       const frag = document.createDocumentFragment
         ? document.createDocumentFragment()
         : null;
       const lines = promptText.split("\n");
-      const batchSize = lines.length > 160 ? 64 : 1;
+      const batchSize = lines.length > 48 ? Math.max(64, Math.ceil(lines.length / 24)) : 1;
       const protoP = document.createElement("p");
 
       if (typeof inputEl.replaceChildren === "function") {
@@ -765,10 +825,13 @@
           inputEl.removeChild(inputEl.firstChild);
         }
       }
-      const targetContainer = frag || inputEl;
 
+      const targetContainer = frag || inputEl;
       for (let idx = 0; idx < lines.length; idx += batchSize) {
-        const p = typeof protoP.cloneNode === "function" ? protoP.cloneNode(false) : document.createElement("p");
+        const p =
+          typeof protoP.cloneNode === "function"
+            ? protoP.cloneNode(false)
+            : document.createElement("p");
         const sliceText =
           batchSize === 1 ? lines[idx] : lines.slice(idx, idx + batchSize).join("\n");
         if (sliceText) {
@@ -778,18 +841,18 @@
         }
         targetContainer.appendChild(p);
       }
-
       if (frag) {
         inputEl.appendChild(frag);
       }
 
+      const eventData = promptText.length > 4000 ? null : promptText;
       inputEl.dispatchEvent(
         new InputEvent("beforeinput", {
           bubbles: true,
           composed: true,
           cancelable: true,
           inputType: "insertText",
-          data: promptText
+          data: eventData
         })
       );
       inputEl.dispatchEvent(
@@ -797,24 +860,14 @@
           bubbles: true,
           composed: true,
           inputType: "insertText",
-          data: promptText
+          data: eventData
         })
       );
       inputEl.dispatchEvent(new Event("change", { bubbles: true, composed: true }));
     }
   }
 
-  async function submitComposer(inputEl) {
-    // Allow Lit/Angular/ProseMirror reactive cycle to enable the Send button
-    await nextAnimationFrame();
-    await sleep(90);
-
-    const sendBtn = findSendButton(inputEl);
-    if (sendBtn) {
-      sendBtn.click();
-      return "button_click";
-    }
-
+  function dispatchEnterKeySequence(targetEl) {
     const enterOpts = {
       key: "Enter",
       code: "Enter",
@@ -824,10 +877,114 @@
       composed: true,
       cancelable: true
     };
-    inputEl.dispatchEvent(new KeyboardEvent("keydown", enterOpts));
-    inputEl.dispatchEvent(new KeyboardEvent("keypress", enterOpts));
-    inputEl.dispatchEvent(new KeyboardEvent("keyup", enterOpts));
+    targetEl.dispatchEvent(new KeyboardEvent("keydown", enterOpts));
+    targetEl.dispatchEvent(new KeyboardEvent("keypress", enterOpts));
+    targetEl.dispatchEvent(new KeyboardEvent("keyup", enterOpts));
+  }
+
+  async function submitComposer(inputEl) {
+    // Allow Lit/Angular/ProseMirror reactive cycle to enable the Send button
+    await nextAnimationFrame();
+    let sendBtn = null;
+    for (let waitIdx = 0; waitIdx < 12; waitIdx += 1) {
+      sendBtn = findSendButton(inputEl);
+      if (sendBtn) break;
+      await sleep(80);
+    }
+
+    if (sendBtn) {
+      sendBtn.click();
+      return "button_click";
+    }
+
+    dispatchEnterKeySequence(inputEl);
     return "enter_keypress";
+  }
+
+  async function submitComposerWithVerification(inputEl, promptText, job = null, baselineCount = 0) {
+    const promptTrimLen = String(promptText || "").trim().length;
+    const hasSubmissionStarted = () => {
+      if (job && (job.networkText.length > 0 || job.networkDone)) return true;
+      if (isPageStillGenerating()) return true;
+      if (collectAssistantReplyTexts().length > baselineCount) return true;
+      const curText = readComposerCurrentText(inputEl);
+      if (curText.length === 0) return true;
+      if (promptTrimLen > 10 && curText.length < Math.min(20, promptTrimLen * 0.2)) return true;
+      return false;
+    };
+
+    // Wait up to ~1s for Lit/ProseMirror reactive state to enable the Send button
+    await nextAnimationFrame();
+    let sendBtn = null;
+    for (let i = 0; i < 12; i += 1) {
+      sendBtn = findSendButton(inputEl);
+      if (sendBtn) break;
+      await sleep(80);
+    }
+
+    // Step A: Primary click or Enter keydown
+    let method = "enter_keypress";
+    if (sendBtn) {
+      sendBtn.click();
+      method = "button_click";
+    } else {
+      dispatchEnterKeySequence(inputEl);
+    }
+
+    for (let i = 0; i < 6; i += 1) {
+      await sleep(90);
+      if (hasSubmissionStarted()) {
+        return method;
+      }
+    }
+
+    // Step B: Realistic pointer/mouse click sequence + form requestSubmit + Enter keydown
+    sendBtn = findSendButton(inputEl) || sendBtn;
+    if (sendBtn) {
+      dispatchRealisticClick(sendBtn);
+      method = "realistic_button_click";
+    }
+    try {
+      const form = inputEl.closest ? inputEl.closest("form") : null;
+      if (form && typeof form.requestSubmit === "function") {
+        form.requestSubmit();
+      }
+    } catch (_) {}
+    dispatchEnterKeySequence(inputEl);
+
+    for (let i = 0; i < 7; i += 1) {
+      await sleep(95);
+      if (hasSubmissionStarted()) {
+        return method;
+      }
+    }
+
+    // Step C: Background / parallel tab self-heal via brief mutex-guarded tab activation
+    logDriver("warn", "检测到后台/并行标签页首次提交未触发，正在短暂激活标签页以完成发送...");
+    await requestBriefTabActivation(240);
+    await sleep(180);
+
+    const activeInput = findComposerInput() || inputEl;
+    if (!readComposerCurrentText(activeInput) && !hasSubmissionStarted()) {
+      await fillInputWithPrompt(activeInput, promptText);
+      await sleep(100);
+    }
+    const healedBtn = findSendButton(activeInput);
+    if (healedBtn) {
+      dispatchRealisticClick(healedBtn);
+      method = "tab_activated_button_click";
+    } else {
+      dispatchEnterKeySequence(activeInput);
+      method = "tab_activated_enter";
+    }
+
+    for (let i = 0; i < 8; i += 1) {
+      await sleep(100);
+      if (hasSubmissionStarted()) {
+        break;
+      }
+    }
+    return method;
   }
 
   // =========================================================================
@@ -1854,23 +2011,20 @@
   }
 
   function isPageStillGenerating() {
-    const stopBtns = querySelectorAllDeep('button, md-icon-button, [role="button"]').filter(
-      (btn) => {
-        if (!isElementVisible(btn)) return false;
-        const label = [
-          btn.getAttribute("aria-label") || "",
-          btn.getAttribute("title") || "",
-          btn.textContent || ""
-        ].join(" ");
-        return /\b(stop generating|stop response|cancel generation)\b|停止生成|停止回答/i.test(label);
-      }
-    );
+    const stopBtns = querySelectorAllDeep(
+      'button, md-icon-button, md-filled-icon-button, ucs-icon-button, [role="button"]'
+    ).filter((btn) => {
+      if (!isElementVisible(btn)) return false;
+      const label = readButtonIconAndLabelText(btn);
+      return /\b(stop generating|stop response|cancel generation|stop_circle|stop_generating|^stop$)\b|停止生成|停止回答|停止/i.test(
+        label.trim()
+      );
+    });
     if (stopBtns.length > 0) {
       return true;
     }
-
     const spinners = querySelectorAllDeep(
-      'md-circular-progress, mat-progress-spinner, mat-spinner, [aria-busy="true"]'
+      'md-circular-progress, mat-progress-spinner, mat-spinner, ucs-thinking, ucs-thought, [aria-busy="true"]'
     ).filter(isElementVisible);
     return spinners.length > 0;
   }
@@ -1991,6 +2145,8 @@
       resolveNetworkComplete = resolve;
     });
 
+    let lastActivityAt = Date.now();
+    let lastProgressSentAt = 0;
     const job = {
       requestId,
       cancelled: false,
@@ -2000,6 +2156,7 @@
       onNetworkDelta(delta) {
         if (job.cancelled || !delta) return;
         usingNetworkStream = true;
+        lastActivityAt = Date.now();
         emitToIsolated({
           type: "stream_chunk",
           request_id: requestId,
@@ -2007,6 +2164,7 @@
         });
       },
       onNetworkDone() {
+        lastActivityAt = Date.now();
         resolveNetworkComplete(true);
       }
     };
@@ -2070,16 +2228,27 @@
       const baselineLastText = baselineCount > 0 ? baselineReplies[baselineCount - 1] : "";
 
       await fillInputWithPrompt(inputEl, prompt);
-      const sendMethod = await submitComposer(inputEl);
+      const sendMethod = await submitComposerWithVerification(
+        inputEl,
+        prompt,
+        job,
+        baselineCount
+      );
       logDriver("info", `已提交问题 (${sendMethod}, len=${prompt.length})，等待响应流...`);
 
       const startedAt = Date.now();
-      const maxWait = timeoutMs || 180000;
+      lastActivityAt = Date.now();
+      const idleTimeoutMs = Math.max(Number(timeoutMs) || 600000, 180000);
+      const hardCapMs = 45 * 60 * 1000;
       let latestDomCandidate = "";
       let lastDomChangeAt = Date.now();
       let sawDomGrowth = false;
 
-      while (!job.cancelled && Date.now() - startedAt < maxWait) {
+      while (
+        !job.cancelled &&
+        Date.now() - lastActivityAt < idleTimeoutMs &&
+        Date.now() - startedAt < hardCapMs
+      ) {
         // Fast path: if passive network stream sniffer captured and completed the RPC!
         if (driverConfig.driverMode !== "dom" && job.networkDone && job.networkText.trim()) {
           emitRequestComplete({
@@ -2097,6 +2266,7 @@
 
         // Wait a short tick or immediate network completion
         await Promise.race([networkCompletePromise, sleep(220)]);
+
         if (driverConfig.driverMode !== "dom" && job.networkDone && job.networkText.trim()) {
           emitRequestComplete({
             type: "request_complete",
@@ -2114,7 +2284,6 @@
         // Inspect Shadow DOM assistant messages
         const currentReplies = collectAssistantReplyTexts();
         let candidate = "";
-
         if (currentReplies.length > baselineCount) {
           candidate = currentReplies.slice(baselineCount).join("\n\n").trim();
         } else if (currentReplies.length > 0) {
@@ -2127,7 +2296,7 @@
         if (candidate && candidate !== latestDomCandidate) {
           sawDomGrowth = true;
           lastDomChangeAt = Date.now();
-
+          lastActivityAt = Date.now();
           if (!usingNetworkStream && candidate.length > domEmittedLen) {
             if (candidate.startsWith(latestDomCandidate)) {
               const delta = candidate.slice(domEmittedLen);
@@ -2145,6 +2314,22 @@
         }
 
         const generating = isPageStillGenerating();
+        if (generating) {
+          lastActivityAt = Date.now();
+        }
+        if (
+          (generating || sawDomGrowth || job.networkText.length > 0) &&
+          Date.now() - lastProgressSentAt >= 8000
+        ) {
+          lastProgressSentAt = Date.now();
+          emitToIsolated({
+            type: "request_progress",
+            request_id: requestId,
+            generating: Boolean(generating),
+            dom_len: latestDomCandidate.length,
+            net_len: job.networkText.length
+          });
+        }
         const idleMs = Date.now() - lastDomChangeAt;
 
         if (sawDomGrowth && latestDomCandidate && !generating && idleMs >= 1500) {
@@ -2263,6 +2448,16 @@
       return;
     }
 
+    if (action === "briefly_activate_tab_done") {
+      const key = payload.req_id || payload.activate_id;
+      const resolver = pendingBriefActivate.get(key);
+      if (resolver) {
+        pendingBriefActivate.delete(key);
+        resolver(payload);
+      }
+      return;
+    }
+
     if (action === "configure") {
       if (payload.driverMode) driverConfig.driverMode = payload.driverMode;
       if (payload.customModelSelector !== undefined) {
@@ -2351,6 +2546,8 @@
     findSendButton,
     fillInputWithPrompt,
     submitComposer,
+    submitComposerWithVerification,
+    isPageStillGenerating,
     findNewChatButton,
     triggerNewChatSession,
     findModelSelectorTrigger,

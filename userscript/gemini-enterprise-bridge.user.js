@@ -404,8 +404,9 @@
         inputEl.dispatchEvent(new InputEvent("input", { bubbles: true, composed: true }));
       } else {
         const isHidden = Boolean(document.hidden || document.visibilityState === "hidden");
+        const isLargePrompt = prompt.length > 3000;
         let inserted = false;
-        if (!isHidden) {
+        if (!isHidden && !isLargePrompt) {
           const sel = window.getSelection();
           const range = document.createRange();
           range.selectNodeContents(inputEl);
@@ -422,7 +423,7 @@
           }
           const frag = document.createDocumentFragment();
           const lines = prompt.split("\n");
-          const step = lines.length > 160 ? 64 : 1;
+          const step = isLargePrompt || lines.length > 48 ? Math.max(64, Math.ceil(lines.length / 24)) : 1;
           for (let idx = 0; idx < lines.length; idx += step) {
             const p = document.createElement("p");
             const txt = step === 1 ? lines[idx] : lines.slice(idx, idx + step).join("\n");
@@ -431,16 +432,27 @@
             frag.appendChild(p);
           }
           inputEl.appendChild(frag);
-          inputEl.dispatchEvent(new InputEvent("beforeinput", { bubbles: true, composed: true, inputType: "insertText", data: prompt }));
-          inputEl.dispatchEvent(new InputEvent("input", { bubbles: true, composed: true, inputType: "insertText", data: prompt }));
+          const evData = prompt.length > 4000 ? null : prompt;
+          inputEl.dispatchEvent(new InputEvent("beforeinput", { bubbles: true, composed: true, inputType: "insertText", data: evData }));
+          inputEl.dispatchEvent(new InputEvent("input", { bubbles: true, composed: true, inputType: "insertText", data: evData }));
         }
       }
 
-      await sleep(100);
-      const sendBtns = queryDeep('button, md-icon-button, [role="button"]').filter((b) => {
-        if (!visible(b) || b.disabled) return false;
-        const lbl = (b.getAttribute("aria-label") || b.textContent || "").toLowerCase();
-        return /\b(send|submit|arrow_upward)\b|发送|提交/.test(lbl);
+      await sleep(120);
+
+      function readBtnLabel(b) {
+        const parts = [b.getAttribute("aria-label") || "", b.getAttribute("title") || "", b.textContent || ""];
+        queryDeep("md-icon, mat-icon, .google-symbols, .material-symbols-outlined, svg", b.shadowRoot || b).forEach((ic) => {
+          parts.push(ic.getAttribute("aria-label") || "", ic.getAttribute("fontIcon") || "", ic.textContent || "");
+        });
+        return parts.join(" ").toLowerCase();
+      }
+
+      const sendBtns = queryDeep('button, md-icon-button, md-filled-icon-button, ucs-icon-button, [role="button"]').filter((b) => {
+        if (!visible(b) || b.disabled || b.getAttribute("aria-disabled") === "true") return false;
+        const lbl = readBtnLabel(b);
+        if (/\b(argon|carbon|pro|flash|auto|model)\b/.test(lbl)) return false;
+        return /\b(send|submit|ask|run|arrow_upward|arrow_forward|north|submitting)\b|发送|提交/.test(lbl);
       });
       if (sendBtns.length) {
         sendBtns[sendBtns.length - 1].click();
@@ -456,14 +468,42 @@
         );
       }
 
+      function isUserscriptGenerating() {
+        const btns = queryDeep('button, md-icon-button, ucs-icon-button, [role="button"]').filter(visible);
+        for (const b of btns) {
+          if (/\b(stop|stop_circle|stop_generating|cancel)\b|停止生成|停止回答/.test(readBtnLabel(b))) {
+            return true;
+          }
+        }
+        const spinners = queryDeep(
+          'ucs-thinking, ucs-thought, [class*="thinking" i], md-circular-progress, mat-progress-spinner, [aria-busy="true"]'
+        ).filter(visible);
+        return spinners.length > 0;
+      }
+
       let lastDom = "";
+      let lastNetLen = 0;
       let emitted = 0;
       let stableSince = Date.now();
-      const deadline = Date.now() + (cmd.timeout_ms || 180000);
+      const startedAt = Date.now();
+      let lastActivityAt = startedAt;
+      let lastProgressSentAt = 0;
+      const idleTimeoutMs = Math.max(Number(cmd.timeout_ms) || 600000, 180000);
+      const maxTotalRuntimeMs = Math.max(idleTimeoutMs * 4, 2700000);
 
-      while (!job.cancelled && Date.now() < deadline) {
+      while (!job.cancelled) {
         await sleep(250);
-        if (job.networkDone && job.networkText.trim()) {
+        const now = Date.now();
+        const stillGen = isUserscriptGenerating();
+        if (job.networkText.length > lastNetLen) {
+          lastNetLen = job.networkText.length;
+          lastActivityAt = now;
+          stableSince = now;
+        }
+        if (stillGen) {
+          lastActivityAt = now;
+        }
+        if (job.networkDone && job.networkText.trim() && !stillGen) {
           await sendBridgeEvent("request_complete", {
             request_id: requestId,
             reply: job.networkText,
@@ -484,8 +524,9 @@
               emitted = txt.length;
             }
             lastDom = txt;
-            stableSince = Date.now();
-          } else if (txt && Date.now() - stableSince > 1600) {
+            stableSince = now;
+            lastActivityAt = now;
+          } else if (txt && !stillGen && now - stableSince > 1600) {
             await sendBridgeEvent("request_complete", {
               request_id: requestId,
               reply: job.networkText || txt,
@@ -494,6 +535,18 @@
             });
             return;
           }
+        }
+        if ((stillGen || now - lastActivityAt < 2500) && now - lastProgressSentAt >= 8000) {
+          lastProgressSentAt = now;
+          void sendBridgeEvent("request_progress", {
+            request_id: requestId,
+            generating: true,
+            dom_len: lastDom.length,
+            net_len: job.networkText.length
+          });
+        }
+        if (now - lastActivityAt >= idleTimeoutMs || now - startedAt >= maxTotalRuntimeMs) {
+          break;
         }
       }
       throw new Error("等待网页回复超时");

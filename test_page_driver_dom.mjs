@@ -717,5 +717,63 @@ const largeCompleteEv = emittedEvents.find(
 assert.ok(largeCompleteEv, "140KB+ chunked reply must complete cleanly");
 assert.equal(largeCompleteEv.reply, expectedLargeReply, "138KB tool argument must arrive with 0 bytes truncated");
 
+// Test 8: Background tab send-button self-heal (`GEB_BRIEFLY_ACTIVATE_TAB`) when initial synthetic clicks are ignored while hidden!
+let activateTabRequests = 0;
+let ignoreClicksUntilActivated = true;
+const origPostMessage = sandbox.window.postMessage;
+sandbox.window.postMessage = (msg) => {
+  if (msg && msg.channel === "GEB_MAIN_TO_ISOLATED" && msg.payload && msg.payload.type === "briefly_activate_tab") {
+    activateTabRequests += 1;
+    ignoreClicksUntilActivated = false;
+    realSetTimeout(() => {
+      doc.dispatchEvent(
+        Object.assign(new MockEvent("message"), {
+          source: vmWindow,
+          origin: mockLocation.origin,
+          data: {
+            channel: "GEB_ISOLATED_TO_MAIN",
+            action: "briefly_activate_tab_done",
+            payload: { req_id: msg.payload.req_id, ok: true }
+          }
+        })
+      );
+    }, 10);
+    return;
+  }
+  origPostMessage(msg);
+};
+
+// Replace sendBtn click listener temporarily so first clicks while `ignoreClicksUntilActivated === true` do NOT clear composer or emit reply
+const savedSendListeners = sendBtn._listeners.get("click") || [];
+sendBtn._listeners.set("click", [
+  () => {
+    if (ignoreClicksUntilActivated) {
+      // Simulate frozen background ProseMirror ignoring synthetic click!
+      return;
+    }
+    const submittedText = (proseMirror.innerText || proseMirror.textContent || "").trim();
+    proseMirror.replaceChildren();
+    proseMirror._text = "";
+    const replyNode = new MockElement("ucs-markdown", { text: `Self-healed reply: ${submittedText}` });
+    chatShadow.appendChild(replyNode);
+  }
+]);
+
+await api.executePromptJob({
+  request_id: "req-self-heal-send",
+  prompt: "Prompt needing background tab self-heal",
+  target_model: null,
+  reset_chat: false,
+  timeout_ms: 6000
+});
+
+assert.ok(activateTabRequests >= 1, "Must request GEB_BRIEFLY_ACTIVATE_TAB when background click did not start submission");
+const healedEv = emittedEvents.find(
+  (e) => e.type === "request_complete" && e.request_id === "req-self-heal-send"
+);
+assert.ok(healedEv, "Must complete prompt after background tab self-heal");
+assert.equal(healedEv.reply, "Self-healed reply: Prompt needing background tab self-heal");
+sendBtn._listeners.set("click", savedSendListeners);
+
 console.log("ALL_SHADOW_DOM_DRIVER_TESTS_PASSED");
 process.exit(0);

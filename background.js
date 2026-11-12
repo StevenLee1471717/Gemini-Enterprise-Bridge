@@ -7,7 +7,7 @@ const DEFAULT_SETTINGS = {
   enabled: true,
   driverMode: "auto", // auto | dom | replay
   autoSpawnTabs: true,
-  maxParallelTabs: 4,
+  maxParallelTabs: 6,
   customModelSelector: "",
   customInputSelector: "",
   customSendSelector: "",
@@ -477,7 +477,7 @@ async function prepareTabForBackgroundExecution(tab) {
 async function spawnParallelWorkerTab(baseUrlHint = "") {
   const allVertexTabs = await chrome.tabs.query({ url: VERTEX_MATCH_PATTERN });
   const settings = await getSettings();
-  const maxTabs = Math.max(1, Number(settings.maxParallelTabs) || 4);
+  const maxTabs = Math.max(1, Number(settings.maxParallelTabs) || 6);
   if (allVertexTabs.length >= maxTabs) {
     throw new Error(`已达到最大并行标签页上限 (${maxTabs})`);
   }
@@ -767,7 +767,7 @@ async function handleBackendCommand(msg) {
           callback_url: callbackUrl,
           target_model: msg.target_model || null,
           reset_chat: remainingResetChat,
-          timeout_ms: msg.timeout_ms || 180000,
+          timeout_ms: msg.timeout_ms || 600000,
           driver_config: {
             driverMode: settings.driverMode,
             customModelSelector: settings.customModelSelector,
@@ -786,7 +786,7 @@ async function handleBackendCommand(msg) {
           callback_url: callbackUrl,
           target_model: msg.target_model || null,
           reset_chat: remainingResetChat,
-          timeout_ms: msg.timeout_ms || 180000,
+          timeout_ms: msg.timeout_ms || 600000,
           driver_config: {
             driverMode: settings.driverMode,
             customModelSelector: settings.customModelSelector,
@@ -890,6 +890,14 @@ chrome.runtime.onConnect.addListener((port) => {
   });
 });
 
+let tabActivationMutex = Promise.resolve();
+
+function withTabActivationLock(fn) {
+  const next = tabActivationMutex.then(fn, fn);
+  tabActivationMutex = next.catch(() => {});
+  return next;
+}
+
 chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   const msgType = message && message.type ? message.type : "";
 
@@ -899,6 +907,42 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     setTimeout(() => {
       sendResponse({ ok: true });
     }, delay);
+    return true;
+  }
+
+  // Mutex-guarded brief tab activation within the Chrome window (never focuses the OS window!)
+  // so background/parallel tabs whose ProseMirror/Lit submit ignored synthetic events can self-heal.
+  if (msgType === "GEB_BRIEFLY_ACTIVATE_TAB") {
+    const targetTabId = (sender && sender.tab && sender.tab.id) || message.tab_id;
+    const holdMs = Math.max(120, Math.min(Number(message.hold_ms) || 240, 1500));
+    const restoreDelayMs = Math.max(300, Math.min(Number(message.restore_delay_ms) || 650, 2500));
+    if (!targetTabId) {
+      sendResponse({ ok: false, error: "missing_tab_id" });
+      return false;
+    }
+    void withTabActivationLock(async () => {
+      let prevActiveId = null;
+      try {
+        const targetTab = await chrome.tabs.get(targetTabId);
+        if (targetTab && targetTab.windowId !== undefined) {
+          const activeInWin = await chrome.tabs.query({ active: true, windowId: targetTab.windowId });
+          if (activeInWin.length > 0 && activeInWin[0].id !== targetTabId) {
+            prevActiveId = activeInWin[0].id;
+          }
+        }
+        await chrome.tabs.update(targetTabId, { active: true });
+        await new Promise((r) => setTimeout(r, holdMs));
+        sendResponse({ ok: true, activated_tab_id: targetTabId, previous_tab_id: prevActiveId });
+        if (message.restore_previous !== false && prevActiveId) {
+          await new Promise((r) => setTimeout(r, restoreDelayMs));
+          try {
+            await chrome.tabs.update(prevActiveId, { active: true });
+          } catch (_) {}
+        }
+      } catch (err) {
+        sendResponse({ ok: false, error: err && err.message ? err.message : String(err) });
+      }
+    });
     return true;
   }
 

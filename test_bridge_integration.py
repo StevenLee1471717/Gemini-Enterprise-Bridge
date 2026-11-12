@@ -511,6 +511,7 @@ def test_full_chain_client_server_extension_dom_integration(tmp_path: Path) -> N
 
             # Step 1: Large (>35KB) chunked tool request + `4argon` + automatic new-chat reset
             msgs: List[Dict[str, Any]] = [
+                {"role": "system", "content": "Enterprise OKR Context:\n" + ("Departmental OKR baseline record; " * 650)},
                 {"role": "user", "content": "请查询 Q4 OKR 进展"},
             ]
             r1 = client.post(

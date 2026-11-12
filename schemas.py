@@ -214,13 +214,12 @@ _WORD_RE = re.compile(r"[A-Za-z0-9_]+|[^\sA-Za-z0-9_\u3400-\u9fff\uf900-\ufaff]"
 
 
 def estimate_tokens(text: str) -> int:
-    """Lightweight token count approximation for OpenAI usage fields."""
+    """Character-based token count approximation without JSON punctuation inflation."""
     if not text:
         return 0
     cjk_count = len(_CJK_RE.findall(text))
-    non_cjk = _CJK_RE.sub(" ", text)
-    word_pieces = len(_WORD_RE.findall(non_cjk))
-    return max(1, int(cjk_count * 1.3 + word_pieces * 1.15))
+    non_cjk = _CJK_RE.sub("", text)
+    return max(1, int(cjk_count * 0.65 + len(non_cjk) / 4.2))
 
 
 def build_usage(prompt_text: str, completion_text: str) -> Dict[str, int]:
@@ -473,6 +472,9 @@ AVAILABLE_MODELS: List[Dict[str, Any]] = [
         "created": 1735689600,
         "owned_by": "google-enterprise-bridge",
         "description": "Gemini Enterprise / Agentspace (keep currently selected web model)",
+        "context_length": 1048576,
+        "max_input_tokens": 1048576,
+        "max_output_tokens": 65536,
     },
     {
         "id": "gemini-enterprise-web-newchat",
@@ -480,6 +482,9 @@ AVAILABLE_MODELS: List[Dict[str, Any]] = [
         "created": 1735689600,
         "owned_by": "google-enterprise-bridge",
         "description": "Start a fresh web chat session using the currently selected web model",
+        "context_length": 1048576,
+        "max_input_tokens": 1048576,
+        "max_output_tokens": 65536,
     },
     {
         "id": "gemini-3.1-pro",
@@ -487,6 +492,9 @@ AVAILABLE_MODELS: List[Dict[str, Any]] = [
         "created": 1735689600,
         "owned_by": "google-enterprise-bridge",
         "description": "Auto-select Gemini 3.1 Pro in Gemini Enterprise web UI (aliases: 3.1pro, 3.1-pro)",
+        "context_length": 1048576,
+        "max_input_tokens": 1048576,
+        "max_output_tokens": 65536,
     },
     {
         "id": "gemini-3.1-pro-newchat",
@@ -494,6 +502,9 @@ AVAILABLE_MODELS: List[Dict[str, Any]] = [
         "created": 1735689600,
         "owned_by": "google-enterprise-bridge",
         "description": "Start a fresh web chat session and select Gemini 3.1 Pro",
+        "context_length": 1048576,
+        "max_input_tokens": 1048576,
+        "max_output_tokens": 65536,
     },
     {
         "id": "gemini-4-argon",
@@ -501,6 +512,9 @@ AVAILABLE_MODELS: List[Dict[str, Any]] = [
         "created": 1735689600,
         "owned_by": "google-enterprise-bridge",
         "description": "Auto-select Gemini 4 Argon in Gemini Enterprise web UI (aliases: 4argon, 4-argon)",
+        "context_length": 1048576,
+        "max_input_tokens": 1048576,
+        "max_output_tokens": 65536,
     },
     {
         "id": "gemini-4-argon-newchat",
@@ -508,6 +522,9 @@ AVAILABLE_MODELS: List[Dict[str, Any]] = [
         "created": 1735689600,
         "owned_by": "google-enterprise-bridge",
         "description": "Start a fresh web chat session and select Gemini 4 Argon",
+        "context_length": 1048576,
+        "max_input_tokens": 1048576,
+        "max_output_tokens": 65536,
     },
     {
         "id": "gemini-4-carbon",
@@ -515,6 +532,9 @@ AVAILABLE_MODELS: List[Dict[str, Any]] = [
         "created": 1735689600,
         "owned_by": "google-enterprise-bridge",
         "description": "Auto-select Gemini 4 Carbon in Gemini Enterprise web UI (aliases: 4carbon, 4-carbon)",
+        "context_length": 1048576,
+        "max_input_tokens": 1048576,
+        "max_output_tokens": 65536,
     },
     {
         "id": "gemini-4-carbon-newchat",
@@ -522,6 +542,9 @@ AVAILABLE_MODELS: List[Dict[str, Any]] = [
         "created": 1735689600,
         "owned_by": "google-enterprise-bridge",
         "description": "Start a fresh web chat session and select Gemini 4 Carbon",
+        "context_length": 1048576,
+        "max_input_tokens": 1048576,
+        "max_output_tokens": 65536,
     },
     {
         "id": "gemini-3.8-flash",
@@ -529,6 +552,9 @@ AVAILABLE_MODELS: List[Dict[str, Any]] = [
         "created": 1735689600,
         "owned_by": "google-enterprise-bridge",
         "description": "Auto-select Gemini 3.8 Flash in Gemini Enterprise web UI (aliases: 3.8flash, 3.8-flash)",
+        "context_length": 1048576,
+        "max_input_tokens": 1048576,
+        "max_output_tokens": 65536,
     },
     {
         "id": "gemini-3.8-flash-newchat",
@@ -536,6 +562,9 @@ AVAILABLE_MODELS: List[Dict[str, Any]] = [
         "created": 1735689600,
         "owned_by": "google-enterprise-bridge",
         "description": "Start a fresh web chat session and select Gemini 3.8 Flash",
+        "context_length": 1048576,
+        "max_input_tokens": 1048576,
+        "max_output_tokens": 65536,
     },
     {
         "id": "gemini-2.5-pro",
@@ -543,6 +572,9 @@ AVAILABLE_MODELS: List[Dict[str, Any]] = [
         "created": 1735689600,
         "owned_by": "google-enterprise-bridge",
         "description": "Auto-select Gemini 2.5 Pro in Gemini Enterprise web UI (aliases: 2.5pro, 2.5-pro)",
+        "context_length": 1048576,
+        "max_input_tokens": 1048576,
+        "max_output_tokens": 65536,
     },
     {
         "id": "gemini-2.5-pro-newchat",
@@ -550,6 +582,9 @@ AVAILABLE_MODELS: List[Dict[str, Any]] = [
         "created": 1735689600,
         "owned_by": "google-enterprise-bridge",
         "description": "Start a fresh web chat session and select Gemini 2.5 Pro",
+        "context_length": 1048576,
+        "max_input_tokens": 1048576,
+        "max_output_tokens": 65536,
     },
     {
         "id": "gemini-2.5-flash",
@@ -557,6 +592,9 @@ AVAILABLE_MODELS: List[Dict[str, Any]] = [
         "created": 1735689600,
         "owned_by": "google-enterprise-bridge",
         "description": "Auto-select Gemini 2.5 Flash in Gemini Enterprise web UI (aliases: 2.5flash, 2.5-flash)",
+        "context_length": 1048576,
+        "max_input_tokens": 1048576,
+        "max_output_tokens": 65536,
     },
     {
         "id": "gemini-2.5-flash-newchat",
@@ -564,6 +602,9 @@ AVAILABLE_MODELS: List[Dict[str, Any]] = [
         "created": 1735689600,
         "owned_by": "google-enterprise-bridge",
         "description": "Start a fresh web chat session and select Gemini 2.5 Flash",
+        "context_length": 1048576,
+        "max_input_tokens": 1048576,
+        "max_output_tokens": 65536,
     },
     {
         "id": "gemini-enterprise-gcloud",
@@ -571,5 +612,8 @@ AVAILABLE_MODELS: List[Dict[str, Any]] = [
         "created": 1735689600,
         "owned_by": "google-cloud-official",
         "description": "Official Google Cloud Vertex AI / Discovery Engine API via local gcloud ADC",
+        "context_length": 1048576,
+        "max_input_tokens": 1048576,
+        "max_output_tokens": 65536,
     },
 ]

@@ -346,6 +346,8 @@ def create_app(settings: Optional[BridgeSettings] = None) -> FastAPI:
         suppress_citations = tools_active or json_mode_active
 
         # ---------------- Option 1: Official GCloud Upstream ----------------
+        prompt_for_usage = "\n".join(m.text_content() for m in request.messages)
+
         if upstream == "gcloud":
             if not gcloud.is_configured():
                 return _openai_error_response(
@@ -354,7 +356,6 @@ def create_app(settings: Optional[BridgeSettings] = None) -> FastAPI:
                     error_type="service_unavailable_error",
                     code="gcloud_not_configured",
                 )
-            prompt_for_usage = "\n".join(m.text_content() for m in request.messages)
             max_out = request.max_completion_tokens or request.max_tokens
 
             if not request.stream:
@@ -503,11 +504,24 @@ def create_app(settings: Optional[BridgeSettings] = None) -> FastAPI:
                 request.messages,
                 model=model_name,
             )
+            aff_slot = hub.get_affinity_slot_key(explicit_session_id)
+            ephemeral_aux = bool(
+                not tools_active
+                and (
+                    (aff_slot and context_builder.has_active_tool_session(aff_slot))
+                    or any(context_builder.has_active_tool_session(k) for k in matching_slots)
+                )
+            )
+            if ephemeral_aux:
+                matching_slots = [
+                    k for k in matching_slots if not context_builder.has_active_tool_session(k)
+                ]
             try:
                 async with hub.acquire_slot(
                     explicit_session_id=explicit_session_id,
                     matching_slot_keys=matching_slots,
                     queue_timeout=cfg.queue_timeout_seconds,
+                    ephemeral_aux=ephemeral_aux,
                 ) as slot:
                     session_key = slot.slot_key
                     prepared = context_builder.build(
@@ -558,7 +572,7 @@ def create_app(settings: Optional[BridgeSettings] = None) -> FastAPI:
                 request_id=completion_id,
                 model=raw_model_name,
                 reply_text=parsed.content,
-                prompt_text=prepared.prompt,
+                prompt_text=prompt_for_usage,
                 created=created_ts,
                 tool_calls=parsed.tool_calls or None,
                 finish_reason=parsed.finish_reason,
@@ -585,7 +599,8 @@ def create_app(settings: Optional[BridgeSettings] = None) -> FastAPI:
             )
             finish_reason = "stop"
             completion_usage_str = ""
-            prompt_for_usage_str = ""
+            prompt_for_usage_str = prompt_for_usage
+            last_sse_ts = time.monotonic()
 
             try:
                 matching_slots = context_builder.find_matching_slots(
@@ -593,10 +608,23 @@ def create_app(settings: Optional[BridgeSettings] = None) -> FastAPI:
                     request.messages,
                     model=model_name,
                 )
+                aff_slot = hub.get_affinity_slot_key(explicit_session_id)
+                ephemeral_aux = bool(
+                    not tools_active
+                    and (
+                        (aff_slot and context_builder.has_active_tool_session(aff_slot))
+                        or any(context_builder.has_active_tool_session(k) for k in matching_slots)
+                    )
+                )
+                if ephemeral_aux:
+                    matching_slots = [
+                        k for k in matching_slots if not context_builder.has_active_tool_session(k)
+                    ]
                 async with hub.acquire_slot(
                     explicit_session_id=explicit_session_id,
                     matching_slot_keys=matching_slots,
                     queue_timeout=cfg.queue_timeout_seconds,
+                    ephemeral_aux=ephemeral_aux,
                 ) as slot:
                     session_key = slot.slot_key
                     prepared = context_builder.build(
@@ -608,7 +636,6 @@ def create_app(settings: Optional[BridgeSettings] = None) -> FastAPI:
                         parallel_tool_calls=request.parallel_tool_calls,
                         response_format=request.response_format,
                     )
-                    prompt_for_usage_str = prepared.prompt
 
                     async for delta in hub.dispatch_stream_on_slot(
                         slot=slot,
@@ -618,6 +645,11 @@ def create_app(settings: Optional[BridgeSettings] = None) -> FastAPI:
                         suppress_citations=suppress_citations,
                         request_timeout=cfg.request_timeout_seconds,
                     ):
+                        if not delta:
+                            if time.monotonic() - last_sse_ts >= 14.5:
+                                yield ": keepalive\n\n"
+                                last_sse_ts = time.monotonic()
+                            continue
                         for safe_piece in processor.feed(delta):
                             chunk = build_chat_completion_chunk(
                                 request_id=completion_id,
@@ -626,6 +658,7 @@ def create_app(settings: Optional[BridgeSettings] = None) -> FastAPI:
                                 created=created_ts,
                             )
                             yield f"data: {json.dumps(chunk, ensure_ascii=False)}\n\n"
+                            last_sse_ts = time.monotonic()
 
                     tail_pieces, parsed = processor.finalize()
                     for raw_piece in tail_pieces:

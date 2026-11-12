@@ -87,7 +87,7 @@
         callback_url: message.callback_url || "",
         target_model: message.target_model || null,
         reset_chat: Boolean(message.reset_chat),
-        timeout_ms: message.timeout_ms || 180000
+        timeout_ms: message.timeout_ms || 600000
       });
     } else {
       postToMain("execute_prompt", {
@@ -96,7 +96,7 @@
         callback_url: message.callback_url || "",
         target_model: message.target_model || null,
         reset_chat: Boolean(message.reset_chat),
-        timeout_ms: message.timeout_ms || 180000
+        timeout_ms: message.timeout_ms || 600000
       });
     }
   }
@@ -254,6 +254,22 @@
             await chrome.runtime.sendMessage({ type: "GEB_SW_SLEEP", ms });
           } catch (_) {}
           postToMain("sw_sleep_done", { sleep_id: sleepId });
+        })();
+        return;
+      }
+
+      if (data.payload.type === "briefly_activate_tab") {
+        const reqId = data.payload.req_id;
+        const holdMs = Math.max(120, Math.min(Number(data.payload.hold_ms) || 240, 1500));
+        void (async () => {
+          let res = { ok: false };
+          try {
+            res = await chrome.runtime.sendMessage({
+              type: "GEB_BRIEFLY_ACTIVATE_TAB",
+              hold_ms: holdMs
+            });
+          } catch (_) {}
+          postToMain("briefly_activate_tab_done", { req_id: reqId, ...(res || {}) });
         })();
         return;
       }

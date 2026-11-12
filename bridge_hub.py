@@ -159,7 +159,7 @@ class BrowserBridgeHub:
         self,
         include_citations: bool = True,
         callback_base_url: str = "",
-        max_parallel_tabs: int = 4,
+        max_parallel_tabs: int = 6,
         auto_spawn_tabs: bool = True,
         session_affinity_ttl_seconds: float = 300.0,
     ) -> None:
@@ -600,6 +600,17 @@ class BrowserBridgeHub:
         if msg_type == "request_ack":
             return None
 
+        if msg_type == "request_progress":
+            await inflight.events.put(
+                {
+                    "type": "progress",
+                    "generating": bool(data.get("generating", True)),
+                    "dom_len": int(data.get("dom_len") or 0),
+                    "net_len": int(data.get("net_len") or 0),
+                }
+            )
+            return None
+
         if msg_type == "stream_chunk":
             delta = str(data.get("delta") or "")
             if delta:
@@ -739,6 +750,11 @@ class BrowserBridgeHub:
         self.add_log("info", f"Parallel worker tab #{slot.tab_id} ready ({slot.slot_key})", client.client_id)
         return slot
 
+    def get_affinity_slot_key(self, explicit_session_id: Optional[str]) -> Optional[str]:
+        if not explicit_session_id:
+            return None
+        return self._session_affinity.get(explicit_session_id)
+
     def _is_slot_holding_protected_session(
         self,
         slot: WorkerSlot,
@@ -759,14 +775,17 @@ class BrowserBridgeHub:
         self,
         explicit_session_id: Optional[str] = None,
         matching_slot_keys: Optional[Sequence[str]] = None,
-        queue_timeout: float = 90.0,
+        queue_timeout: float = 300.0,
+        ephemeral_aux: bool = False,
     ) -> AsyncIterator[WorkerSlot]:
         """Atomically select/spawn and lock an isolated `WorkerSlot` for parallel execution."""
         chosen: Optional[WorkerSlot] = None
         spawn_target: Optional[tuple[BrowserClientState, str]] = None
+        effective_session_id = None if ephemeral_aux else explicit_session_id
 
         async with self._routing_lock:
             ready_slots = self._get_alive_ready_slots()
+
             # Ensure any alive ready client without an explicit slot yet gets its default slot
             if not ready_slots:
                 fallback_client = self.select_active_client()
@@ -793,8 +812,8 @@ class BrowserBridgeHub:
             now = time.time()
 
             # 1) Explicit session_id affinity (`X-Session-Id` / `session_id` / `model@session`)
-            if explicit_session_id and explicit_session_id in self._session_affinity:
-                aff_key = self._session_affinity[explicit_session_id]
+            if effective_session_id and effective_session_id in self._session_affinity:
+                aff_key = self._session_affinity[effective_session_id]
                 if aff_key in ready_map:
                     chosen = ready_map[aff_key]
 
@@ -814,7 +833,7 @@ class BrowserBridgeHub:
                     for s in ready_slots
                     if not s.is_busy
                     and s.waiting_count == 0
-                    and not self._is_slot_holding_protected_session(s, explicit_session_id, now)
+                    and not self._is_slot_holding_protected_session(s, effective_session_id, now)
                 ]
                 if clean_idle:
                     clean_idle.sort(key=lambda s: (0 if s.last_used_at == 0.0 else 1, s.last_used_at))
@@ -830,13 +849,13 @@ class BrowserBridgeHub:
 
             # 5) Pool at max_parallel_tabs (or spawn unavailable): pick LRU idle slot, else least-loaded busy slot
             if chosen is None and spawn_target is None:
-                chosen = self._select_fallback_slot(ready_slots, explicit_session_id, now)
+                chosen = self._select_fallback_slot(ready_slots, effective_session_id, now)
 
             if chosen is not None:
                 chosen.waiting_count += 1
-                if explicit_session_id:
-                    self._session_affinity[explicit_session_id] = chosen.slot_key
-                    chosen.pinned_session_id = explicit_session_id
+                if effective_session_id:
+                    self._session_affinity[effective_session_id] = chosen.slot_key
+                    chosen.pinned_session_id = effective_session_id
 
         # Perform async tab auto-spawn outside `_routing_lock` so other parallel requests aren't stalled!
         if spawn_target is not None:
@@ -854,12 +873,12 @@ class BrowserBridgeHub:
                             self._total_errors += 1
                             raise BridgeUnavailableError("浏览器标签页池不可用，自动扩容失败。")
                         chosen = self._select_fallback_slot(
-                            fallback_slots, explicit_session_id, time.time()
+                            fallback_slots, effective_session_id, time.time()
                         )
                     chosen.waiting_count += 1
-                    if explicit_session_id:
-                        self._session_affinity[explicit_session_id] = chosen.slot_key
-                        chosen.pinned_session_id = explicit_session_id
+                    if effective_session_id:
+                        self._session_affinity[effective_session_id] = chosen.slot_key
+                        chosen.pinned_session_id = effective_session_id
 
         assert chosen is not None
         acquired = False
@@ -916,7 +935,7 @@ class BrowserBridgeHub:
         target_model: Optional[str] = None,
         reset_chat: bool = False,
         suppress_citations: bool = False,
-        request_timeout: float = 180.0,
+        request_timeout: float = 600.0,
     ) -> AsyncIterator[str]:
         """Execute a prompt on an already-acquired `WorkerSlot` without blocking other slots."""
         self._total_requests += 1
@@ -996,6 +1015,7 @@ class BrowserBridgeHub:
             await self._send_command_to_client(client, command)
 
             emitted_parts: List[str] = []
+            sliding_window = max(request_timeout, 180.0)
             deadline = time.monotonic() + request_timeout
 
             while True:
@@ -1007,19 +1027,24 @@ class BrowserBridgeHub:
                 try:
                     event = await asyncio.wait_for(
                         inflight.events.get(),
-                        timeout=min(remaining, 30.0),
+                        timeout=min(remaining, 15.0),
                     )
                 except asyncio.TimeoutError:
+                    # Yield empty string heartbeat so SSE streams can emit `: keepalive` comments
+                    yield ""
                     continue
 
                 ev_type = event.get("type")
+                if ev_type == "progress":
+                    deadline = max(deadline, time.monotonic() + sliding_window)
+                    yield ""
+                    continue
                 if ev_type == "chunk":
                     delta = event.get("delta", "")
                     if delta:
                         emitted_parts.append(delta)
                         yield delta
-                    deadline = max(deadline, time.monotonic() + min(request_timeout, 60.0))
-
+                    deadline = max(deadline, time.monotonic() + sliding_window)
                 elif ev_type == "error":
                     raise BridgeExecutionError(str(event.get("message") or "网页端执行失败"))
 
@@ -1056,7 +1081,7 @@ class BrowserBridgeHub:
         target_model: Optional[str] = None,
         reset_chat: bool = False,
         suppress_citations: bool = False,
-        request_timeout: float = 180.0,
+        request_timeout: float = 600.0,
     ) -> str:
         chunks: List[str] = []
         async for delta in self.dispatch_stream_on_slot(
@@ -1067,7 +1092,8 @@ class BrowserBridgeHub:
             suppress_citations=suppress_citations,
             request_timeout=request_timeout,
         ):
-            chunks.append(delta)
+            if delta:
+                chunks.append(delta)
         return "".join(chunks).strip()
 
     async def dispatch_stream(
@@ -1076,8 +1102,8 @@ class BrowserBridgeHub:
         target_model: Optional[str] = None,
         reset_chat: bool = False,
         suppress_citations: bool = False,
-        request_timeout: float = 180.0,
-        queue_timeout: float = 90.0,
+        request_timeout: float = 600.0,
+        queue_timeout: float = 300.0,
         explicit_session_id: Optional[str] = None,
         matching_slot_keys: Optional[Sequence[str]] = None,
     ) -> AsyncIterator[str]:
@@ -1103,8 +1129,8 @@ class BrowserBridgeHub:
         target_model: Optional[str] = None,
         reset_chat: bool = False,
         suppress_citations: bool = False,
-        request_timeout: float = 180.0,
-        queue_timeout: float = 90.0,
+        request_timeout: float = 600.0,
+        queue_timeout: float = 300.0,
         explicit_session_id: Optional[str] = None,
         matching_slot_keys: Optional[Sequence[str]] = None,
     ) -> str:
@@ -1119,7 +1145,8 @@ class BrowserBridgeHub:
             explicit_session_id=explicit_session_id,
             matching_slot_keys=matching_slot_keys,
         ):
-            chunks.append(delta)
+            if delta:
+                chunks.append(delta)
         return "".join(chunks).strip()
 
     async def _send_command_to_client(self, client: BrowserClientState, command: Dict[str, Any]) -> None:

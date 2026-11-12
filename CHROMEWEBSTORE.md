@@ -1,7 +1,7 @@
 # Chrome Web Store Listing & Permissions Reference
 
 **Extension Name:** Gemini Enterprise Web-to-API Bridge  
-**Current Version:** 1.1.2  
+**Current Version:** 1.1.3  
 **Last Updated:** 2026-11-12  
 **Distribution Target:** Local Developer Unpacked Extension / Private Enterprise Internal Distribution
 
@@ -37,7 +37,7 @@ Every permission in `manifest.json` is strictly scoped to local bridging:
 | `scripting` | Attaches the page bridge to already-open `vertexaisearch.cloud.google.com` tabs when the extension is first installed or reloaded without forcing a manual refresh. |
 | `https://vertexaisearch.cloud.google.com/*` | Reads assistant responses and submits your prompts inside the Gemini Enterprise / Vertex AI Search web interface. |
 | `http://127.0.0.1/*` & `http://localhost/*` | Communicates with the local OpenAI-compatible proxy server running on your own computer. |
-| `https://api.github.com/*`, `https://github.com/*`, & `https://objects.githubusercontent.com/*` | Checks the official GitHub Releases feed for newer extension and gateway versions so local developer installations stay up to date. |
+| `https://api.github.com/*`, `https://github.com/*`, & `https://*.githubusercontent.com/*` | Checks the official GitHub Releases feed and follows release-asset CDN redirects (`release-assets.githubusercontent.com` / `objects.githubusercontent.com`) so local developer installations stay up to date without cross-origin preflight failures. |
 
 ---
 
@@ -51,6 +51,7 @@ Every permission in `manifest.json` is strictly scoped to local bridging:
 
 ## Version History
 
+- **1.1.3 (2026-11-12):** Fixed CORS preflight errors when checking GitHub Releases by expanding `*.githubusercontent.com` CDN host coverage, preferring the local gateway / GitHub REST API before redirected release assets, and removing non-CORS-safelisted request headers.
 - **1.1.2 (2026-11-12):** Added full 1,048,576 input / 65,536 output token limit metadata across `/v1/models` and `GET /v1/models/{model_id}` plus automatic GitHub Copilot BYOK `provider_models` limit synchronization to prevent false 128k prompt budget caps.
 - **1.1.1 (2026-11-12):** Eliminated background WebSocket connection-refused and handshake warnings via lightweight gateway readiness checks, and improved back/forward cache keep-alive port cleanup during tab navigation.
 - **1.1.0 (2026-11-12):** Added Gemini 4 Carbon support, real-time context window and API cost equivalence telemetry, and automated GitHub Releases update detection with one-click local gateway upgrade.

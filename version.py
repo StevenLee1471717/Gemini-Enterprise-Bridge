@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import os
 
-APP_VERSION = "1.1.2"
+APP_VERSION = "1.1.3"
 DEFAULT_GITHUB_REPO = "StevenLee1471717/Gemini-Enterprise-Bridge"
 
 

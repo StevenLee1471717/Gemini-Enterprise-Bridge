@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "Gemini Enterprise Web-to-API Bridge",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "description": "Bridge Google Cloud Vertex AI Search / Agentspace web sessions to a local OpenAI-compatible API server.",
   "permissions": [
     "storage",
@@ -12,7 +12,10 @@
   "host_permissions": [
     "https://vertexaisearch.cloud.google.com/*",
     "http://127.0.0.1/*",
-    "http://localhost/*"
+    "http://localhost/*",
+    "https://api.github.com/*",
+    "https://github.com/*",
+    "https://objects.githubusercontent.com/*"
   ],
   "background": {
     "service_worker": "background.js"

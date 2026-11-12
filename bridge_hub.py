@@ -13,6 +13,9 @@ from typing import Any, AsyncIterator, Callable, Dict, List, Optional, Sequence,
 
 from fastapi import WebSocket
 
+from updater import compare_semver, normalize_version
+from version import APP_VERSION
+
 logger = logging.getLogger("gemini_bridge.hub")
 
 
@@ -99,6 +102,9 @@ class BrowserClientState:
     driver_mode: str = "auto"
     captured_rpc: bool = False
     active_model: str = ""
+    extension_version: str = ""
+    notified_reload_for_version: str = ""
+    warned_outdated_backend_for: str = ""
     completed_requests: int = 0
     capabilities: Set[str] = field(default_factory=set)
     client_max_parallel_tabs: Optional[int] = None
@@ -126,6 +132,7 @@ class BrowserClientState:
             "driver_mode": self.driver_mode,
             "captured_rpc": self.captured_rpc,
             "active_model": self.active_model,
+            "extension_version": self.extension_version,
             "completed_requests": self.completed_requests,
             "capabilities": sorted(self.capabilities),
         }
@@ -162,26 +169,28 @@ class BrowserBridgeHub:
         max_parallel_tabs: int = 6,
         auto_spawn_tabs: bool = True,
         session_affinity_ttl_seconds: float = 300.0,
+        backend_version: str = APP_VERSION,
     ) -> None:
         self.include_citations = include_citations
         self.callback_base_url = callback_base_url.rstrip("/")
         self.max_parallel_tabs = max(1, max_parallel_tabs)
         self.auto_spawn_tabs = auto_spawn_tabs
         self.session_affinity_ttl_seconds = max(0.0, session_affinity_ttl_seconds)
-
+        self.backend_version = normalize_version(backend_version) or APP_VERSION
         self._clients: Dict[str, BrowserClientState] = {}
         self._slots: Dict[str, WorkerSlot] = {}
         self._session_affinity: Dict[str, str] = {}  # explicit_session_id -> slot_key
         self._pending: Dict[str, InFlightRequest] = {}
         self._pending_spawns: Dict[str, asyncio.Future[Dict[str, Any]]] = {}
         self._routing_lock = asyncio.Lock()
-
         self._total_requests = 0
         self._total_errors = 0
         self._recent_logs: List[Dict[str, Any]] = []
         self.usage_snapshot_provider: Optional[Callable[[], Dict[str, Any]]] = None
         self.on_slot_removed: Optional[Callable[[str], None]] = None
         self.on_slot_migrated: Optional[Callable[[str, str], None]] = None
+        self.on_extension_version_reported: Optional[Callable[[str], Any]] = None
+        self.on_outdated_extension_detected: Optional[Callable[[str], Any]] = None
 
     def add_log(self, level: str, message: str, client_id: Optional[str] = None) -> None:
         entry = {
@@ -354,6 +363,7 @@ class BrowserBridgeHub:
             driver_mode=prev.driver_mode if prev else "auto",
             captured_rpc=prev.captured_rpc if prev else False,
             active_model=prev.active_model if prev else "",
+            extension_version=prev.extension_version if prev else "",
             capabilities=set(prev.capabilities) if prev else set(),
             client_max_parallel_tabs=prev.client_max_parallel_tabs if prev else None,
         )
@@ -368,6 +378,7 @@ class BrowserBridgeHub:
             "type": "welcome",
             "client_id": cid,
             "server_time": int(time.time()),
+            "backend_version": self.backend_version,
             "max_parallel_tabs": self.max_parallel_tabs,
             "auto_spawn_tabs": self.auto_spawn_tabs,
         }
@@ -525,13 +536,27 @@ class BrowserBridgeHub:
     def status_snapshot(self) -> Dict[str, Any]:
         self._prune_stale_http_clients()
         now = time.time()
-        clients = [c.to_public_dict() for c in self._clients.values() if c.is_alive(now)]
+        alive_states = [c for c in self._clients.values() if c.is_alive(now)]
+        clients = [c.to_public_dict() for c in alive_states]
         slots = self._get_alive_ready_slots()
         active = self.select_active_client()
         busy_slots = sum(1 for s in slots if s.is_busy)
         waiting_total = sum(s.waiting_count for s in slots)
+        connected_ext_ver = ""
+        for st in alive_states:
+            if st.extension_version and (
+                not connected_ext_ver
+                or compare_semver(st.extension_version, connected_ext_ver) > 0
+            ):
+                connected_ext_ver = st.extension_version
+        backend_update_required = bool(
+            connected_ext_ver and compare_semver(connected_ext_ver, self.backend_version) > 0
+        )
         return {
             "browser_connected": len(slots) > 0 or active is not None,
+            "backend_version": self.backend_version,
+            "connected_extension_version": connected_ext_ver,
+            "backend_update_required": backend_update_required,
             "active_client": active.to_public_dict() if active else None,
             "clients": clients,
             "worker_slots": [s.to_public_dict() for s in slots],
@@ -566,9 +591,39 @@ class BrowserBridgeHub:
             return None
 
         if msg_type in {"hello", "tab_status", "heartbeat"}:
+            reported_ext_ver = normalize_version(str(data.get("extension_version") or ""))
+            emit_ext_reload = False
+            backend_outdated_flag = False
             if state is not None:
                 if isinstance(data.get("capabilities"), list):
                     state.capabilities = {str(x) for x in data["capabilities"] if x}
+                if reported_ext_ver:
+                    state.extension_version = reported_ext_ver
+                    if self.on_extension_version_reported is not None:
+                        try:
+                            self.on_extension_version_reported(reported_ext_ver)
+                        except Exception:
+                            pass
+                    cmp_ver = compare_semver(reported_ext_ver, self.backend_version)
+                    if cmp_ver > 0:
+                        backend_outdated_flag = True
+                        if state.warned_outdated_backend_for != reported_ext_ver:
+                            state.warned_outdated_backend_for = reported_ext_ver
+                            self.add_log(
+                                "warn",
+                                f"浏览器插件已升级至 v{reported_ext_ver}（当前后端 v{self.backend_version}）— 请更新后端",
+                                client_id,
+                            )
+                    elif cmp_ver < 0:
+                        if self.on_outdated_extension_detected is not None:
+                            try:
+                                self.on_outdated_extension_detected(reported_ext_ver)
+                            except Exception:
+                                pass
+                        target_combo = f"{reported_ext_ver}->{self.backend_version}"
+                        if state.notified_reload_for_version != target_combo:
+                            state.notified_reload_for_version = target_combo
+                            emit_ext_reload = True
                 if data.get("max_parallel_tabs") is not None:
                     try:
                         state.client_max_parallel_tabs = max(1, int(data["max_parallel_tabs"]))
@@ -611,7 +666,12 @@ class BrowserBridgeHub:
             resp_frame: Dict[str, Any] = {
                 "type": "pong" if msg_type == "heartbeat" else "ack",
                 "server_time": int(time.time()),
+                "backend_version": self.backend_version,
             }
+            if backend_outdated_flag:
+                resp_frame["backend_update_required"] = True
+            if emit_ext_reload:
+                resp_frame["_emit_extension_reload"] = self.backend_version
             if self.usage_snapshot_provider is not None:
                 try:
                     resp_frame["usage_snapshot"] = self.usage_snapshot_provider()

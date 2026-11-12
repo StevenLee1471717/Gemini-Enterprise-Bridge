@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
+import os
 import time
 import uuid
 from contextlib import asynccontextmanager
@@ -38,7 +40,14 @@ from schemas import (
     parse_model_and_session,
     resolve_target_web_model,
 )
+from updater import (
+    EXIT_RESTART_FOR_UPDATE,
+    UpdateError,
+    UpdateIntegrityError,
+    UpdateManager,
+)
 from usage_stats import UsageTracker
+from version import APP_VERSION
 from tool_calling import (
     ToolStreamProcessor,
     build_sse_tool_call_deltas,
@@ -76,8 +85,17 @@ def _openai_error_response(
     )
 
 
-def create_app(settings: Optional[BridgeSettings] = None) -> FastAPI:
+def create_app(
+    settings: Optional[BridgeSettings] = None,
+    update_manager: Optional[UpdateManager] = None,
+) -> FastAPI:
     cfg = settings or BridgeSettings.from_env()
+    root_dir = Path(__file__).resolve().parent
+    updater = update_manager or UpdateManager(
+        root_dir=root_dir,
+        current_version=APP_VERSION,
+        repo=cfg.github_repo,
+    )
     cb_host = "127.0.0.1" if cfg.host in {"0.0.0.0", "::"} else cfg.host
     hub = BrowserBridgeHub(
         include_citations=cfg.include_citations,
@@ -85,6 +103,7 @@ def create_app(settings: Optional[BridgeSettings] = None) -> FastAPI:
         max_parallel_tabs=cfg.max_parallel_tabs,
         auto_spawn_tabs=cfg.auto_spawn_tabs,
         session_affinity_ttl_seconds=cfg.session_affinity_ttl_seconds,
+        backend_version=updater.current_version,
     )
     context_builder = ConversationContextBuilder(
         default_mode=cfg.context_mode,
@@ -121,38 +140,67 @@ def create_app(settings: Optional[BridgeSettings] = None) -> FastAPI:
             "context_monitor": ctx_monitor,
         }
 
+    def _sync_extension_for_reload(_old_ext_ver: str) -> None:
+        if cfg.auto_export_extension:
+            try:
+                export_extension_bundle(updater.root_dir)
+            except Exception:
+                pass
+
     hub.usage_snapshot_provider = lambda: build_live_usage_snapshot(include_catalog=False)
     hub.on_slot_removed = context_builder.drop_slot
     hub.on_slot_migrated = context_builder.migrate_slot_key
+    hub.on_extension_version_reported = updater.record_extension_version
+    hub.on_outdated_extension_detected = _sync_extension_for_reload
 
     @asynccontextmanager
     async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
         if cfg.auto_export_extension:
             try:
-                ext_path = export_extension_bundle(Path(__file__).resolve().parent)
-                logger.info("Chrome/Edge MV3 扩展目录已就绪: %s", ext_path)
+                ext_path = export_extension_bundle(updater.root_dir)
+                logger.info("Chrome/Edge MV3 扩展目录已就绪 (v%s): %s", updater.current_version, ext_path)
             except Exception as exc:  # pragma: no cover
                 logger.warning("自动导出 extension 目录失败（不影响主目录加载）: %s", exc)
+
+        bg_check_task: Optional[asyncio.Task[Any]] = None
+        if cfg.auto_update:
+            async def _initial_github_probe() -> None:
+                try:
+                    snap = await asyncio.to_thread(updater.check_github_update, False, 6.0)
+                    if snap.get("backend_outdated"):
+                        logger.warning(
+                            "发现 GitHub 新版本 v%s（当前本地后端 v%s），可在控制台或插件弹窗一键自动更新！",
+                            snap.get("latest_github_version"),
+                            updater.current_version,
+                        )
+                except Exception:
+                    pass
+
+            bg_check_task = asyncio.create_task(_initial_github_probe())
+
         logger.info(
-            "Gemini Enterprise Bridge 已启动: http://%s:%d/ (OpenAI Base URL: http://%s:%d/v1)",
+            "Gemini Enterprise Bridge v%s 已启动: http://%s:%d/ (OpenAI Base URL: http://%s:%d/v1)",
+            updater.current_version,
             cfg.host,
             cfg.port,
             cfg.host,
             cfg.port,
         )
         yield
+        if bg_check_task is not None and not bg_check_task.done():
+            bg_check_task.cancel()
 
     app = FastAPI(
         title="Gemini Enterprise Web-to-API Bridge",
-        version="1.0.0",
+        version=updater.current_version,
         description="Browser-in-the-loop OpenAI-compatible proxy for Google Cloud Vertex AI Search / Agentspace",
         lifespan=lifespan,
     )
-
     app.state.settings = cfg
     app.state.hub = hub
     app.state.context_builder = context_builder
     app.state.usage_tracker = usage_tracker
+    app.state.update_manager = updater
     app.state.gcloud = gcloud
 
     app.add_middleware(
@@ -205,6 +253,7 @@ def create_app(settings: Optional[BridgeSettings] = None) -> FastAPI:
     async def health() -> Dict[str, Any]:
         return {
             "status": "ok",
+            "version": updater.current_version,
             "browser_connected": hub.has_ready_client(),
             "gcloud_configured": gcloud.is_configured(),
             "backend_mode": cfg.backend_mode,
@@ -213,19 +262,113 @@ def create_app(settings: Optional[BridgeSettings] = None) -> FastAPI:
     @app.get("/api/status")
     async def api_status() -> Dict[str, Any]:
         hub_snap = hub.status_snapshot()
+        if hub_snap.get("connected_extension_version"):
+            updater.record_extension_version(str(hub_snap["connected_extension_version"]))
+        upd_snap = updater.status_snapshot(include_remote_if_cached=True)
         ctx_monitor = context_builder.get_context_snapshot(hub_snap.get("worker_slots") or [])
         model_hint = _resolve_active_model_hint(hub_snap) or str(
             (ctx_monitor.get("primary") or {}).get("active_model") or ""
         )
         return {
             "status": "ok",
+            "version": updater.current_version,
+            "backend_version": updater.current_version,
+            "connected_extension_version": upd_snap["connected_extension_version"],
+            "backend_update_required": bool(
+                upd_snap["backend_update_required"] or hub_snap.get("backend_update_required")
+            ),
             "backend_mode": cfg.backend_mode,
             "context_mode": cfg.context_mode,
             "gcloud_configured": gcloud.is_configured(),
             "hub": hub_snap,
+            "update": upd_snap,
             "usage": usage_tracker.snapshot(active_model_hint=model_hint, include_catalog=False),
             "context_monitor": ctx_monitor,
         }
+
+    @app.get("/api/update/status")
+    async def api_update_status(force: bool = False) -> Dict[str, Any]:
+        hub_snap = hub.status_snapshot()
+        if hub_snap.get("connected_extension_version"):
+            updater.record_extension_version(str(hub_snap["connected_extension_version"]))
+        info = await asyncio.to_thread(updater.check_github_update, force)
+        return {
+            "status": "ok",
+            **info,
+        }
+
+    @app.post("/api/update/extension")
+    async def api_update_extension() -> JSONResponse:
+        try:
+            result = await asyncio.to_thread(updater.update_extension_only)
+        except UpdateIntegrityError as exc:
+            return JSONResponse(
+                status_code=400,
+                content={"ok": False, "error": str(exc), "code": "integrity_error"},
+            )
+        except UpdateError as exc:
+            return JSONResponse(
+                status_code=502,
+                content={"ok": False, "error": str(exc), "code": "update_failed"},
+            )
+        updated_ver = str(result.get("updated_version") or updater.current_version)
+        await hub.broadcast_ws_event(
+            {"type": "extension_reload_available", "version": updated_ver},
+            required_capability="auto_update",
+        )
+        return JSONResponse(status_code=200, content=result)
+
+    @app.post("/api/update/apply")
+    async def api_update_apply(request: Request) -> JSONResponse:
+        supervised = os.getenv("BRIDGE_SUPERVISED", "").strip() == "1"
+        requested_restart: Optional[bool] = None
+        try:
+            body = await request.json()
+            if isinstance(body, dict) and "restart" in body:
+                requested_restart = bool(body["restart"])
+        except Exception:
+            pass
+
+        try:
+            result = await asyncio.to_thread(updater.update_backend_and_extension)
+        except UpdateIntegrityError as exc:
+            return JSONResponse(
+                status_code=400,
+                content={"ok": False, "error": str(exc), "code": "integrity_error"},
+            )
+        except UpdateError as exc:
+            return JSONResponse(
+                status_code=502,
+                content={"ok": False, "error": str(exc), "code": "update_failed"},
+            )
+
+        updated_ver = str(result.get("updated_version") or updater.current_version)
+        await hub.broadcast_ws_event(
+            {"type": "extension_reload_available", "version": updated_ver},
+            required_capability="auto_update",
+        )
+
+        will_restart = supervised if requested_restart is None else (requested_restart and supervised)
+        if will_restart:
+            async def _delayed_hot_exit() -> None:
+                await asyncio.sleep(0.35)
+                os._exit(EXIT_RESTART_FOR_UPDATE)
+
+            asyncio.create_task(_delayed_hot_exit())
+            msg = f"已下载并写入 v{updated_ver} 更新文件，本地网关正在自动热重启（约 2~3 秒恢复）..."
+        else:
+            msg = f"已下载并写入 v{updated_ver} 更新文件；当前为手动启动模式，请重启 server.py（使用 start.ps1 启动可自动热重启）。"
+
+        return JSONResponse(
+            status_code=200,
+            content={
+                **result,
+                "supervised": supervised,
+                "restart_scheduled": will_restart,
+                "exit_code": EXIT_RESTART_FOR_UPDATE if will_restart else None,
+                "message": msg,
+            },
+        )
 
     @app.get("/api/usage")
     async def api_usage() -> Dict[str, Any]:
@@ -275,7 +418,15 @@ def create_app(settings: Optional[BridgeSettings] = None) -> FastAPI:
                 if isinstance(data, dict):
                     reply_packet = await hub.handle_browser_event(client.client_id, data)
                     if reply_packet is not None:
+                        reload_ver = reply_packet.pop("_emit_extension_reload", None)
                         await websocket.send_json(reply_packet)
+                        if reload_ver:
+                            await websocket.send_json(
+                                {
+                                    "type": "extension_reload_available",
+                                    "version": str(reload_ver),
+                                }
+                            )
         except WebSocketDisconnect:
             logger.info("浏览器扩展前端已断开连接 (%s)", client.client_id)
         except Exception as exc:

@@ -121,6 +121,7 @@ def _make_test_settings(**overrides: Any) -> BridgeSettings:
     tmp_dir = Path(tempfile.mkdtemp(prefix="geb_test_usage_"))
     defaults: Dict[str, Any] = {
         "auto_export_extension": False,
+        "auto_update": False,
         "request_timeout_seconds": 10.0,
         "queue_timeout_seconds": 10.0,
         "usage_stats_path": str(tmp_dir / "usage_stats.json"),
@@ -1896,3 +1897,274 @@ def test_e2e_context_monitor_and_usage_api_sync_and_sse(tmp_path: Path) -> None:
             reset_resp = client.post("/api/usage/reset", json={"scope": "all"})
             assert reset_resp.status_code == 200
             assert reset_resp.json()["usage"]["all_time"]["requests"] == 0
+
+
+# ---------------------------------------------------------------------------
+# 8. GitHub Releases Packaging, Auto-Updater, SHA-256 & Cross-Version Sync
+# ---------------------------------------------------------------------------
+
+
+def _populate_minimal_repo_tree(repo_dir: Path, version: str = "1.1.0", marker: str = "v1") -> None:
+    repo_dir.mkdir(parents=True, exist_ok=True)
+    (repo_dir / "version.py").write_text(
+        f'APP_VERSION = "{version}"\nDEFAULT_GITHUB_REPO = "StevenLee1471717/Gemini-Enterprise-Bridge"\n',
+        encoding="utf-8",
+    )
+    (repo_dir / "server.py").write_text(f"# server {marker} v{version}\n", encoding="utf-8")
+    (repo_dir / "manifest.json").write_text(
+        json.dumps(
+            {
+                "manifest_version": 3,
+                "name": "Gemini Enterprise Bridge",
+                "version": version,
+                "action": {"default_popup": "popup.html"},
+            }
+        ),
+        encoding="utf-8",
+    )
+    for fname in ("background.js", "content-bridge.js", "page-driver.js", "popup.html", "popup.css", "popup.js"):
+        (repo_dir / fname).write_text(f"// {fname} {marker} v{version}\n", encoding="utf-8")
+    (repo_dir / "gemini-enterprise-bridge.user.js").write_text(
+        f"// ==UserScript==\n// @version {version}\n// ==/UserScript==\n// {marker}\n",
+        encoding="utf-8",
+    )
+
+
+def test_semver_comparison_and_release_artifact_builder(tmp_path: Path) -> None:
+    import zipfile
+    from extension_exporter import build_release_artifacts
+    from updater import compare_semver, normalize_version, sha256_file
+
+    assert normalize_version("v1.2.0") == "1.2.0"
+    assert compare_semver("1.1.0", "1.1.0") == 0
+    assert compare_semver("v1.2.0", "1.1.9") == 1
+    assert compare_semver("1.1.0", "1.2.0") == -1
+    assert compare_semver("1.2.0-rc.1", "1.2.0") == -1
+    assert compare_semver("2.0.0", "1.99.99") == 1
+
+    src_repo = tmp_path / "src_repo"
+    _populate_minimal_repo_tree(src_repo, version="1.2.0", marker="release120")
+    # Sensitive user files MUST NEVER leak into backend release zip
+    (src_repo / ".env").write_text("BRIDGE_API_KEY=super-secret-do-not-pack\n", encoding="utf-8")
+    (src_repo / "usage_stats.json").write_text('{"secret_ledger": true}', encoding="utf-8")
+
+    dist_dir = tmp_path / "dist_out"
+    manifest = build_release_artifacts(
+        dist_dir=dist_dir,
+        root_dir=src_repo,
+        version="1.2.0",
+        repo="StevenLee1471717/Gemini-Enterprise-Bridge",
+    )
+
+    assert manifest["version"] == "1.2.0"
+    assert manifest["tag"] == "v1.2.0"
+    ext_zip = dist_dir / "gemini-enterprise-bridge-extension.zip"
+    backend_zip = dist_dir / "gemini-enterprise-bridge-backend.zip"
+    userscript_out = dist_dir / "gemini-enterprise-bridge.user.js"
+    update_xml = dist_dir / "update-manifest.xml"
+    release_json = dist_dir / "release-manifest.json"
+
+    for f in (ext_zip, backend_zip, userscript_out, update_xml, release_json):
+        assert f.is_file() and f.stat().st_size > 0
+
+    assert sha256_file(ext_zip) == manifest["extension_zip_sha256"]
+    assert sha256_file(backend_zip) == manifest["backend_zip_sha256"]
+    assert sha256_file(userscript_out) == manifest["userscript_sha256"]
+    xml_text = update_xml.read_text(encoding="utf-8")
+    assert "version='1.2.0'" in xml_text or 'version="1.2.0"' in xml_text
+
+    with zipfile.ZipFile(backend_zip, "r") as zf:
+        names = set(zf.namelist())
+        assert "server.py" in names
+        assert "extension/manifest.json" in names
+        assert ".env" not in names
+        assert "usage_stats.json" not in names
+
+    with zipfile.ZipFile(ext_zip, "r") as ezf:
+        ext_names = set(ezf.namelist())
+        assert "manifest.json" in ext_names
+        assert "background.js" in ext_names
+        assert "icons/icon-128.png" in ext_names
+
+
+def test_updater_apply_preserves_env_and_ledger_and_rejects_tampered_sha256(tmp_path: Path) -> None:
+    from extension_exporter import build_release_artifacts
+    from updater import UpdateIntegrityError, UpdateManager
+
+    # Build a v1.2.0 release package in a staging directory
+    upstream_repo = tmp_path / "upstream_v120"
+    _populate_minimal_repo_tree(upstream_repo, version="1.2.0", marker="upgraded_from_github")
+    dist_dir = tmp_path / "github_releases_dist"
+    rel_manifest = build_release_artifacts(
+        dist_dir=dist_dir,
+        root_dir=upstream_repo,
+        version="1.2.0",
+        repo="StevenLee1471717/Gemini-Enterprise-Bridge",
+    )
+
+    # Prepare local v1.1.0 installation with custom .env and usage_stats.json
+    local_install = tmp_path / "local_v110"
+    _populate_minimal_repo_tree(local_install, version="1.1.0", marker="old_local")
+    env_bytes = b"BRIDGE_API_KEY=keep-my-local-secret\nBRIDGE_USD_TO_CNY_RATE=6.8\n"
+    ledger_bytes = b'{"schema_version": 1, "all_time": {"requests": 99}}'
+    (local_install / ".env").write_bytes(env_bytes)
+    (local_install / "usage_stats.json").write_bytes(ledger_bytes)
+
+    url_map: Dict[str, bytes] = {
+        "https://github.com/StevenLee1471717/Gemini-Enterprise-Bridge/releases/latest/download/release-manifest.json": (
+            dist_dir / "release-manifest.json"
+        ).read_bytes(),
+        rel_manifest["extension_zip_url"]: (dist_dir / "gemini-enterprise-bridge-extension.zip").read_bytes(),
+        rel_manifest["backend_zip_url"]: (dist_dir / "gemini-enterprise-bridge-backend.zip").read_bytes(),
+        rel_manifest["userscript_url"]: (dist_dir / "gemini-enterprise-bridge.user.js").read_bytes(),
+    }
+
+    def mock_fetcher(url: str, _timeout: float, _accept: str) -> bytes:
+        if url not in url_map:
+            raise RuntimeError(f"404 Not Found: {url}")
+        return url_map[url]
+
+    mgr = UpdateManager(
+        root_dir=local_install,
+        current_version="1.1.0",
+        repo="StevenLee1471717/Gemini-Enterprise-Bridge",
+        url_fetcher=mock_fetcher,
+    )
+    chk = mgr.check_github_update(force=True)
+    assert chk["ok"] is True
+    assert chk["latest_github_version"] == "1.2.0"
+    assert chk["backend_outdated"] is True
+    assert chk["extension_outdated"] is True
+
+    # 1) Reject tampered SHA-256 archive before touching any local file
+    tampered_map = dict(url_map)
+    tampered_map[rel_manifest["extension_zip_url"]] = b"corrupted-zip-payload"
+    bad_mgr = UpdateManager(
+        root_dir=local_install,
+        current_version="1.1.0",
+        repo="StevenLee1471717/Gemini-Enterprise-Bridge",
+        url_fetcher=lambda u, t, a: tampered_map[u],
+    )
+    try:
+        bad_mgr.update_extension_only()
+        raise AssertionError("Expected UpdateIntegrityError for tampered zip")
+    except UpdateIntegrityError:
+        pass
+
+    # 2) Extension-only hot update
+    ext_res = mgr.update_extension_only()
+    assert ext_res["ok"] is True
+    assert ext_res["updated_version"] == "1.2.0"
+    ext_mf = json.loads((local_install / "extension" / "manifest.json").read_text(encoding="utf-8"))
+    assert ext_mf["version"] == "1.2.0"
+    assert "upgraded_from_github" in (local_install / "extension" / "background.js").read_text(encoding="utf-8")
+
+    # 3) Full backend + extension update strictly preserves .env and usage_stats.json
+    full_res = mgr.update_backend_and_extension(allow_git=False)
+    assert full_res["ok"] is True
+    assert full_res["strategy"] == "release_zip"
+    assert full_res["updated_version"] == "1.2.0"
+    assert "upgraded_from_github" in (local_install / "server.py").read_text(encoding="utf-8")
+    assert (local_install / ".env").read_bytes() == env_bytes
+    assert (local_install / "usage_stats.json").read_bytes() == ledger_bytes
+
+
+def test_e2e_cross_version_ws_handshake_and_update_endpoints(tmp_path: Path) -> None:
+    from extension_exporter import build_release_artifacts
+    from updater import UpdateManager
+
+    # Build mocked v1.3.0 GitHub release
+    rel_src = tmp_path / "rel_v130"
+    _populate_minimal_repo_tree(rel_src, version="1.3.0", marker="rel130")
+    dist_dir = tmp_path / "dist_v130"
+    rel_manifest = build_release_artifacts(
+        dist_dir=dist_dir,
+        root_dir=rel_src,
+        version="1.3.0",
+        repo="StevenLee1471717/Gemini-Enterprise-Bridge",
+    )
+    url_map: Dict[str, bytes] = {
+        "https://github.com/StevenLee1471717/Gemini-Enterprise-Bridge/releases/latest/download/release-manifest.json": (
+            dist_dir / "release-manifest.json"
+        ).read_bytes(),
+        rel_manifest["extension_zip_url"]: (dist_dir / "gemini-enterprise-bridge-extension.zip").read_bytes(),
+        rel_manifest["backend_zip_url"]: (dist_dir / "gemini-enterprise-bridge-backend.zip").read_bytes(),
+        rel_manifest["userscript_url"]: (dist_dir / "gemini-enterprise-bridge.user.js").read_bytes(),
+    }
+
+    install_dir = tmp_path / "runtime_install"
+    _populate_minimal_repo_tree(install_dir, version="1.1.0", marker="base110")
+    (install_dir / ".env").write_text("BRIDGE_USD_TO_CNY_RATE=6.8\n", encoding="utf-8")
+
+    # Case A: Extension already auto-updated to v1.3.0 while backend is on v1.1.0 -> prompts backend update!
+    mgr_old_backend = UpdateManager(
+        root_dir=install_dir,
+        current_version="1.1.0",
+        repo="StevenLee1471717/Gemini-Enterprise-Bridge",
+        url_fetcher=lambda u, _t, _a: url_map[u],
+    )
+    app_a = create_app(_make_test_settings(), update_manager=mgr_old_backend)
+    with TestClient(app_a) as client:
+        with client.websocket_connect("/ws/browser?client_id=ext-newer") as ws:
+            welcome = ws.receive_json()
+            assert welcome["backend_version"] == "1.1.0"
+            ws.send_json(
+                {
+                    "type": "tab_status",
+                    "extension_version": "1.3.0",
+                    "capabilities": ["multi_tab", "usage_push", "auto_update"],
+                    "tab_id": 11,
+                    "tab_url": "https://vertexaisearch.cloud.google.com/u/0/home",
+                    "ready": True,
+                }
+            )
+            ack = ws.receive_json()
+            assert ack["type"] == "ack"
+            assert ack["backend_update_required"] is True
+
+            st = client.get("/api/status").json()
+            assert st["connected_extension_version"] == "1.3.0"
+            assert st["backend_update_required"] is True
+            assert st["update"]["backend_outdated"] is True
+
+            upd_st = client.get("/api/update/status?force=true").json()
+            assert upd_st["latest_github_version"] == "1.3.0"
+            assert upd_st["backend_update_required"] is True
+
+            # Apply update via HTTP endpoint (non-supervised test process -> no os._exit)
+            apply_res = client.post("/api/update/apply", json={"restart": False}).json()
+            assert apply_res["ok"] is True
+            assert apply_res["updated_version"] == "1.3.0"
+            reload_evt = ws.receive_json()
+            assert reload_evt["type"] == "extension_reload_available"
+            assert reload_evt["version"] == "1.3.0"
+            assert "rel130" in (install_dir / "server.py").read_text(encoding="utf-8")
+            assert "BRIDGE_USD_TO_CNY_RATE=6.8" in (install_dir / ".env").read_text(encoding="utf-8")
+
+    # Case B: Backend auto-updated on startup to v1.3.0 while browser still runs v1.1.0 -> auto-triggers reload!
+    mgr_new_backend = UpdateManager(
+        root_dir=install_dir,
+        current_version="1.3.0",
+        repo="StevenLee1471717/Gemini-Enterprise-Bridge",
+        url_fetcher=lambda u, _t, _a: url_map[u],
+    )
+    app_b = create_app(_make_test_settings(), update_manager=mgr_new_backend)
+    with TestClient(app_b) as client:
+        with client.websocket_connect("/ws/browser?client_id=ext-older") as ws:
+            welcome_b = ws.receive_json()
+            assert welcome_b["backend_version"] == "1.3.0"
+            ws.send_json(
+                {
+                    "type": "tab_status",
+                    "extension_version": "1.1.0",
+                    "capabilities": ["multi_tab", "usage_push", "auto_update"],
+                    "tab_id": 12,
+                    "tab_url": "https://vertexaisearch.cloud.google.com/u/0/home",
+                    "ready": True,
+                }
+            )
+            ack_b = ws.receive_json()
+            assert ack_b["type"] == "ack"
+            assert ack_b["backend_version"] == "1.3.0"
+            reload_msg = ws.receive_json()
+            assert reload_msg == {"type": "extension_reload_available", "version": "1.3.0"}

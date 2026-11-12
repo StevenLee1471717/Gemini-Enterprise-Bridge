@@ -7,6 +7,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import List
 
+from version import DEFAULT_GITHUB_REPO
+
 
 def _load_dotenv_file(dotenv_path: Path) -> None:
     """Load key=value pairs from .env without failing if python-dotenv is absent."""
@@ -77,6 +79,9 @@ class BridgeSettings:
     include_citations: bool = True
     cors_allow_origins: List[str] = field(default_factory=lambda: ["*"])
     auto_export_extension: bool = True
+    auto_update: bool = True
+    github_repo: str = DEFAULT_GITHUB_REPO
+    github_token: str = ""
     usage_stats_path: str = ""
     usd_to_cny_rate: float = 6.8
 
@@ -124,6 +129,13 @@ class BridgeSettings:
             include_citations=_env_bool("BRIDGE_INCLUDE_CITATIONS", True),
             cors_allow_origins=origins,
             auto_export_extension=_env_bool("BRIDGE_AUTO_EXPORT_EXTENSION", True),
+            auto_update=_env_bool("BRIDGE_AUTO_UPDATE", True),
+            github_repo=os.getenv("BRIDGE_GITHUB_REPO", DEFAULT_GITHUB_REPO).strip().strip("/")
+            or DEFAULT_GITHUB_REPO,
+            github_token=(
+                os.getenv("BRIDGE_GITHUB_TOKEN", "").strip()
+                or os.getenv("GITHUB_TOKEN", "").strip()
+            ),
             usage_stats_path=os.getenv("BRIDGE_USAGE_STATS_PATH", "").strip(),
             usd_to_cny_rate=_env_float("BRIDGE_USD_TO_CNY_RATE", 6.8),
             gcp_project_id=os.getenv("GCP_PROJECT_ID", "").strip(),

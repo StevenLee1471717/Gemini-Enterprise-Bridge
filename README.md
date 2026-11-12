@@ -150,7 +150,18 @@ print(resp.choices[0].message.tool_calls)
   - **切换本地历史会话 -> 自动开新网页会话并打包上下文**：在客户端侧边栏切回另一条旧会话继续提问时，自动开启干净网页会话并注入该会话历史，彻底杜绝不同本地会话串台。
 - 如希望始终在当前打开的固定网页对话中追加而不自动重置，可在 `.env` 中设 `BRIDGE_AUTO_RESET_NEW_CHAT=false`（此时仍可通过 `*-newchat` 模型名或 `[NEW_CHAT]` 前缀按需新建）。
 
-### 6. 可选方案一：官方 Google Cloud CLI (`gcloud`) 模式
+### 6. GitHub CI/CD 自动发布与「浏览器插件 + 本地后端」双向自动更新
+
+客户端扩展、油猴脚本与本地后端的更新包统一托管于 **GitHub Releases (`StevenLee1471717/Gemini-Enterprise-Bridge/releases/latest/download/...`)**，形成全链路闭环：
+
+- **GitHub Actions 自动测试与打包发布 (`.github/workflows/ci-release.yml`)**：每次推送至 `main` 或打 `v*` 标签自动执行 `pytest`、`node test_page_driver_dom.mjs`、JS 语法检查及 `python extension_exporter.py --package`，并在版本号变更时自动发布含 `SHA-256` 校验清单（`release-manifest.json`）的 `gemini-enterprise-bridge-extension.zip`、`gemini-enterprise-bridge-backend.zip`、`gemini-enterprise-bridge.user.js` 与 `update-manifest.xml`。
+- **本地后端每次启动自动检查更新 (`start.ps1` + `updater.py --startup-update`)**：运行 `start.bat` / `start.ps1` 时自动检查 GitHub 最新 Release（同时支持公开仓库与已登录 `gh` CLI / 配置 `BRIDGE_GITHUB_TOKEN` 的私有仓库），自动拉取更新并严格保留本地 `.env` 与 `usage_stats.json`（可通过 `start.ps1 -SkipUpdate` 或 `BRIDGE_AUTO_UPDATE=false` 关闭）。
+- **浏览器扩展后台自动同步热重载 + 跨端版本协同提示**：
+  - MV3 扩展定期轮询 GitHub Releases，发现新版本后自动请求同步 `extension/` 目录并在无进行中对话时调用 `chrome.runtime.reload()` 无感热重载；
+  - 若**浏览器扩展版本高于本地后端**（或检测到 GitHub 新版），扩展图标自动显示琥珀色 `UPD` 角标，扩展弹窗与 `http://127.0.0.1:8000` 控制台顶部同步弹出醒目提示条，支持点击 **「立即自动更新并重启后端」**（经 `POST /api/update/apply` + 退出码 `42` 守护循环约 3 秒平滑热重启）；
+  - 若**后端启动时率先完成自动升级**，WebSocket 握手后自动推送 `extension_reload_available` 通知浏览器扩展空闲热重载，保持两端版本严格一致。
+
+### 7. 可选方案一：官方 Google Cloud CLI (`gcloud`) 模式
 若后续获得 GCP 项目访问权限，无需修改客户端配置：
 1. 安装 Google Cloud SDK 并执行：`gcloud auth application-default login`
 2. 在 `.env` 中设置 `GCP_PROJECT_ID=你的项目ID`（如需直连 Agentspace 引擎可额外填写 `GCP_ENGINE_ID`）
@@ -180,6 +191,9 @@ pytest -v
 
 ```text
 I:\Projects\Gemini-Enterprise-Bridge\
+├── .github/workflows/ci-release.yml  # GitHub Actions 自动化测试与 Release 产物发布流水线
+├── version.py                        # 全局单一事实源版本号与 GitHub Releases 端点常量
+├── updater.py                        # 零外部依赖 GitHub Releases 自动更新器（SHA-256 校验 + 配置保护）
 ├── server.py                         # FastAPI 主入口（支持 python server.py 直接运行）
 ├── config.py                         # 环境变量与 .env 配置加载
 ├── schemas.py                        # OpenAI 兼容模型、工具参数与网页模型别名解析器

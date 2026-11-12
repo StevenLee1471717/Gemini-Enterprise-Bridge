@@ -15,9 +15,11 @@ const DEFAULT_SETTINGS = {
 };
 
 const ALARM_NAME = "geb-keepalive-alarm";
+const GITHUB_UPDATE_ALARM = "geb-github-update-check";
 const VERTEX_MATCH_PATTERN = "https://vertexaisearch.cloud.google.com/*";
+const DEFAULT_GITHUB_REPO = "StevenLee1471717/Gemini-Enterprise-Bridge";
 
-// Live non-serializable WebSocket handle & per-tab fast caches; durable settings live in chrome.storage
+// Live non-serializable WebSocket handle & per-tab fast caches; durable settings & update state live in chrome.storage
 const socketRuntime = {
   ws: null,
   connecting: false,
@@ -25,9 +27,94 @@ const socketRuntime = {
   reconnectTimer: null,
   reconnectAttempts: 0
 };
-
 const runtimeTabMeta = new Map(); // tabId -> { activeModel, capturedRpc }
 const injectedTabVersions = new Map(); // tabId -> driverVersion
+const activeInFlightRequests = new Map(); // requestId -> expiresAtMs
+
+function getExtensionVersion() {
+  try {
+    return (chrome.runtime.getManifest() && chrome.runtime.getManifest().version) || "1.1.0";
+  } catch (_) {
+    return "1.1.0";
+  }
+}
+
+function normalizeVersion(raw) {
+  const text = String(raw || "").trim();
+  if (text.length > 1 && (text[0] === "v" || text[0] === "V") && /^\d/.test(text.slice(1))) {
+    return text.slice(1);
+  }
+  return text;
+}
+
+function parseSemver(raw) {
+  const text = normalizeVersion(raw);
+  if (!text) return [0, 0, 0, 0, ""];
+  const m = text.match(/^(\d+)(?:\.(\d+))?(?:\.(\d+))?(?:-([0-9A-Za-z.-]+))?/);
+  if (!m) return [0, 0, 0, 1, ""];
+  const major = Number(m[1] || 0);
+  const minor = Number(m[2] || 0);
+  const patch = Number(m[3] || 0);
+  const pre = m[4] || "";
+  return [major, minor, patch, pre ? 0 : 1, pre];
+}
+
+function compareSemver(v1, v2) {
+  const a = parseSemver(v1);
+  const b = parseSemver(v2);
+  for (let i = 0; i < 4; i += 1) {
+    if (a[i] !== b[i]) return a[i] > b[i] ? 1 : -1;
+  }
+  if (a[4] === b[4]) return 0;
+  return a[4] > b[4] ? 1 : -1;
+}
+
+function hasActiveInFlightJobs() {
+  const now = Date.now();
+  for (const [reqId, exp] of activeInFlightRequests.entries()) {
+    if (exp <= now) {
+      activeInFlightRequests.delete(reqId);
+    }
+  }
+  return activeInFlightRequests.size > 0;
+}
+
+async function getUpdateState() {
+  const { updateState = {} } = await chrome.storage.local.get("updateState");
+  return {
+    githubRepo: DEFAULT_GITHUB_REPO,
+    extensionVersion: getExtensionVersion(),
+    backendVersion: "",
+    latestGitHubVersion: "",
+    releaseUrl: `https://github.com/${DEFAULT_GITHUB_REPO}/releases`,
+    backendUpdateRequired: false,
+    extensionOutdated: false,
+    pendingExtensionReloadVersion: "",
+    justAutoUpdatedTo: "",
+    attemptedReloadTargetVersion: "",
+    attemptedReloadFromVersion: "",
+    lastCheckedAt: 0,
+    lastCheckError: "",
+    ...updateState,
+    currentExtensionVersion: getExtensionVersion()
+  };
+}
+
+async function patchUpdateState(patch) {
+  const prev = await getUpdateState();
+  const merged = {
+    ...prev,
+    ...patch,
+    extensionVersion: getExtensionVersion()
+  };
+  delete merged.currentExtensionVersion;
+  await chrome.storage.local.set({ updateState: merged });
+  await setSessionStatus({
+    backendUpdateRequired: Boolean(merged.backendUpdateRequired),
+    extensionOutdated: Boolean(merged.extensionOutdated)
+  });
+  return merged;
+}
 
 async function getSettings() {
   const stored = await chrome.storage.local.get(Object.keys(DEFAULT_SETTINGS));
@@ -72,7 +159,9 @@ async function setSessionStatus(patch) {
       "activeTabUrl",
       "activeTabTitle",
       "capturedRpc",
-      "tabCount"
+      "tabCount",
+      "backendUpdateRequired",
+      "extensionOutdated"
     ]);
     const next = { ...current, ...patch };
     await chrome.storage.session.set(next);
@@ -87,7 +176,10 @@ async function updateActionBadge(status) {
     await chrome.action.setBadgeBackgroundColor({ color: "#64748B" });
     return;
   }
-  if (status.wsConnected && status.activeTabId) {
+  if (status.wsConnected && status.backendUpdateRequired) {
+    await chrome.action.setBadgeText({ text: "UPD" });
+    await chrome.action.setBadgeBackgroundColor({ color: "#D97706" });
+  } else if (status.wsConnected && status.activeTabId) {
     const count = Number(status.tabCount) || 1;
     await chrome.action.setBadgeText({ text: count > 1 ? `${count}T` : "ON" });
     await chrome.action.setBadgeBackgroundColor({ color: "#0D9488" });
@@ -195,7 +287,7 @@ async function reportTabStatusToBackend() {
   const tabsSnapshot = await buildReportedTabsSnapshot();
   const primary = tabsSnapshot[0] || null;
   const { preferredTabId } = await chrome.storage.session.get("preferredTabId");
-  const capabilities = ["multi_tab", "usage_push"];
+  const capabilities = ["multi_tab", "usage_push", "auto_update"];
   if (settings.autoSpawnTabs !== false && !preferredTabId) {
     capabilities.push("spawn_tab");
   }
@@ -211,6 +303,7 @@ async function reportTabStatusToBackend() {
 
   sendWsJson({
     type: "tab_status",
+    extension_version: getExtensionVersion(),
     tab_id: primary ? primary.tab_id : null,
     tab_url: primary ? primary.tab_url : "",
     tab_title: primary ? primary.tab_title : "",
@@ -253,12 +346,13 @@ function startHeartbeatInterval() {
       const tabsSnapshot = await buildReportedTabsSnapshot();
       const primary = tabsSnapshot[0] || null;
       const { preferredTabId } = await chrome.storage.session.get("preferredTabId");
-      const capabilities = ["multi_tab", "usage_push"];
+      const capabilities = ["multi_tab", "usage_push", "auto_update"];
       if (settings.autoSpawnTabs !== false && !preferredTabId) {
         capabilities.push("spawn_tab");
       }
       sendWsJson({
         type: "heartbeat",
+        extension_version: getExtensionVersion(),
         tab_id: primary ? primary.tab_id : null,
         tab_url: primary ? primary.tab_url : "",
         tab_title: primary ? primary.tab_title : "",
@@ -378,6 +472,7 @@ async function ensureWebSocketConnected(forceReconnect = false, fromBackoffTimer
     ws.addEventListener("close", () => {
       void (async () => {
         clearHeartbeatInterval();
+        activeInFlightRequests.clear();
         if (socketRuntime.ws === ws) {
           socketRuntime.ws = null;
           socketRuntime.connecting = false;
@@ -583,13 +678,248 @@ const TAB_IPC_CHUNK_SIZE = 24576;
 const swPromptReassembly = new Map();
 const swReplyReassembly = new Map();
 
-function deriveCallbackUrlFromWs(wsUrl) {
+function deriveHttpBaseFromWs(wsUrl) {
   try {
     const u = new URL(wsUrl || DEFAULT_SETTINGS.wsUrl);
     const proto = u.protocol === "wss:" ? "https:" : "http:";
-    return `${proto}//${u.host}/api/bridge/callback`;
+    return `${proto}//${u.host}`;
   } catch (_) {
-    return "http://127.0.0.1:8000/api/bridge/callback";
+    return "http://127.0.0.1:8000";
+  }
+}
+
+function deriveCallbackUrlFromWs(wsUrl) {
+  return `${deriveHttpBaseFromWs(wsUrl)}/api/bridge/callback`;
+}
+
+async function fetchJsonWithTimeout(url, options = {}, timeoutMs = 8000) {
+  const ctrl = new AbortController();
+  const timer = setTimeout(() => ctrl.abort(), timeoutMs);
+  try {
+    const resp = await fetch(url, { ...options, signal: ctrl.signal });
+    const data = await resp.json();
+    return { ok: resp.ok, status: resp.status, data };
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+async function scheduleOrTriggerExtensionReload(targetVersion, reason = "auto_update", forceManual = false) {
+  const currentExtVer = getExtensionVersion();
+  const normalizedTarget = normalizeVersion(targetVersion);
+  const state = await getUpdateState();
+
+  // Prevent infinite reload loop if user loaded unpacked extension from a non-default directory
+  if (
+    !forceManual &&
+    normalizedTarget &&
+    state.attemptedReloadFromVersion === currentExtVer &&
+    state.attemptedReloadTargetVersion === normalizedTarget
+  ) {
+    await appendLog(
+      "warn",
+      `已同步插件目录至 v${normalizedTarget}，但当前运行实例仍为 v${currentExtVer}；请在扩展弹窗点击重载或确认加载目录为 extension/`
+    );
+    await patchUpdateState({
+      extensionOutdated: true,
+      pendingExtensionReloadVersion: normalizedTarget
+    });
+    return { reloaded: false, deferred: false, manualRequired: true };
+  }
+
+  if (!forceManual && hasActiveInFlightJobs()) {
+    await appendLog(
+      "info",
+      `检测到插件新版本 v${normalizedTarget || "latest"} (${reason})，等待当前对话生成完成后自动无感热重载...`
+    );
+    await patchUpdateState({
+      extensionOutdated: true,
+      pendingExtensionReloadVersion: normalizedTarget || "latest"
+    });
+    return { reloaded: false, deferred: true };
+  }
+
+  await patchUpdateState({
+    justAutoUpdatedTo: normalizedTarget || currentExtVer,
+    pendingExtensionReloadVersion: "",
+    extensionOutdated: false,
+    attemptedReloadFromVersion: currentExtVer,
+    attemptedReloadTargetVersion: normalizedTarget || currentExtVer
+  });
+  await appendLog(
+    "info",
+    `正在自动热重载浏览器扩展至 v${normalizedTarget || currentExtVer} (${reason})...`
+  );
+  setTimeout(() => {
+    chrome.runtime.reload();
+  }, 180);
+  return { reloaded: true, deferred: false };
+}
+
+async function maybeReloadPendingExtensionUpdate() {
+  if (hasActiveInFlightJobs()) return;
+  const state = await getUpdateState();
+  if (state.pendingExtensionReloadVersion) {
+    await scheduleOrTriggerExtensionReload(state.pendingExtensionReloadVersion, "idle_deferred_reload", false);
+  }
+}
+
+async function syncExtensionDiskAndReload(targetVersionHint = "", forceManual = false) {
+  const settings = await getSettings();
+  const httpBase = deriveHttpBaseFromWs(settings.wsUrl);
+  try {
+    const res = await fetchJsonWithTimeout(
+      `${httpBase}/api/update/extension`,
+      { method: "POST", headers: { "Content-Type": "application/json" } },
+      45000
+    );
+    if (res.ok && res.data && res.data.ok) {
+      const ver = normalizeVersion(res.data.updated_version || targetVersionHint);
+      await appendLog("info", `已从 GitHub Release 下载并更新本地 extension/ 目录至 v${ver}`);
+      const reloadInfo = await scheduleOrTriggerExtensionReload(ver, "github_extension_sync", forceManual);
+      return { ok: true, updatedVersion: ver, ...reloadInfo };
+    }
+    const errMsg = (res.data && res.data.error) || `HTTP ${res.status}`;
+    await appendLog("warn", `同步扩展更新包失败: ${errMsg}`);
+    return { ok: false, error: errMsg };
+  } catch (err) {
+    await appendLog("warn", `无法请求本地后端同步扩展目录: ${err.message}`);
+    return { ok: false, error: err.message };
+  }
+}
+
+async function checkGitHubReleaseDirectly(repo = DEFAULT_GITHUB_REPO) {
+  const cleanRepo = String(repo || DEFAULT_GITHUB_REPO).trim().replace(/^\/+|\/+$/g, "");
+  const manifestUrl = `https://github.com/${cleanRepo}/releases/latest/download/release-manifest.json`;
+  const latestApiUrl = `https://api.github.com/repos/${cleanRepo}/releases/latest`;
+
+  try {
+    const mfRes = await fetchJsonWithTimeout(
+      manifestUrl,
+      { headers: { Accept: "application/json", "Cache-Control": "no-cache" } },
+      7000
+    );
+    if (mfRes.ok && mfRes.data && mfRes.data.version) {
+      const ver = normalizeVersion(mfRes.data.version);
+      return {
+        ok: true,
+        version: ver,
+        releaseUrl:
+          mfRes.data.release_url || `https://github.com/${cleanRepo}/releases/tag/v${ver}`
+      };
+    }
+  } catch (_) {}
+
+  try {
+    const apiRes = await fetchJsonWithTimeout(
+      latestApiUrl,
+      { headers: { Accept: "application/vnd.github+json" } },
+      7000
+    );
+    if (apiRes.ok && apiRes.data && apiRes.data.tag_name) {
+      const ver = normalizeVersion(apiRes.data.tag_name);
+      return {
+        ok: true,
+        version: ver,
+        releaseUrl:
+          apiRes.data.html_url || `https://github.com/${cleanRepo}/releases/tag/${apiRes.data.tag_name}`
+      };
+    }
+  } catch (err) {
+    return { ok: false, version: "", error: err.message };
+  }
+  return { ok: false, version: "", error: "no_github_release" };
+}
+
+async function checkUpdatesAndAutoSync(force = false) {
+  const { checkingUpdateLock = 0 } = await chrome.storage.session.get("checkingUpdateLock");
+  if (!force && checkingUpdateLock && Date.now() - checkingUpdateLock < 20000) {
+    return await getUpdateState();
+  }
+  await chrome.storage.session.set({ checkingUpdateLock: Date.now() });
+
+  try {
+    const settings = await getSettings();
+    const httpBase = deriveHttpBaseFromWs(settings.wsUrl);
+    const prev = await getUpdateState();
+    const extVer = getExtensionVersion();
+    let backendVer = prev.backendVersion || "";
+    let latestGitHubVer = prev.latestGitHubVersion || "";
+    let releaseUrl = prev.releaseUrl || `https://github.com/${DEFAULT_GITHUB_REPO}/releases`;
+    let githubRepo = prev.githubRepo || DEFAULT_GITHUB_REPO;
+    let lastCheckError = "";
+
+    // Path A: Query local backend /api/update/status (supports private repos via gh CLI / token)
+    try {
+      const bRes = await fetchJsonWithTimeout(
+        `${httpBase}/api/update/status?force=${force ? "true" : "false"}`,
+        { method: "GET" },
+        8500
+      );
+      if (bRes.ok && bRes.data) {
+        if (bRes.data.repo) githubRepo = bRes.data.repo;
+        if (bRes.data.current_backend_version) {
+          backendVer = normalizeVersion(bRes.data.current_backend_version);
+        }
+        if (bRes.data.latest_github_version) {
+          const bRemote = normalizeVersion(bRes.data.latest_github_version);
+          if (!latestGitHubVer || compareSemver(bRemote, latestGitHubVer) >= 0) {
+            latestGitHubVer = bRemote;
+          }
+        }
+        if (bRes.data.release_url) releaseUrl = bRes.data.release_url;
+      }
+    } catch (_) {}
+
+    // Path B: Directly poll GitHub Releases from MV3 Service Worker (works even when backend is offline/old)
+    const direct = await checkGitHubReleaseDirectly(githubRepo);
+    if (direct.ok && direct.version) {
+      if (!latestGitHubVer || compareSemver(direct.version, latestGitHubVer) >= 0) {
+        latestGitHubVer = direct.version;
+        if (direct.releaseUrl) releaseUrl = direct.releaseUrl;
+      }
+    } else if (!latestGitHubVer && direct.error) {
+      lastCheckError = direct.error;
+    }
+
+    const extNewerThanBackend = Boolean(backendVer && compareSemver(extVer, backendVer) > 0);
+    const githubNewerThanBackend = Boolean(
+      backendVer && latestGitHubVer && compareSemver(latestGitHubVer, backendVer) > 0
+    );
+    const backendUpdateRequired = extNewerThanBackend || githubNewerThanBackend;
+
+    const githubNewerThanExt = Boolean(latestGitHubVer && compareSemver(latestGitHubVer, extVer) > 0);
+    const backendNewerThanExt = Boolean(backendVer && compareSemver(backendVer, extVer) > 0);
+    const extensionOutdated = githubNewerThanExt || backendNewerThanExt;
+
+    // Clear justAutoUpdatedTo notice once backend catches up
+    let justAutoUpdatedTo = prev.justAutoUpdatedTo || "";
+    if (justAutoUpdatedTo && backendVer && compareSemver(backendVer, justAutoUpdatedTo) >= 0 && !backendUpdateRequired) {
+      justAutoUpdatedTo = "";
+    }
+
+    const updatedState = await patchUpdateState({
+      githubRepo,
+      backendVersion: backendVer,
+      latestGitHubVersion: latestGitHubVer,
+      releaseUrl,
+      backendUpdateRequired,
+      extensionOutdated,
+      justAutoUpdatedTo,
+      lastCheckedAt: Date.now(),
+      lastCheckError
+    });
+
+    // Automatically sync & hot-reload unpacked extension when GitHub has a newer release
+    if (githubNewerThanExt) {
+      await syncExtensionDiskAndReload(latestGitHubVer, false);
+    } else if (backendNewerThanExt) {
+      await scheduleOrTriggerExtensionReload(backendVer, "backend_ahead", false);
+    }
+
+    return updatedState;
+  } finally {
+    await chrome.storage.session.set({ checkingUpdateLock: 0 });
   }
 }
 
@@ -656,6 +986,44 @@ async function handleBackendCommand(msg) {
       await chrome.storage.session.set({ usageSnapshot: msg.usage_snapshot });
     } catch (_) {}
   }
+  if (msg && msg.backend_version) {
+    const bVer = normalizeVersion(msg.backend_version);
+    const extVer = getExtensionVersion();
+    const state = await getUpdateState();
+    const remoteVer = state.latestGitHubVersion || "";
+    const backendOutdated =
+      Boolean(msg.backend_update_required) ||
+      compareSemver(extVer, bVer) > 0 ||
+      Boolean(remoteVer && compareSemver(remoteVer, bVer) > 0);
+    const extOutdated =
+      compareSemver(bVer, extVer) > 0 ||
+      Boolean(remoteVer && compareSemver(remoteVer, extVer) > 0);
+    let clearedNotice = state.justAutoUpdatedTo || "";
+    if (clearedNotice && compareSemver(bVer, clearedNotice) >= 0 && !backendOutdated) {
+      clearedNotice = "";
+    }
+    await patchUpdateState({
+      backendVersion: bVer,
+      backendUpdateRequired: backendOutdated,
+      extensionOutdated: extOutdated,
+      justAutoUpdatedTo: clearedNotice
+    });
+    if (compareSemver(extVer, bVer) > 0) {
+      await appendLog(
+        "warn",
+        `插件已更新至 v${extVer}，检测到本地后端仍为 v${bVer} — 请在插件弹窗或控制台一键更新后端`
+      );
+    }
+  }
+
+  if (type === "extension_reload_available") {
+    const targetVer = normalizeVersion(msg.version || "");
+    if (!targetVer || compareSemver(targetVer, getExtensionVersion()) > 0) {
+      await scheduleOrTriggerExtensionReload(targetVer || getExtensionVersion(), "backend_ws_push", false);
+    }
+    return;
+  }
+
   if (type === "welcome" || type === "pong" || type === "ack" || type === "usage_update") {
     return;
   }
@@ -721,8 +1089,9 @@ async function handleBackendCommand(msg) {
       return;
     }
 
+    const reqTtlMs = Math.max(60000, Number(msg.timeout_ms) || 600000) + 15000;
+    activeInFlightRequests.set(requestId, Date.now() + reqTtlMs);
     sendWsJson({ type: "request_ack", request_id: requestId, tab_id: rawTab.id });
-
     const tab = await prepareTabForBackgroundExecution(rawTab);
 
     await appendLog(
@@ -810,17 +1179,22 @@ async function handleBackendCommand(msg) {
       try {
         await dispatchToReadyTab();
       } catch (retryErr) {
+        activeInFlightRequests.delete(requestId);
         sendWsJson({
           type: "request_error",
           request_id: requestId,
           error: "无法向 Gemini Enterprise 标签页注入桥接脚本，请刷新该网页后重试: " + retryErr.message
         });
+        await maybeReloadPendingExtensionUpdate();
       }
     }
     return;
   }
 
   if (type === "cancel_request") {
+    if (msg.request_id) {
+      activeInFlightRequests.delete(msg.request_id);
+    }
     const tab = await findTargetVertexTab(msg.tab_id);
     if (tab && tab.id) {
       try {
@@ -830,21 +1204,35 @@ async function handleBackendCommand(msg) {
         });
       } catch (_) {}
     }
+    await maybeReloadPendingExtensionUpdate();
   }
 }
 
 async function setupAlarms() {
   await chrome.alarms.create(ALARM_NAME, { periodInMinutes: 0.4 });
+  await chrome.alarms.create(GITHUB_UPDATE_ALARM, { periodInMinutes: 30 });
 }
 
-chrome.runtime.onInstalled.addListener(() => {
+chrome.runtime.onInstalled.addListener((details) => {
   void (async () => {
     const existing = await chrome.storage.local.get(Object.keys(DEFAULT_SETTINGS));
     const merged = { ...DEFAULT_SETTINGS, ...existing };
     await chrome.storage.local.set(merged);
+    if (details && details.reason === "update") {
+      const curVer = getExtensionVersion();
+      await patchUpdateState({
+        justAutoUpdatedTo: curVer,
+        pendingExtensionReloadVersion: "",
+        extensionOutdated: false,
+        attemptedReloadFromVersion: "",
+        attemptedReloadTargetVersion: ""
+      });
+      await appendLog("info", `浏览器扩展已升级并热重载至 v${curVer}`);
+    }
     await setupAlarms();
     await injectIntoExistingTabs();
     await ensureWebSocketConnected(false);
+    void checkUpdatesAndAutoSync(false);
   })();
 });
 
@@ -853,12 +1241,15 @@ chrome.runtime.onStartup.addListener(() => {
     await setupAlarms();
     await injectIntoExistingTabs();
     await ensureWebSocketConnected(false);
+    void checkUpdatesAndAutoSync(false);
   })();
 });
 
 chrome.alarms.onAlarm.addListener((alarm) => {
   if (alarm.name === ALARM_NAME) {
     void ensureWebSocketConnected(false);
+  } else if (alarm.name === GITHUB_UPDATE_ALARM) {
+    void checkUpdatesAndAutoSync(false);
   }
 });
 
@@ -992,7 +1383,12 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
         entry.parts[eventData.chunk_index] = eventData.data || "";
         if (eventData.total_chunks) entry.total = eventData.total_chunks;
       } else {
-        // stream_chunk | request_complete | request_error
+        // stream_chunk | request_progress | request_complete | request_error
+        if ((eventData.type === "stream_chunk" || eventData.type === "request_progress") && eventData.request_id) {
+          if (activeInFlightRequests.has(eventData.request_id)) {
+            activeInFlightRequests.set(eventData.request_id, Date.now() + 180000);
+          }
+        }
         if (eventData.type === "request_complete" && eventData.chunked) {
           const entry = swReplyReassembly.get(eventData.request_id);
           swReplyReassembly.delete(eventData.request_id);
@@ -1004,6 +1400,12 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
         } else {
           await deliverResultToBackend(eventData);
         }
+        if (eventData.type === "request_complete" || eventData.type === "request_error") {
+          if (eventData.request_id) {
+            activeInFlightRequests.delete(eventData.request_id);
+          }
+          await maybeReloadPendingExtensionUpdate();
+        }
       }
       sendResponse({ ok: true });
       return;
@@ -1012,6 +1414,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     if (msgType === "GEB_POPUP_GET_STATE") {
       await ensureWebSocketConnected(false);
       const settings = await getSettings();
+      const updateState = await getUpdateState();
       const tab = await findBestVertexTab();
       const session = await chrome.storage.session.get([
         "wsConnected",
@@ -1025,6 +1428,8 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
       const allTabs = await chrome.tabs.query({ url: VERTEX_MATCH_PATTERN });
       sendResponse({
         ok: true,
+        extensionVersion: getExtensionVersion(),
+        updateState,
         settings,
         wsConnected: Boolean(socketRuntime.ws && socketRuntime.ws.readyState === WebSocket.OPEN),
         lastError: session.lastError || "",
@@ -1043,6 +1448,18 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
         })),
         logs: session.logs || []
       });
+      return;
+    }
+
+    if (msgType === "GEB_POPUP_CHECK_UPDATE") {
+      const uState = await checkUpdatesAndAutoSync(true);
+      sendResponse({ ok: true, updateState: uState });
+      return;
+    }
+
+    if (msgType === "GEB_POPUP_SYNC_EXTENSION") {
+      const syncRes = await syncExtensionDiskAndReload(message.targetVersion || "", true);
+      sendResponse(syncRes);
       return;
     }
 

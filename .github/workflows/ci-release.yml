@@ -1,0 +1,129 @@
+name: CI & GitHub Release
+
+on:
+  push:
+    branches:
+      - main
+    tags:
+      - "v*"
+  pull_request:
+    branches:
+      - main
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: Test & Package Verification
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: "pip"
+
+      - name: Set up Node.js 20
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - name: Install Python dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt pytest httpx
+
+      - name: Syntax check JavaScript files
+        run: |
+          for js in background.js content-bridge.js page-driver.js popup.js gemini-enterprise-bridge.user.js; do
+            node --check "$js"
+          done
+
+      - name: Run DOM driver unit tests
+        run: node test_page_driver_dom.mjs
+
+      - name: Run Python test suite
+        run: pytest -v
+
+      - name: Build deterministic release packages & verify SHA-256
+        run: |
+          python extension_exporter.py --package
+          python - <<'PY'
+          import hashlib, json
+          from pathlib import Path
+
+          dist = Path("dist")
+          manifest = json.loads((dist / "release-manifest.json").read_text(encoding="utf-8"))
+          for asset_name, sha_key in [
+              ("gemini-enterprise-bridge-extension.zip", "extension_zip_sha256"),
+              ("gemini-enterprise-bridge-backend.zip", "backend_zip_sha256"),
+              ("gemini-enterprise-bridge.user.js", "userscript_sha256"),
+          ]:
+              path = dist / asset_name
+              assert path.is_file() and path.stat().st_size > 0, f"Missing {asset_name}"
+              actual = hashlib.sha256(path.read_bytes()).hexdigest()
+              assert actual == manifest[sha_key], f"SHA mismatch for {asset_name}: {actual} != {manifest[sha_key]}"
+          assert (dist / "update-manifest.xml").is_file(), "Missing update-manifest.xml"
+          print("Verified release artifacts for", manifest["tag"])
+          PY
+
+  release:
+    name: Publish GitHub Release Assets
+    needs: test
+    if: github.event_name == 'workflow_dispatch' || startsWith(github.ref, 'refs/tags/v') || github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Build release artifacts
+        id: pkg
+        env:
+          BRIDGE_GITHUB_REPO: ${{ github.repository }}
+        run: |
+          python extension_exporter.py --package
+          VERSION=$(python -c 'from version import APP_VERSION; print(APP_VERSION)')
+          echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
+          echo "tag=v${VERSION}" >> "$GITHUB_OUTPUT"
+
+      - name: Create or update GitHub Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ steps.pkg.outputs.tag }}
+          VERSION: ${{ steps.pkg.outputs.version }}
+        run: |
+          ASSETS=(
+            "dist/gemini-enterprise-bridge-extension.zip"
+            "dist/gemini-enterprise-bridge-backend.zip"
+            "dist/gemini-enterprise-bridge.user.js"
+            "dist/release-manifest.json"
+            "dist/update-manifest.xml"
+          )
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            if [[ "${{ github.event_name }}" == "workflow_dispatch" || "${{ github.ref }}" == "refs/tags/$TAG" ]]; then
+              echo "Updating existing release $TAG assets..."
+              gh release upload "$TAG" "${ASSETS[@]}" --clobber
+            else
+              echo "Release $TAG already exists on push to main; skipping asset overwrite."
+            fi
+          else
+            echo "Creating new GitHub Release $TAG..."
+            gh release create "$TAG" "${ASSETS[@]}" \
+              --title "Gemini Enterprise Bridge $TAG" \
+              --generate-notes \
+              --latest
+          fi

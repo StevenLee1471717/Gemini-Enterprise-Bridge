@@ -1,6 +1,14 @@
 // Popup controller for Gemini Enterprise Web-to-API Bridge (MV3 compliant, async/await)
 
 const elEnabled = document.getElementById("enabledToggle");
+const elExtVersionPill = document.getElementById("extVersionPill");
+const elCheckUpdateBtn = document.getElementById("checkUpdateBtn");
+const elUpdateBanner = document.getElementById("updateBanner");
+const elUpdateTitle = document.getElementById("updateBannerTitle");
+const elUpdateReleaseLink = document.getElementById("updateReleaseLink");
+const elUpdateDesc = document.getElementById("updateBannerDesc");
+const elApplyBackendUpdateBtn = document.getElementById("applyBackendUpdateBtn");
+const elSyncExtUpdateBtn = document.getElementById("syncExtUpdateBtn");
 const elWsPill = document.getElementById("wsStatusPill");
 const elTabStatus = document.getElementById("tabStatusText");
 const elRpcStatus = document.getElementById("rpcStatusText");
@@ -223,7 +231,74 @@ function renderUsageAndContext(snapshot) {
   }
 }
 
-async function refreshBackendUsageLive(wsUrl, fallbackSnapshot) {
+function renderUpdateBanner(extVer, updateState, liveApiStatus = null) {
+  if (elExtVersionPill && extVer) {
+    elExtVersionPill.textContent = `v${String(extVer).replace(/^v/i, "")}`;
+  }
+  if (!elUpdateBanner) return;
+
+  const u = updateState || {};
+  const apiUpd = (liveApiStatus && liveApiStatus.update) || {};
+  const cleanExtVer = String(extVer || u.extensionVersion || "1.1.0").replace(/^v/i, "");
+  const backendVer = String(
+    (liveApiStatus && liveApiStatus.backend_version) ||
+      apiUpd.current_backend_version ||
+      u.backendVersion ||
+      ""
+  ).replace(/^v/i, "");
+  const remoteVer = String(
+    apiUpd.latest_github_version || u.latestGitHubVersion || ""
+  ).replace(/^v/i, "");
+  const releaseUrl =
+    apiUpd.release_url ||
+    u.releaseUrl ||
+    "https://github.com/StevenLee1471717/Gemini-Enterprise-Bridge/releases";
+
+  if (elUpdateReleaseLink) {
+    elUpdateReleaseLink.href = releaseUrl;
+  }
+
+  const backendNeedsUpdate = Boolean(
+    (liveApiStatus && liveApiStatus.backend_update_required) ||
+      apiUpd.backend_outdated ||
+      u.backendUpdateRequired
+  );
+  const extNeedsUpdate = Boolean(apiUpd.extension_outdated || u.extensionOutdated);
+
+  if (backendNeedsUpdate) {
+    elUpdateBanner.hidden = false;
+    const targetV = remoteVer || cleanExtVer;
+    if (elUpdateTitle) {
+      elUpdateTitle.textContent = `请更新本地后端 -> v${targetV}`;
+    }
+    if (elUpdateDesc) {
+      const prefix =
+        backendVer && cleanExtVer !== backendVer
+          ? `插件已更新至 v${cleanExtVer}`
+          : `检测到 GitHub 新版本 v${targetV}`;
+      elUpdateDesc.textContent = `${prefix}，当前本地后端为 v${backendVer || "旧版"} — 点击下方按钮即可从 GitHub 自动更新并平滑重启后端（保留 .env 与统计）。`;
+    }
+    if (elApplyBackendUpdateBtn) elApplyBackendUpdateBtn.hidden = false;
+    if (elSyncExtUpdateBtn) elSyncExtUpdateBtn.hidden = !extNeedsUpdate;
+  } else if (extNeedsUpdate) {
+    elUpdateBanner.hidden = false;
+    const targetV = remoteVer || backendVer || "latest";
+    if (elUpdateTitle) {
+      elUpdateTitle.textContent = `检测到插件新版本 v${targetV}`;
+    }
+    if (elUpdateDesc) {
+      elUpdateDesc.textContent = u.pendingExtensionReloadVersion
+        ? `本地 extension/ 已同步至 v${targetV}，将在空闲时自动重载；也可点击立即重载。`
+        : `当前浏览器插件为 v${cleanExtVer}，可从 GitHub Releases 自动同步并热重载至 v${targetV}。`;
+    }
+    if (elApplyBackendUpdateBtn) elApplyBackendUpdateBtn.hidden = true;
+    if (elSyncExtUpdateBtn) elSyncExtUpdateBtn.hidden = false;
+  } else {
+    elUpdateBanner.hidden = true;
+  }
+}
+
+async function refreshBackendUsageLive(wsUrl, fallbackSnapshot, extVer, cachedUpdateState) {
   const baseHttp = deriveHttpConsoleUrl(wsUrl);
   try {
     const ctrl = new AbortController();
@@ -232,6 +307,7 @@ async function refreshBackendUsageLive(wsUrl, fallbackSnapshot) {
     clearTimeout(timer);
     if (resp.ok) {
       const data = await resp.json();
+      renderUpdateBanner(extVer, cachedUpdateState, data);
       if (data && data.usage) {
         renderUsageAndContext({
           usage: data.usage,
@@ -243,6 +319,7 @@ async function refreshBackendUsageLive(wsUrl, fallbackSnapshot) {
   } catch (_) {
     // Fall back to cached WebSocket snapshot when backend HTTP is unreachable
   }
+  renderUpdateBanner(extVer, cachedUpdateState, null);
   if (fallbackSnapshot) {
     renderUsageAndContext(fallbackSnapshot);
   }
@@ -254,8 +331,8 @@ async function loadState(overwriteInputs = false) {
     if (!state || !state.ok) {
       return;
     }
-
-    const { settings, wsConnected, lastError, capturedRpc, activeModel, activeTab, vertexTabs, preferredTabId, usageSnapshot, logs } = state;
+    const { extensionVersion, updateState, settings, wsConnected, lastError, capturedRpc, activeModel, activeTab, vertexTabs, preferredTabId, usageSnapshot, logs } = state;
+    renderUpdateBanner(extensionVersion, updateState, null);
 
     if (!initialFormHydrated || overwriteInputs) {
       elEnabled.checked = Boolean(settings.enabled);
@@ -329,7 +406,7 @@ async function loadState(overwriteInputs = false) {
     if (usageSnapshot) {
       renderUsageAndContext(usageSnapshot);
     }
-    void refreshBackendUsageLive(settings.wsUrl, usageSnapshot);
+    void refreshBackendUsageLive(settings.wsUrl, usageSnapshot, extensionVersion, updateState);
 
     if (!elDiagOut.dataset.showingDiag) {
       elDiagOut.textContent = formatLogs(logs);
@@ -447,6 +524,88 @@ if (elResetUsageBtn) {
         }
       } catch (err) {
         elDiagOut.textContent = "重置用量统计失败: " + err.message;
+      }
+    })();
+  });
+}
+
+if (elCheckUpdateBtn) {
+  elCheckUpdateBtn.addEventListener("click", () => {
+    void (async () => {
+      elCheckUpdateBtn.disabled = true;
+      elCheckUpdateBtn.textContent = "检查中...";
+      try {
+        const res = await chrome.runtime.sendMessage({ type: "GEB_POPUP_CHECK_UPDATE" });
+        await loadState(false);
+        const u = (res && res.updateState) || {};
+        if (!u.backendUpdateRequired && !u.extensionOutdated) {
+          elCheckUpdateBtn.textContent = "已是最新";
+          setTimeout(() => {
+            elCheckUpdateBtn.textContent = "检查更新";
+          }, 2200);
+        } else {
+          elCheckUpdateBtn.textContent = `发现 v${u.latestGitHubVersion || u.backendVersion}`;
+        }
+      } catch (_) {
+        elCheckUpdateBtn.textContent = "检查失败";
+        setTimeout(() => {
+          elCheckUpdateBtn.textContent = "检查更新";
+        }, 2200);
+      } finally {
+        elCheckUpdateBtn.disabled = false;
+      }
+    })();
+  });
+}
+
+if (elApplyBackendUpdateBtn) {
+  elApplyBackendUpdateBtn.addEventListener("click", () => {
+    void (async () => {
+      const baseHttp = deriveHttpConsoleUrl(elWsUrl.value);
+      elApplyBackendUpdateBtn.disabled = true;
+      elApplyBackendUpdateBtn.textContent = "正在更新并重启后端...";
+      try {
+        const resp = await fetch(`${baseHttp}api/update/apply`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ restart: true })
+        });
+        const data = await resp.json();
+        if (resp.ok && data.ok) {
+          if (elUpdateDesc) {
+            elUpdateDesc.textContent =
+              data.message || `已更新至 v${data.updated_version}，后端正在平滑重启...`;
+          }
+        } else if (elUpdateDesc) {
+          elUpdateDesc.textContent = `自动更新失败: ${(data && data.error) || resp.status}`;
+        }
+      } catch (_) {
+        if (elUpdateDesc) {
+          elUpdateDesc.textContent = "后端已触发热重启更新，预计约 3 秒后自动恢复连接...";
+        }
+      } finally {
+        setTimeout(() => {
+          elApplyBackendUpdateBtn.disabled = false;
+          elApplyBackendUpdateBtn.textContent = "立即自动更新并重启后端";
+          void loadState(false);
+        }, 3500);
+      }
+    })();
+  });
+}
+
+if (elSyncExtUpdateBtn) {
+  elSyncExtUpdateBtn.addEventListener("click", () => {
+    void (async () => {
+      elSyncExtUpdateBtn.disabled = true;
+      elSyncExtUpdateBtn.textContent = "正在同步并重载...";
+      const res = await chrome.runtime.sendMessage({ type: "GEB_POPUP_SYNC_EXTENSION" });
+      if (!res || !res.ok) {
+        elSyncExtUpdateBtn.disabled = false;
+        elSyncExtUpdateBtn.textContent = "同步并重载插件";
+        if (elUpdateDesc) {
+          elUpdateDesc.textContent = "同步插件失败: " + ((res && res.error) || "请确认本地后端已启动");
+        }
       }
     })();
   });

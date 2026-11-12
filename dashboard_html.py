@@ -238,14 +238,30 @@ DASHBOARD_HTML = """<!DOCTYPE html>
   <div class="wrap">
     <header>
       <div>
-        <h1>Gemini Enterprise Bridge</h1>
+        <h1>Gemini Enterprise Bridge <span class="mono" id="dashVerBadge" style="font-size:0.8rem;font-weight:600;">v1.1.0</span></h1>
         <div class="muted">Vertex AI Search / Agentspace 浏览器回路 OpenAI API 本地代理网关</div>
       </div>
-      <div class="badge" id="connBadge">
-        <span class="dot" id="connDot"></span>
-        <span id="connText">正在检测状态...</span>
+      <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap;">
+        <button id="checkUpdateDashBtn" class="secondary" type="button" style="padding:6px 12px;font-size:0.82rem;">检查 GitHub 更新</button>
+        <div class="badge" id="connBadge">
+          <span class="dot" id="connDot"></span>
+          <span id="connText">正在检测状态...</span>
+        </div>
       </div>
     </header>
+
+    <section class="card" id="dashUpdateBanner" hidden style="margin-bottom: 18px; border-color: var(--warn);">
+      <div style="display:flex;justify-content:space-between;align-items:center;gap:12px;flex-wrap:wrap;">
+        <div>
+          <strong id="dashUpdateTitle" style="color:var(--warn);">检测到新版本可用</strong>
+          <div id="dashUpdateDesc" class="muted" style="margin-top:4px;color:var(--text);"></div>
+        </div>
+        <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap;">
+          <button id="applyUpdateDashBtn" type="button">立即从 GitHub 更新后端与插件</button>
+          <a id="dashReleaseLink" href="https://github.com/StevenLee1471717/Gemini-Enterprise-Bridge/releases" target="_blank" rel="noreferrer" class="mono" style="text-decoration:none;color:var(--accent);">查看 Release</a>
+        </div>
+      </div>
+    </section>
 
     <div class="grid">
       <section class="card">
@@ -491,6 +507,12 @@ DASHBOARD_HTML = """<!DOCTYPE html>
           (hub.queued_requests || 0) + ' 排队 / ' +
           (hub.total_requests || 0) + ' 总计';
 
+        if (data.backend_version) {
+          const extTag = data.connected_extension_version ? (' · 插件 v' + data.connected_extension_version) : '';
+          document.getElementById('dashVerBadge').textContent = '后端 v' + data.backend_version + extTag;
+        }
+        renderDashboardUpdateBanner(data);
+
         renderDashboardUsage(data.usage || {}, data.context_monitor || {});
 
         const logs = hub.recent_logs || [];
@@ -573,6 +595,87 @@ DASHBOARD_HTML = """<!DOCTYPE html>
         await refreshStatus();
       }
     }
+
+    function renderDashboardUpdateBanner(data) {
+      const banner = document.getElementById('dashUpdateBanner');
+      const titleEl = document.getElementById('dashUpdateTitle');
+      const descEl = document.getElementById('dashUpdateDesc');
+      const linkEl = document.getElementById('dashReleaseLink');
+      const upd = data.update || {};
+      const bVer = data.backend_version || upd.current_backend_version || '';
+      const eVer = data.connected_extension_version || upd.connected_extension_version || '';
+      const gVer = upd.latest_github_version || '';
+      if (upd.release_url) {
+        linkEl.href = upd.release_url;
+      }
+      if (data.backend_update_required || upd.backend_outdated) {
+        banner.hidden = false;
+        const targetV = gVer || eVer || 'latest';
+        titleEl.textContent = '需要更新本地后端（目标版本 v' + targetV + '）';
+        descEl.textContent =
+          (eVer && eVer !== bVer
+            ? ('浏览器插件已自动更新至 v' + eVer + '，而当前本地后端仍为 v' + bVer + '。')
+            : ('检测到 GitHub Release 新版本 v' + targetV + '（当前本地后端 v' + bVer + '）。')) +
+          ' 点击右侧按钮即可从 GitHub Releases 自动下载更新包（保留 .env 与历史统计）并平滑重启。';
+      } else if (upd.extension_outdated) {
+        banner.hidden = false;
+        titleEl.textContent = '浏览器扩展待同步更新（当前插件 v' + eVer + ' -> v' + (gVer || bVer) + '）';
+        descEl.textContent = '后端已就绪并通知扩展空闲时自动重载；也可点击右侧按钮立即从 GitHub 同步 extension/ 目录。';
+      } else {
+        banner.hidden = true;
+      }
+    }
+
+    document.getElementById('checkUpdateDashBtn').addEventListener('click', async function () {
+      const btn = document.getElementById('checkUpdateDashBtn');
+      btn.disabled = true;
+      btn.textContent = '检查中...';
+      try {
+        const res = await fetch('/api/update/status?force=true');
+        const u = await res.json();
+        await refreshStatus();
+        if (!u.update_available) {
+          btn.textContent = '已是最新 (v' + (u.current_backend_version || '1.1.0') + ')';
+          setTimeout(function () { btn.textContent = '检查 GitHub 更新'; }, 2500);
+        } else {
+          btn.textContent = '发现 v' + (u.latest_github_version || u.highest_known_version);
+        }
+      } catch (_) {
+        btn.textContent = '检查失败';
+        setTimeout(function () { btn.textContent = '检查 GitHub 更新'; }, 2500);
+      } finally {
+        btn.disabled = false;
+      }
+    });
+
+    document.getElementById('applyUpdateDashBtn').addEventListener('click', async function () {
+      const btn = document.getElementById('applyUpdateDashBtn');
+      const descEl = document.getElementById('dashUpdateDesc');
+      btn.disabled = true;
+      btn.textContent = '正在从 GitHub 下载并更新...';
+      try {
+        const res = await fetch('/api/update/apply', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ restart: true })
+        });
+        const out = await res.json();
+        if (res.ok && out.ok) {
+          descEl.textContent = out.message || ('已更新至 v' + out.updated_version + '，正在重启服务...');
+          setTimeout(refreshStatus, 3200);
+        } else {
+          descEl.textContent = '自动更新失败: ' + (out.error || ('HTTP ' + res.status));
+        }
+      } catch (err) {
+        descEl.textContent = '后端正在重启以应用新版本，约 3 秒后自动恢复连接...';
+        setTimeout(refreshStatus, 3200);
+      } finally {
+        setTimeout(function () {
+          btn.disabled = false;
+          btn.textContent = '立即从 GitHub 更新后端与插件';
+        }, 3500);
+      }
+    });
 
     document.getElementById('sendBtn').addEventListener('click', sendTestPrompt);
     document.getElementById('refreshBtn').addEventListener('click', refreshStatus);

@@ -10,14 +10,32 @@
   <main class="container">
     <header class="header">
       <div>
-        <h1>Gemini Enterprise Bridge</h1>
-        <p class="subtitle">Vertex AI Search / Agentspace 本地网关</p>
+        <div class="title-row">
+          <h1>Gemini Enterprise Bridge</h1>
+          <span class="ver-pill" id="extVersionPill">v1.1.0</span>
+        </div>
+        <div class="subtitle-row">
+          <p class="subtitle">Vertex AI Search / Agentspace 本地网关</p>
+          <button type="button" id="checkUpdateBtn" class="link-btn subtle" title="从 GitHub Releases 检查插件与后端新版本">检查更新</button>
+        </div>
       </div>
       <label class="switch" title="启用或暂停桥接">
         <input type="checkbox" id="enabledToggle" checked />
         <span class="slider"></span>
       </label>
     </header>
+
+    <section class="update-banner" id="updateBanner" hidden aria-live="polite">
+      <div class="update-banner-head">
+        <strong id="updateBannerTitle">检测到可用更新</strong>
+        <a id="updateReleaseLink" class="link-btn subtle" href="https://github.com/StevenLee1471717/Gemini-Enterprise-Bridge/releases" target="_blank" rel="noreferrer">GitHub Release</a>
+      </div>
+      <p class="update-banner-desc" id="updateBannerDesc"></p>
+      <div class="update-banner-actions">
+        <button type="button" id="applyBackendUpdateBtn" class="btn primary compact">立即自动更新并重启后端</button>
+        <button type="button" id="syncExtUpdateBtn" class="btn compact" hidden>同步并重载插件</button>
+      </div>
+    </section>
 
     <section class="status-card" aria-live="polite">
       <div class="status-row">

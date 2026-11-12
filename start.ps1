@@ -93,6 +93,18 @@ if (-not $AutoUpdateDisabled -and (Test-Path "updater.py")) {
 # Always materialize clean `extension\` (with generated PNG icons) and `userscript\`
 Invoke-SyncDependenciesAndExtension
 
+if (Test-Path "sync_client_limits.py") {
+    try {
+        $SyncJson = & $VenvPython sync_client_limits.py
+        $SyncObj = $SyncJson | ConvertFrom-Json -ErrorAction SilentlyContinue
+        if ($SyncObj -and $SyncObj.models_updated -and $SyncObj.models_updated.Count -gt 0) {
+            Write-Host "[Limits] Synced 1M context / 65K output token limits for $($SyncObj.models_updated.Count) Copilot BYOK model(s)." -ForegroundColor Green
+        }
+    } catch {
+        # Best-effort client DB sync; never block startup
+    }
+}
+
 if ($Port -gt 0) {
     $env:BRIDGE_PORT = "$Port"
 }

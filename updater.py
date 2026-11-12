@@ -758,7 +758,18 @@ def main() -> None:
         action="store_true",
         help="Only check GitHub Releases and print version status without modifying files",
     )
+    parser.add_argument(
+        "--sync-client-limits",
+        action="store_true",
+        help="Sync 1,048,576 prompt / 65,536 output token limits into local Copilot App BYOK provider_models",
+    )
     args = parser.parse_args()
+    if args.sync_client_limits:
+        from sync_client_limits import sync_copilot_provider_limits
+
+        res = sync_copilot_provider_limits()
+        print(json.dumps(res, ensure_ascii=False, indent=2))
+        sys.exit(0 if res.get("ok") else 1)
     root = Path(__file__).resolve().parent
     if args.startup_check:
         sys.exit(run_startup_auto_update(root_dir=root, check_only=True))

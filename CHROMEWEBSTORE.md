@@ -1,8 +1,8 @@
 # Chrome Web Store Listing & Permissions Reference
 
 **Extension Name:** Gemini Enterprise Web-to-API Bridge  
-**Current Version:** 1.1.0  
-**Last Updated:** 2026-11-12  
+**Current Version:** 1.2.0  
+**Last Updated:** 2026-11-13  
 **Distribution Target:** Local Developer Unpacked Extension / Private Enterprise Internal Distribution
 
 ---
@@ -51,5 +51,8 @@ Every permission in `manifest.json` is strictly scoped to local bridging:
 
 ## Version History
 
+- **1.2.0 (2026-11-13):** Added end-to-end multimodal file and media support (images, video, audio, PDFs, Office documents, code/text, and binary attachments) with token-guarded local staging, multi-turn delta deduplication, and Trusted-Types-safe Shadow DOM composer upload.
+- **1.1.2 (2026-11-12):** Added full 1,048,576 input / 65,536 output token limit metadata across `/v1/models` and `GET /v1/models/{model_id}` plus automatic GitHub Copilot BYOK `provider_models` limit synchronization to prevent false 128k prompt budget caps.
+- **1.1.1 (2026-11-12):** Eliminated background WebSocket connection-refused and handshake warnings via lightweight gateway readiness checks, and improved back/forward cache keep-alive port cleanup during tab navigation.
 - **1.1.0 (2026-11-12):** Added Gemini 4 Carbon support, real-time context window and API cost equivalence telemetry, and automated GitHub Releases update detection with one-click local gateway upgrade.
 - **1.0.0 (2026-11-11):** Initial release with local WebSocket gateway connection, multi-account tab selector, real-time response streaming, custom selector overrides, and page diagnostics.

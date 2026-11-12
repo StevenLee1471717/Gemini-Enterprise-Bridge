@@ -239,7 +239,7 @@ function renderUpdateBanner(extVer, updateState, liveApiStatus = null) {
 
   const u = updateState || {};
   const apiUpd = (liveApiStatus && liveApiStatus.update) || {};
-  const cleanExtVer = String(extVer || u.extensionVersion || "1.1.0").replace(/^v/i, "");
+  const cleanExtVer = String(extVer || u.extensionVersion || "1.2.0").replace(/^v/i, "");
   const backendVer = String(
     (liveApiStatus && liveApiStatus.backend_version) ||
       apiUpd.current_backend_version ||

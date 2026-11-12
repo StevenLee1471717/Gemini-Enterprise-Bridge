@@ -40,6 +40,7 @@ from schemas import (
     build_usage,
     estimate_tokens,
     parse_model_and_session,
+    resolve_model_metadata,
     resolve_target_web_model,
 )
 from updater import (
@@ -205,9 +206,24 @@ def create_app(
     app.state.update_manager = updater
     app.state.gcloud = gcloud
 
+    class _WebSocketSafeCORSMiddleware:
+        """Apply CORSMiddleware to HTTP requests while letting WebSocket handshakes pass cleanly."""
+
+        def __init__(self, asgi_app: Any, **cors_kwargs: Any) -> None:
+            self.asgi_app = asgi_app
+            self.cors_app = CORSMiddleware(asgi_app, **cors_kwargs)
+
+        async def __call__(self, scope: Dict[str, Any], receive: Any, send: Any) -> None:
+            if scope.get("type") == "websocket":
+                await self.asgi_app(scope, receive, send)
+                return
+            await self.cors_app(scope, receive, send)
+
+    wildcard_cors = "*" in (cfg.cors_allow_origins or [])
     app.add_middleware(
-        CORSMiddleware,
-        allow_origins=cfg.cors_allow_origins,
+        _WebSocketSafeCORSMiddleware,
+        allow_origins=[] if wildcard_cors else cfg.cors_allow_origins,
+        allow_origin_regex=r".*" if wildcard_cors else None,
         allow_credentials=True,
         allow_methods=["*"],
         allow_headers=["*"],
@@ -566,6 +582,26 @@ def create_app(
     @app.get("/models", dependencies=[Depends(verify_api_key)], include_in_schema=False)
     async def list_models() -> Dict[str, Any]:
         return {"object": "list", "data": AVAILABLE_MODELS}
+
+    @app.get("/v1/models/{model_id:path}", dependencies=[Depends(verify_api_key)])
+    @app.get(
+        "/models/{model_id:path}",
+        dependencies=[Depends(verify_api_key)],
+        include_in_schema=False,
+    )
+    async def retrieve_model(model_id: str) -> Any:
+        clean_id = (model_id or "").strip().strip("/")
+        if not clean_id:
+            return {"object": "list", "data": AVAILABLE_MODELS}
+        entry = resolve_model_metadata(clean_id)
+        if entry is None:
+            return _openai_error_response(
+                status_code=404,
+                message=f"The model '{clean_id}' does not exist",
+                error_type="invalid_request_error",
+                code="model_not_found",
+            )
+        return entry
 
     def _select_upstream(model_name: str) -> str:
         """Decide between 'browser' and 'gcloud' upstream."""
@@ -1147,6 +1183,25 @@ if __name__ == "__main__":
     import uvicorn
 
     runtime_cfg = BridgeSettings.from_env()
+    if os.getenv("BRIDGE_SYNC_COPILOT_LIMITS", "true").strip().lower() not in {
+        "0",
+        "false",
+        "no",
+        "off",
+    }:
+        try:
+            from sync_client_limits import sync_copilot_provider_limits
+
+            sync_res = sync_copilot_provider_limits(bridge_port=runtime_cfg.port)
+            updated_rows = sync_res.get("models_updated") or []
+            if updated_rows:
+                logger.info(
+                    "Synced 1M prompt / 65K output token limits for %d Copilot BYOK model(s): %s",
+                    len(updated_rows),
+                    ", ".join(m["model_id"] for m in updated_rows),
+                )
+        except Exception as exc:  # pragma: no cover
+            logger.debug("Optional Copilot BYOK token limit sync skipped: %s", exc)
     uvicorn.run(
         app,
         host=runtime_cfg.host,

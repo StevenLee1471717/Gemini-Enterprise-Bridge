@@ -18,6 +18,7 @@
   let portRetryAttempts = 0;
   let portRetryTimer = null;
   let hiddenKeepaliveTimer = null;
+  let pageInBfcache = false;
   let disposed = false;
 
   // Guarded Trusted Types policy for ISOLATED world
@@ -154,8 +155,26 @@
     }
   }
 
+  function disconnectKeepalivePort() {
+    if (hiddenKeepaliveTimer !== null) {
+      clearInterval(hiddenKeepaliveTimer);
+      hiddenKeepaliveTimer = null;
+    }
+    if (portRetryTimer !== null) {
+      clearTimeout(portRetryTimer);
+      portRetryTimer = null;
+    }
+    if (keepalivePort) {
+      const closingPort = keepalivePort;
+      keepalivePort = null;
+      try {
+        closingPort.disconnect();
+      } catch (_) {}
+    }
+  }
+
   function schedulePortReconnect() {
-    if (disposed || !chrome.runtime?.id || portRetryTimer !== null) return;
+    if (disposed || pageInBfcache || !chrome.runtime?.id || portRetryTimer !== null) return;
     const attempt = portRetryAttempts;
     portRetryAttempts = Math.min(attempt + 1, 6);
     const delayMs = Math.min(500 * Math.pow(2, attempt), 10000);
@@ -166,23 +185,30 @@
   }
 
   function ensureKeepalivePort() {
-    if (disposed || !chrome.runtime?.id || keepalivePort) return;
+    if (disposed || pageInBfcache || !chrome.runtime?.id || keepalivePort) return;
     try {
-      keepalivePort = chrome.runtime.connect({ name: "geb-keepalive" });
+      const port = chrome.runtime.connect({ name: "geb-keepalive" });
+      keepalivePort = port;
       portRetryAttempts = 0;
       if (portRetryTimer !== null) {
         clearTimeout(portRetryTimer);
         portRetryTimer = null;
       }
-      keepalivePort.onDisconnect.addListener(() => {
-        keepalivePort = null;
-        if (!disposed && chrome.runtime?.id) {
+      port.onDisconnect.addListener(() => {
+        // Always touch chrome.runtime.lastError so bfcache / navigation disconnects never log Unchecked runtime.lastError
+        void chrome.runtime?.lastError;
+        if (keepalivePort === port) {
+          keepalivePort = null;
+        }
+        if (!disposed && !pageInBfcache && chrome.runtime?.id) {
           schedulePortReconnect();
         }
       });
     } catch (_) {
       keepalivePort = null;
-      schedulePortReconnect();
+      if (!pageInBfcache) {
+        schedulePortReconnect();
+      }
     }
   }
 
@@ -370,13 +396,35 @@
     }
   }
 
+  function onPageHide() {
+    pageInBfcache = true;
+    disconnectKeepalivePort();
+  }
+
+  function onPageShow(event) {
+    pageInBfcache = false;
+    if (!disposed && event && event.persisted) {
+      updateVisibilityKeepalive();
+    }
+  }
+
   window.addEventListener("message", onWindowMessage);
+  window.addEventListener("pagehide", onPageHide);
+  window.addEventListener("pageshow", onPageShow);
   document.addEventListener("visibilitychange", updateVisibilityKeepalive);
 
   chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
     if (disposed) return false;
+
     (async () => {
       const msgType = message && message.type ? message.type : "";
+
+      if (msgType === "GEB_PREPARE_UNLOAD") {
+        pageInBfcache = true;
+        disconnectKeepalivePort();
+        sendResponse({ ok: true });
+        return;
+      }
 
       if (msgType === "GEB_ATTACHMENT_CHUNK") {
         attachmentReassembly.addChunk(
@@ -500,22 +548,11 @@
   globalThis.__GEB_ISOLATED_CLEANUP__ = () => {
     disposed = true;
     window.removeEventListener("message", onWindowMessage);
+    window.removeEventListener("pagehide", onPageHide);
+    window.removeEventListener("pageshow", onPageShow);
     document.removeEventListener("visibilitychange", updateVisibilityKeepalive);
     clearInterval(heartbeatTimer);
-    if (hiddenKeepaliveTimer !== null) {
-      clearInterval(hiddenKeepaliveTimer);
-      hiddenKeepaliveTimer = null;
-    }
-    if (portRetryTimer !== null) {
-      clearTimeout(portRetryTimer);
-      portRetryTimer = null;
-    }
-    if (keepalivePort) {
-      try {
-        keepalivePort.disconnect();
-      } catch (_) {}
-      keepalivePort = null;
-    }
+    disconnectKeepalivePort();
     promptReassembly.clear();
     attachmentReassembly.clear();
     replyReassembly.clear();
@@ -526,12 +563,13 @@
   };
 
   // Probe MAIN driver readiness immediately & sync config + visibility state
-  callMainAsync("diagnose", {}, 1500)
-    .then(() => {
+  void (async () => {
+    try {
+      await callMainAsync("diagnose", {}, 1500);
       mainReady = true;
       flushQueuedPrompts();
-    })
-    .catch(() => {});
+    } catch (_) {}
+  })();
   void syncDriverConfigFromStorage();
   updateVisibilityKeepalive();
 })();

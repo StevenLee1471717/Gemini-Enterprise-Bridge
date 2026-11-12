@@ -29,6 +29,20 @@ flowchart LR
 
 ---
 
+## v1.2.x 架构与核心能力速览
+
+当前版本（`v1.2.0`）在本地 OpenAI 兼容网关基础上构建了完整的生产级多模态、多会话与自动化运维闭环：
+
+| 能力模块 | 核心实现与运行机制 |
+|---|---|
+| **全链路多模态文件与媒体支持 (`multimodal.py`)** | 原生兼容图片、视频、音频、PDF、Office 文档（`.docx`/`.xlsx`/`.pptx`）、代码与任意二进制文件（支持 Data URI、Base64、HTTP URL 与本地路径）；多轮对话按 `SHA-256` 增量去重免重复上传；通过令牌保护的 `/api/bridge/attachments/{id}` 与零 `.innerHTML` 三级 Shadow DOM 注入安全上传至网页输入框，同时支持官方 GCloud `inlineData`/`fileData` |
+| **1M 上下文窗口与客户端上限同步** | `/v1/models` 与 `/v1/models/{model_id}` 全量声明 **`1,048,576` 输入 / `65,536` 输出** Token 上限（覆盖 **Gemini 4 Carbon**、**4 Argon**、**3.1 Pro**、**3.8 Flash** 及 `@会话名` 别名）；启动时自动运行 `sync_client_limits.py` 同步修复本地 GitHub Copilot App (`~/.copilot/data.db`) BYOK 模型的 `128K` 默认回退限制 |
+| **上下文水位监控与官方 API 等价账本 (`6.8` 汇率)** | 实时计算各并行会话在 `1M` 窗口中的占用水位（历史消息 / 工具 Schema / 增量输入），并通过 `usage_stats.py` 按 Google 官方分段定价持久化累计输入/输出 Token 与等价节省费用（默认按 **`1 USD = 6.8 CNY`** 折算，可通过 `BRIDGE_USD_TO_CNY_RATE` 自定义，支持扩展弹窗、Web 控制台与 `/api/usage` 实时查看及重置） |
+| **多标签页真并行池 (`WorkerSlot` Pool)** | 每个已打开的 Gemini Enterprise 标签页作为独立并发工作槽位，支持多客户端同时流式请求、对话前缀自动粘性路由、`@会话名` 显式固定绑定，以及并发繁忙时后台静默新建标签页扩容（`BRIDGE_AUTO_SPAWN_TABS=true`） |
+| **GitHub Releases 双向自动更新** | `.github/workflows/ci-release.yml` 自动测试并发布带 `SHA-256` 清单的插件与后端产物；后端每次启动自动检查更新并保留 `.env` / `usage_stats.json`；MV3 扩展内置 `/health` 静默预检、bfcache 保活端口清理、后台空闲自动重载（`chrome.runtime.reload()`）及跨端版本不一致一键升级提示 |
+
+---
+
 ## 3 分钟快速上手（Windows 一键启动）
 
 ### 第一步：启动本地 FastAPI 代理网关
@@ -81,7 +95,7 @@ cd I:\Projects\Gemini-Enterprise-Bridge
 | **Model（其他网页模型透传）** | `gemini-2.5-pro`、`gemini-2.5-flash` 或任意 `gemini-web:<网页菜单名称>` |
 | **Model（官方 GCloud 模式）** | `gemini-enterprise-gcloud` |
 
-> **提示**：网关同时兼容将 Base URL 填为 `http://127.0.0.1:8000` 或 `http://127.0.0.1:8000/v1`。在 Custom Endpoint 客户端中拉取模型列表（`GET /v1/models`）即可直接下拉选择上述全部模型！
+> **提示**：网关同时兼容将 Base URL 填为 `http://127.0.0.1:8000` 或 `http://127.0.0.1:8000/v1`。`GET /v1/models` 与单模型检索接口 `GET /v1/models/{model_id}`（含 `4argon`、`4carbon`、`gemini-4-carbon@sess1` 等别名）均完整声明 `1,048,576` 上下文窗口与 `65,536` 输出上限（`max_prompt_tokens`、`max_output_tokens`、`context_window`、`limits` 等全生态字段）。若此前在 GitHub Copilot App 中添加 BYOK 模型时 `max_prompt_tokens` 为空导致被回退限制为 `128,000`，启动网关（或手动运行 `python sync_client_limits.py` / `python updater.py --sync-client-limits`）会自动同步修复本地 `provider_models` 上限。
 
 ---
 
@@ -203,6 +217,7 @@ I:\Projects\Gemini-Enterprise-Bridge\
 ├── .github/workflows/ci-release.yml  # GitHub Actions 自动化测试与 Release 产物发布流水线
 ├── version.py                        # 全局单一事实源版本号与 GitHub Releases 端点常量
 ├── updater.py                        # 零外部依赖 GitHub Releases 自动更新器（SHA-256 校验 + 配置保护）
+├── sync_client_limits.py             # 自动同步 1M/65K Token 上限至本地 Copilot BYOK 数据库
 ├── server.py                         # FastAPI 主入口（支持 python server.py 直接运行）
 ├── config.py                         # 环境变量与 .env 配置加载
 ├── multimodal.py                     # 多模态文件/音视频/图片/Office 文档归一化、嗅探与文本提取器

@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Gemini Enterprise Web-to-API Bridge (CSP-Immune Edition)
 // @namespace    https://github.com/StevenLee1471717/Gemini-Enterprise-Bridge
-// @version      1.1.0
+// @version      1.2.0
 // @description  将已登录的 Google Cloud Vertex AI Search / Agentspace 企业网页桥接至本地 OpenAI API 网关（采用 GM_xmlhttpRequest 绕过页面严格 CSP）
 // @downloadURL  https://github.com/StevenLee1471717/Gemini-Enterprise-Bridge/releases/latest/download/gemini-enterprise-bridge.user.js
 // @updateURL    https://github.com/StevenLee1471717/Gemini-Enterprise-Bridge/releases/latest/download/gemini-enterprise-bridge.user.js

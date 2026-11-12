@@ -33,9 +33,9 @@ const activeInFlightRequests = new Map(); // requestId -> expiresAtMs
 
 function getExtensionVersion() {
   try {
-    return (chrome.runtime.getManifest() && chrome.runtime.getManifest().version) || "1.1.1";
+    return (chrome.runtime.getManifest() && chrome.runtime.getManifest().version) || "1.1.2";
   } catch (_) {
-    return "1.1.1";
+    return "1.1.2";
   }
 }
 

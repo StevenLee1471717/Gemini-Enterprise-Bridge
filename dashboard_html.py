@@ -238,7 +238,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
   <div class="wrap">
     <header>
       <div>
-        <h1>Gemini Enterprise Bridge <span class="mono" id="dashVerBadge" style="font-size:0.8rem;font-weight:600;">v1.1.1</span></h1>
+        <h1>Gemini Enterprise Bridge <span class="mono" id="dashVerBadge" style="font-size:0.8rem;font-weight:600;">v1.1.2</span></h1>
         <div class="muted">Vertex AI Search / Agentspace 浏览器回路 OpenAI API 本地代理网关</div>
       </div>
       <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap;">
@@ -635,7 +635,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
         const u = await res.json();
         await refreshStatus();
         if (!u.update_available) {
-          btn.textContent = '已是最新 (v' + (u.current_backend_version || '1.1.1') + ')';
+          btn.textContent = '已是最新 (v' + (u.current_backend_version || '1.1.2') + ')';
           setTimeout(function () { btn.textContent = '检查 GitHub 更新'; }, 2500);
         } else {
           btn.textContent = '发现 v' + (u.latest_github_version || u.highest_known_version);

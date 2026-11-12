@@ -1494,8 +1494,19 @@ def test_gemini_4_carbon_deduplicated_and_context_window_metadata() -> None:
 
     carbon_entry = next(m for m in AVAILABLE_MODELS if m["id"] == "gemini-4-carbon")
     assert carbon_entry["context_length"] == 1048576
+    assert carbon_entry["context_window"] == 1048576
+    assert carbon_entry["max_prompt_tokens"] == 1048576
     assert carbon_entry["max_input_tokens"] == 1048576
+    assert carbon_entry["input_token_limit"] == 1048576
     assert carbon_entry["max_output_tokens"] == 65536
+    assert carbon_entry["max_completion_tokens"] == 65536
+    assert carbon_entry["output_token_limit"] == 65536
+    assert carbon_entry["max_tokens"] == 1048576
+    assert carbon_entry["limits"] == {
+        "max_prompt_tokens": 1048576,
+        "max_output_tokens": 65536,
+        "max_context_window_tokens": 1048576,
+    }
 
     # Verify estimate_tokens does not 3x-inflate JSON punctuation
     sample_json = json.dumps({"key": "value", "arr": [1, 2, 3, 4, 5], "nested": {"a": "hello world"}}) * 100
@@ -2212,3 +2223,153 @@ def test_websocket_browser_accepts_chrome_extension_and_vertex_origins_never_403
             ) as ws:
                 welcome = ws.receive_json()
                 assert welcome["type"] == "welcome"
+
+
+def test_models_list_and_retrieve_model_expose_full_1m_budget_fields() -> None:
+    """Verify /v1/models and /v1/models/{model_id} expose all BYOK 1M prompt / 65K output fields."""
+    app = create_app(_make_test_settings())
+    with TestClient(app) as client:
+        list_resp = client.get("/v1/models")
+        assert list_resp.status_code == 200
+        models = list_resp.json()["data"]
+        assert len(models) >= 15
+
+        for entry in models:
+            assert entry["context_length"] == 1048576
+            assert entry["context_window"] == 1048576
+            assert entry["max_prompt_tokens"] == 1048576
+            assert entry["max_input_tokens"] == 1048576
+            assert entry["input_token_limit"] == 1048576
+            assert entry["max_output_tokens"] == 65536
+            assert entry["max_completion_tokens"] == 65536
+            assert entry["output_token_limit"] == 65536
+            assert entry["max_tokens"] == 1048576
+            assert entry["capabilities"] == {
+                "chat": True,
+                "tools": True,
+                "function_calling": True,
+                "streaming": True,
+                "json_mode": True,
+            }
+            assert entry["limits"] == {
+                "max_prompt_tokens": 1048576,
+                "max_output_tokens": 65536,
+                "max_context_window_tokens": 1048576,
+            }
+
+        for model_query in (
+            "gemini-4-carbon",
+            "4argon",
+            "3.1pro",
+            "gemini-4-carbon@sess1",
+            "4argon@sess1-newchat",
+            "gemini-web:Gemini 4 Carbon",
+        ):
+            r = client.get(f"/v1/models/{model_query}")
+            assert r.status_code == 200, f"Failed for {model_query}: {r.text}"
+            body = r.json()
+            assert body["id"] == model_query
+            assert body["object"] == "model"
+            assert body["max_prompt_tokens"] == 1048576
+            assert body["max_output_tokens"] == 65536
+            assert body["context_window"] == 1048576
+            assert body["limits"]["max_prompt_tokens"] == 1048576
+            assert body["limits"]["max_output_tokens"] == 65536
+
+        alias_no_v1 = client.get("/models/4carbon")
+        assert alias_no_v1.status_code == 200
+        assert alias_no_v1.json()["id"] == "4carbon"
+        assert alias_no_v1.json()["max_prompt_tokens"] == 1048576
+
+        missing = client.get("/v1/models/nonexistent-unknown-model")
+        assert missing.status_code == 404
+        assert missing.json()["error"]["code"] == "model_not_found"
+
+
+def test_sync_copilot_provider_limits_updates_only_gemini_bridge_models(tmp_path: Path) -> None:
+    """Verify sync_client_limits updates NULL/<1M limits for gemini-enterprise without touching other providers."""
+    import sqlite3
+    from sync_client_limits import sync_copilot_provider_limits
+
+    db_file = tmp_path / "data.db"
+    backup_file = tmp_path / "data.db.bak"
+    conn = sqlite3.connect(str(db_file))
+    conn.executescript(
+        """
+        CREATE TABLE model_providers (
+            id TEXT PRIMARY KEY NOT NULL,
+            name TEXT NOT NULL,
+            created_at TEXT NOT NULL DEFAULT '2026-11-11T00:00:00Z',
+            updated_at TEXT NOT NULL DEFAULT '2026-11-11T00:00:00Z',
+            type TEXT NOT NULL DEFAULT 'custom',
+            settings_json TEXT NOT NULL DEFAULT '{}'
+        );
+        CREATE TABLE provider_models (
+            id TEXT PRIMARY KEY NOT NULL,
+            provider_id TEXT NOT NULL,
+            model_id TEXT NOT NULL,
+            wire_model TEXT,
+            display_name TEXT NOT NULL,
+            max_prompt_tokens INTEGER,
+            max_output_tokens INTEGER,
+            wire_api_override TEXT,
+            created_at TEXT NOT NULL DEFAULT '2026-11-11T00:00:00Z',
+            updated_at TEXT NOT NULL DEFAULT '2026-11-11T00:00:00Z',
+            supported_reasoning_efforts TEXT,
+            supports_vision INTEGER NOT NULL DEFAULT 0
+        );
+        """
+    )
+    conn.execute(
+        "INSERT INTO model_providers (id, name, type, settings_json) VALUES (?, ?, ?, ?)",
+        (
+            "3126a75e-77bb-4baa-b663-6abcc2cdb5a7",
+            "gemini-enterprise",
+            "custom",
+            '{"baseUrl":"http://127.0.0.1:8000/v1","wireApi":"completions"}',
+        ),
+    )
+    conn.execute(
+        "INSERT INTO model_providers (id, name, type, settings_json) VALUES (?, ?, ?, ?)",
+        (
+            "other-prov-1",
+            "other-remote",
+            "custom",
+            '{"baseUrl":"https://api.example.com/v1","wireApi":"completions"}',
+        ),
+    )
+    conn.executemany(
+        "INSERT INTO provider_models (id, provider_id, model_id, display_name, max_prompt_tokens, max_output_tokens) VALUES (?, ?, ?, ?, ?, ?)",
+        [
+            ("m1", "3126a75e-77bb-4baa-b663-6abcc2cdb5a7", "gemini-4-carbon", "gemini-4-carbon", None, None),
+            ("m2", "3126a75e-77bb-4baa-b663-6abcc2cdb5a7", "gemini-4-argon", "gemini-4-argon", 128000, None),
+            ("m3", "other-prov-1", "other-model", "other-model", None, None),
+        ],
+    )
+    conn.commit()
+    conn.close()
+
+    dry = sync_copilot_provider_limits(db_path=db_file, dry_run=True)
+    assert dry["ok"] is True
+    assert len(dry["models_updated"]) == 2
+
+    applied = sync_copilot_provider_limits(db_path=db_file, backup_path=backup_file)
+    assert applied["ok"] is True
+    assert backup_file.is_file()
+    assert len(applied["models_updated"]) == 2
+
+    verify_conn = sqlite3.connect(str(db_file))
+    rows = {
+        r[0]: (r[1], r[2])
+        for r in verify_conn.execute(
+            "SELECT id, max_prompt_tokens, max_output_tokens FROM provider_models"
+        ).fetchall()
+    }
+    verify_conn.close()
+    assert rows["m1"] == (1048576, 65536)
+    assert rows["m2"] == (1048576, 65536)
+    assert rows["m3"] == (None, None)
+
+    second = sync_copilot_provider_limits(db_path=db_file)
+    assert second["ok"] is True
+    assert second["models_updated"] == []

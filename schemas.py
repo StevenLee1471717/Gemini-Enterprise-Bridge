@@ -465,155 +465,198 @@ def resolve_target_web_model(model_name: Optional[str]) -> Optional[str]:
     return raw
 
 
+DEFAULT_CONTEXT_WINDOW_TOKENS = 1048576
+DEFAULT_MAX_OUTPUT_TOKENS = 65536
+
+
+def _build_model_entry(
+    model_id: str,
+    description: str,
+    owned_by: str = "google-enterprise-bridge",
+    created: int = 1735689600,
+) -> Dict[str, Any]:
+    """Construct an OpenAI/Copilot/LiteLLM/Cursor-compatible model metadata object."""
+    return {
+        "id": model_id,
+        "object": "model",
+        "created": created,
+        "owned_by": owned_by,
+        "description": description,
+        "context_length": DEFAULT_CONTEXT_WINDOW_TOKENS,
+        "context_window": DEFAULT_CONTEXT_WINDOW_TOKENS,
+        "max_prompt_tokens": DEFAULT_CONTEXT_WINDOW_TOKENS,
+        "max_input_tokens": DEFAULT_CONTEXT_WINDOW_TOKENS,
+        "input_token_limit": DEFAULT_CONTEXT_WINDOW_TOKENS,
+        "max_output_tokens": DEFAULT_MAX_OUTPUT_TOKENS,
+        "max_completion_tokens": DEFAULT_MAX_OUTPUT_TOKENS,
+        "output_token_limit": DEFAULT_MAX_OUTPUT_TOKENS,
+        "max_tokens": DEFAULT_CONTEXT_WINDOW_TOKENS,
+        "capabilities": {
+            "chat": True,
+            "tools": True,
+            "function_calling": True,
+            "streaming": True,
+            "json_mode": True,
+        },
+        "limits": {
+            "max_prompt_tokens": DEFAULT_CONTEXT_WINDOW_TOKENS,
+            "max_output_tokens": DEFAULT_MAX_OUTPUT_TOKENS,
+            "max_context_window_tokens": DEFAULT_CONTEXT_WINDOW_TOKENS,
+        },
+    }
+
+
 AVAILABLE_MODELS: List[Dict[str, Any]] = [
-    {
-        "id": "gemini-enterprise-web",
-        "object": "model",
-        "created": 1735689600,
-        "owned_by": "google-enterprise-bridge",
-        "description": "Gemini Enterprise / Agentspace (keep currently selected web model)",
-        "context_length": 1048576,
-        "max_input_tokens": 1048576,
-        "max_output_tokens": 65536,
-    },
-    {
-        "id": "gemini-enterprise-web-newchat",
-        "object": "model",
-        "created": 1735689600,
-        "owned_by": "google-enterprise-bridge",
-        "description": "Start a fresh web chat session using the currently selected web model",
-        "context_length": 1048576,
-        "max_input_tokens": 1048576,
-        "max_output_tokens": 65536,
-    },
-    {
-        "id": "gemini-3.1-pro",
-        "object": "model",
-        "created": 1735689600,
-        "owned_by": "google-enterprise-bridge",
-        "description": "Auto-select Gemini 3.1 Pro in Gemini Enterprise web UI (aliases: 3.1pro, 3.1-pro)",
-        "context_length": 1048576,
-        "max_input_tokens": 1048576,
-        "max_output_tokens": 65536,
-    },
-    {
-        "id": "gemini-3.1-pro-newchat",
-        "object": "model",
-        "created": 1735689600,
-        "owned_by": "google-enterprise-bridge",
-        "description": "Start a fresh web chat session and select Gemini 3.1 Pro",
-        "context_length": 1048576,
-        "max_input_tokens": 1048576,
-        "max_output_tokens": 65536,
-    },
-    {
-        "id": "gemini-4-argon",
-        "object": "model",
-        "created": 1735689600,
-        "owned_by": "google-enterprise-bridge",
-        "description": "Auto-select Gemini 4 Argon in Gemini Enterprise web UI (aliases: 4argon, 4-argon)",
-        "context_length": 1048576,
-        "max_input_tokens": 1048576,
-        "max_output_tokens": 65536,
-    },
-    {
-        "id": "gemini-4-argon-newchat",
-        "object": "model",
-        "created": 1735689600,
-        "owned_by": "google-enterprise-bridge",
-        "description": "Start a fresh web chat session and select Gemini 4 Argon",
-        "context_length": 1048576,
-        "max_input_tokens": 1048576,
-        "max_output_tokens": 65536,
-    },
-    {
-        "id": "gemini-4-carbon",
-        "object": "model",
-        "created": 1735689600,
-        "owned_by": "google-enterprise-bridge",
-        "description": "Auto-select Gemini 4 Carbon in Gemini Enterprise web UI (aliases: 4carbon, 4-carbon)",
-        "context_length": 1048576,
-        "max_input_tokens": 1048576,
-        "max_output_tokens": 65536,
-    },
-    {
-        "id": "gemini-4-carbon-newchat",
-        "object": "model",
-        "created": 1735689600,
-        "owned_by": "google-enterprise-bridge",
-        "description": "Start a fresh web chat session and select Gemini 4 Carbon",
-        "context_length": 1048576,
-        "max_input_tokens": 1048576,
-        "max_output_tokens": 65536,
-    },
-    {
-        "id": "gemini-3.8-flash",
-        "object": "model",
-        "created": 1735689600,
-        "owned_by": "google-enterprise-bridge",
-        "description": "Auto-select Gemini 3.8 Flash in Gemini Enterprise web UI (aliases: 3.8flash, 3.8-flash)",
-        "context_length": 1048576,
-        "max_input_tokens": 1048576,
-        "max_output_tokens": 65536,
-    },
-    {
-        "id": "gemini-3.8-flash-newchat",
-        "object": "model",
-        "created": 1735689600,
-        "owned_by": "google-enterprise-bridge",
-        "description": "Start a fresh web chat session and select Gemini 3.8 Flash",
-        "context_length": 1048576,
-        "max_input_tokens": 1048576,
-        "max_output_tokens": 65536,
-    },
-    {
-        "id": "gemini-2.5-pro",
-        "object": "model",
-        "created": 1735689600,
-        "owned_by": "google-enterprise-bridge",
-        "description": "Auto-select Gemini 2.5 Pro in Gemini Enterprise web UI (aliases: 2.5pro, 2.5-pro)",
-        "context_length": 1048576,
-        "max_input_tokens": 1048576,
-        "max_output_tokens": 65536,
-    },
-    {
-        "id": "gemini-2.5-pro-newchat",
-        "object": "model",
-        "created": 1735689600,
-        "owned_by": "google-enterprise-bridge",
-        "description": "Start a fresh web chat session and select Gemini 2.5 Pro",
-        "context_length": 1048576,
-        "max_input_tokens": 1048576,
-        "max_output_tokens": 65536,
-    },
-    {
-        "id": "gemini-2.5-flash",
-        "object": "model",
-        "created": 1735689600,
-        "owned_by": "google-enterprise-bridge",
-        "description": "Auto-select Gemini 2.5 Flash in Gemini Enterprise web UI (aliases: 2.5flash, 2.5-flash)",
-        "context_length": 1048576,
-        "max_input_tokens": 1048576,
-        "max_output_tokens": 65536,
-    },
-    {
-        "id": "gemini-2.5-flash-newchat",
-        "object": "model",
-        "created": 1735689600,
-        "owned_by": "google-enterprise-bridge",
-        "description": "Start a fresh web chat session and select Gemini 2.5 Flash",
-        "context_length": 1048576,
-        "max_input_tokens": 1048576,
-        "max_output_tokens": 65536,
-    },
-    {
-        "id": "gemini-enterprise-gcloud",
-        "object": "model",
-        "created": 1735689600,
-        "owned_by": "google-cloud-official",
-        "description": "Official Google Cloud Vertex AI / Discovery Engine API via local gcloud ADC",
-        "context_length": 1048576,
-        "max_input_tokens": 1048576,
-        "max_output_tokens": 65536,
-    },
+    _build_model_entry(
+        "gemini-enterprise-web",
+        "Gemini Enterprise / Agentspace (keep currently selected web model)",
+    ),
+    _build_model_entry(
+        "gemini-enterprise-web-newchat",
+        "Start a fresh web chat session using the currently selected web model",
+    ),
+    _build_model_entry(
+        "gemini-3.1-pro",
+        "Auto-select Gemini 3.1 Pro in Gemini Enterprise web UI (aliases: 3.1pro, 3.1-pro)",
+    ),
+    _build_model_entry(
+        "gemini-3.1-pro-newchat",
+        "Start a fresh web chat session and select Gemini 3.1 Pro",
+    ),
+    _build_model_entry(
+        "gemini-4-argon",
+        "Auto-select Gemini 4 Argon in Gemini Enterprise web UI (aliases: 4argon, 4-argon)",
+    ),
+    _build_model_entry(
+        "gemini-4-argon-newchat",
+        "Start a fresh web chat session and select Gemini 4 Argon",
+    ),
+    _build_model_entry(
+        "gemini-4-carbon",
+        "Auto-select Gemini 4 Carbon in Gemini Enterprise web UI (aliases: 4carbon, 4-carbon)",
+    ),
+    _build_model_entry(
+        "gemini-4-carbon-newchat",
+        "Start a fresh web chat session and select Gemini 4 Carbon",
+    ),
+    _build_model_entry(
+        "gemini-3.8-flash",
+        "Auto-select Gemini 3.8 Flash in Gemini Enterprise web UI (aliases: 3.8flash, 3.8-flash)",
+    ),
+    _build_model_entry(
+        "gemini-3.8-flash-newchat",
+        "Start a fresh web chat session and select Gemini 3.8 Flash",
+    ),
+    _build_model_entry(
+        "gemini-2.5-pro",
+        "Auto-select Gemini 2.5 Pro in Gemini Enterprise web UI (aliases: 2.5pro, 2.5-pro)",
+    ),
+    _build_model_entry(
+        "gemini-2.5-pro-newchat",
+        "Start a fresh web chat session and select Gemini 2.5 Pro",
+    ),
+    _build_model_entry(
+        "gemini-2.5-flash",
+        "Auto-select Gemini 2.5 Flash in Gemini Enterprise web UI (aliases: 2.5flash, 2.5-flash)",
+    ),
+    _build_model_entry(
+        "gemini-2.5-flash-newchat",
+        "Start a fresh web chat session and select Gemini 2.5 Flash",
+    ),
+    _build_model_entry(
+        "gemini-enterprise-gcloud",
+        "Official Google Cloud Vertex AI / Discovery Engine API via local gcloud ADC",
+        owned_by="google-cloud-official",
+    ),
 ]
+
+_AVAILABLE_MODELS_BY_LOWER_ID: Dict[str, Dict[str, Any]] = {
+    m["id"].lower(): m for m in AVAILABLE_MODELS
+}
+
+_CANONICAL_TARGET_TO_MODEL_ID: Dict[str, str] = {
+    "auto": "gemini-enterprise-web",
+    "3.1-pro": "gemini-3.1-pro",
+    "4-argon": "gemini-4-argon",
+    "4-carbon": "gemini-4-carbon",
+    "3.8-flash": "gemini-3.8-flash",
+    "2.5-pro": "gemini-2.5-pro",
+    "2.5-flash": "gemini-2.5-flash",
+}
+
+
+def _clone_model_entry(entry: Dict[str, Any], model_id: Optional[str] = None) -> Dict[str, Any]:
+    cloned = dict(entry)
+    cloned["capabilities"] = dict(entry.get("capabilities") or {})
+    cloned["limits"] = dict(entry.get("limits") or {})
+    if model_id is not None:
+        cloned["id"] = model_id
+    return cloned
+
+
+def resolve_model_metadata(model_id: Optional[str]) -> Optional[Dict[str, Any]]:
+    """Resolve `GET /v1/models/{model_id}` for canonical IDs, shorthand aliases, and `@session` tags."""
+    if not model_id:
+        return None
+    raw_id = model_id.strip()
+    if not raw_id:
+        return None
+
+    direct = _AVAILABLE_MODELS_BY_LOWER_ID.get(raw_id.lower())
+    if direct is not None:
+        return _clone_model_entry(direct, model_id=raw_id if raw_id != direct["id"] else None)
+
+    base_model, session_tag = parse_model_and_session(raw_id)
+    if not base_model:
+        return None
+
+    direct_base = _AVAILABLE_MODELS_BY_LOWER_ID.get(base_model.lower())
+    if direct_base is not None:
+        out = _clone_model_entry(direct_base, model_id=raw_id)
+        if session_tag:
+            out["description"] = f"{direct_base['description']} [session: {session_tag}]"
+        return out
+
+    wants_new_chat = model_requests_new_chat(base_model)
+    core_name = (
+        base_model[: -len("-newchat")].strip() if wants_new_chat else base_model.strip()
+    )
+    if not core_name:
+        return None
+
+    lowered_core = core_name.lower()
+    if lowered_core in {"gcloud", "gemini-enterprise-gcloud"}:
+        gcloud_base = _AVAILABLE_MODELS_BY_LOWER_ID["gemini-enterprise-gcloud"]
+        return _clone_model_entry(gcloud_base, model_id=raw_id)
+
+    if lowered_core in _KEEP_CURRENT_WEB_MODEL_IDS:
+        target_key = (
+            "gemini-enterprise-web-newchat" if wants_new_chat else "gemini-enterprise-web"
+        )
+        return _clone_model_entry(_AVAILABLE_MODELS_BY_LOWER_ID[target_key], model_id=raw_id)
+
+    normalized_hyphen = re.sub(r"[\s_]+", "-", lowered_core)
+    normalized_compact = re.sub(r"[\s_\-]+", "", lowered_core)
+    alias_target = WEB_MODEL_ALIASES.get(normalized_hyphen) or WEB_MODEL_ALIASES.get(
+        normalized_compact
+    )
+    if alias_target:
+        canonical_id = _CANONICAL_TARGET_TO_MODEL_ID.get(alias_target, "gemini-enterprise-web")
+        if wants_new_chat and f"{canonical_id}-newchat" in _AVAILABLE_MODELS_BY_LOWER_ID:
+            canonical_id = f"{canonical_id}-newchat"
+        base_entry = _AVAILABLE_MODELS_BY_LOWER_ID[canonical_id]
+        out = _clone_model_entry(base_entry, model_id=raw_id)
+        if session_tag:
+            out["description"] = f"{base_entry['description']} [session: {session_tag}]"
+        return out
+
+    if lowered_core.startswith(("gemini-web:", "web:", "gemini-")):
+        resolved_label = resolve_target_web_model(core_name) or core_name
+        desc = f"Custom Gemini Enterprise web model ({resolved_label})"
+        if wants_new_chat:
+            desc += " [new chat]"
+        if session_tag:
+            desc += f" [session: {session_tag}]"
+        return _build_model_entry(raw_id, desc)
+
+    return None

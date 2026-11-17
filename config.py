@@ -83,7 +83,19 @@ class BridgeSettings:
     github_repo: str = DEFAULT_GITHUB_REPO
     github_token: str = ""
     usage_stats_path: str = ""
+    usage_ledger_path: str = ""
+    session_archive_path: str = ""
+    distribution_path: str = ""
+    host_reserved_slots: int = 2
     usd_to_cny_rate: float = 6.8
+    price_overrides_json: str = ""
+    generated_dir: str = ""
+    response_store_dir: str = ""
+    response_store_ttl_seconds: float = 86400.0
+    log_level: str = "INFO"
+    debug: bool = False
+    log_file: str = ""
+    log_payloads: bool = False
 
     # Optional Option-1 (Official GCloud CLI / Vertex AI / Discovery Engine) settings
     gcp_project_id: str = ""
@@ -137,7 +149,31 @@ class BridgeSettings:
                 or os.getenv("GITHUB_TOKEN", "").strip()
             ),
             usage_stats_path=os.getenv("BRIDGE_USAGE_STATS_PATH", "").strip(),
+            usage_ledger_path=os.getenv(
+                "BRIDGE_USAGE_LEDGER_PATH", str(root / ".cache" / "usage_ledger.json")
+            ).strip(),
+            session_archive_path=os.getenv(
+                "BRIDGE_SESSION_ARCHIVE_PATH", str(root / ".cache" / "session_archive.sqlite3")
+            ).strip(),
+            distribution_path=os.getenv(
+                "BRIDGE_DISTRIBUTION_PATH", str(root / ".cache" / "distribution.json")
+            ).strip(),
+            host_reserved_slots=max(0, _env_int("BRIDGE_HOST_RESERVED_SLOTS", 2)),
             usd_to_cny_rate=_env_float("BRIDGE_USD_TO_CNY_RATE", 6.8),
+            price_overrides_json=os.getenv("BRIDGE_PRICE_OVERRIDES_JSON", "").strip(),
+            generated_dir=os.getenv("BRIDGE_GENERATED_DIR", "").strip(),
+            response_store_dir=os.getenv(
+                "BRIDGE_RESPONSE_STORE_DIR", str(root / ".cache" / "response_store")
+            ).strip(),
+            response_store_ttl_seconds=max(
+                60.0, _env_float("BRIDGE_RESPONSE_STORE_TTL", 86400.0)
+            ),
+            log_level=os.getenv("BRIDGE_LOG_LEVEL", "INFO").strip().upper() or "INFO",
+            debug=_env_bool("BRIDGE_DEBUG", False),
+            log_file=os.getenv(
+                "BRIDGE_LOG_FILE", str(root / ".cache" / "logs" / "bridge.log")
+            ).strip(),
+            log_payloads=_env_bool("BRIDGE_LOG_PAYLOADS", False),
             gcp_project_id=os.getenv("GCP_PROJECT_ID", "").strip(),
             gcp_location=os.getenv("GCP_LOCATION", "global").strip() or "global",
             gcp_vertex_location=os.getenv("GCP_VERTEX_LOCATION", "us-central1").strip()

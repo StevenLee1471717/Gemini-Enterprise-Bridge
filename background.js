@@ -15,11 +15,12 @@ const DEFAULT_SETTINGS = {
 };
 
 const ALARM_NAME = "geb-keepalive-alarm";
-const GITHUB_UPDATE_ALARM = "geb-github-update-check";
+const UPDATE_CHECK_ALARM_NAME = "geb-update-check-alarm";
 const VERTEX_MATCH_PATTERN = "https://vertexaisearch.cloud.google.com/*";
+const EXPECTED_DRIVER_VERSION = "2.8.6";
 const DEFAULT_GITHUB_REPO = "StevenLee1471717/Gemini-Enterprise-Bridge";
 
-// Live non-serializable WebSocket handle & per-tab fast caches; durable settings & update state live in chrome.storage
+// Live non-serializable WebSocket handle & per-tab fast caches; durable settings live in chrome.storage
 const socketRuntime = {
   ws: null,
   connecting: false,
@@ -27,93 +28,224 @@ const socketRuntime = {
   reconnectTimer: null,
   reconnectAttempts: 0
 };
+
 const runtimeTabMeta = new Map(); // tabId -> { activeModel, capturedRpc }
 const injectedTabVersions = new Map(); // tabId -> driverVersion
-const activeInFlightRequests = new Map(); // requestId -> expiresAtMs
+const busyRequestsByTab = new Map(); // requestId -> tabId
+let backendBusyTabIds = new Set(); // session-level active tabIds pushed by Bridge
+let managedTabOrder = new Set(); // stable admitted tabIds within maxParallelTabs
 
-function getExtensionVersion() {
+function extractVertexSessionKey(rawUrl) {
+  if (!rawUrl || typeof rawUrl !== "string") return "";
   try {
-    return (chrome.runtime.getManifest() && chrome.runtime.getManifest().version) || "1.1.3";
+    const u = new URL(rawUrl);
+    if (!u.hostname.includes("vertexaisearch.cloud.google.com")) return "";
+    const m =
+      u.pathname.match(/\/r\/session\/([^/?#]+)/i) ||
+      u.pathname.match(/\/session\/([^/?#]+)/i) ||
+      u.pathname.match(/\/c\/([^/?#]+)/i);
+    return m && m[1] ? `session:${m[1]}` : "";
   } catch (_) {
-    return "1.1.3";
+    return "";
   }
 }
 
-function normalizeVersion(raw) {
-  const text = String(raw || "").trim();
-  if (text.length > 1 && (text[0] === "v" || text[0] === "V") && /^\d/.test(text.slice(1))) {
-    return text.slice(1);
+function isTabCurrentlyBusy(tabId) {
+  if (!tabId) return false;
+  if (backendBusyTabIds.has(Number(tabId))) return true;
+  for (const [, tid] of busyRequestsByTab) {
+    if (tid === tabId) return true;
   }
-  return text;
+  return false;
 }
 
-function parseSemver(raw) {
-  const text = normalizeVersion(raw);
-  if (!text) return [0, 0, 0, 0, ""];
-  const m = text.match(/^(\d+)(?:\.(\d+))?(?:\.(\d+))?(?:-([0-9A-Za-z.-]+))?/);
-  if (!m) return [0, 0, 0, 1, ""];
-  const major = Number(m[1] || 0);
-  const minor = Number(m[2] || 0);
-  const patch = Number(m[3] || 0);
-  const pre = m[4] || "";
-  return [major, minor, patch, pre ? 0 : 1, pre];
-}
-
-function compareSemver(v1, v2) {
-  const a = parseSemver(v1);
-  const b = parseSemver(v2);
-  for (let i = 0; i < 4; i += 1) {
-    if (a[i] !== b[i]) return a[i] > b[i] ? 1 : -1;
-  }
-  if (a[4] === b[4]) return 0;
-  return a[4] > b[4] ? 1 : -1;
-}
-
-function hasActiveInFlightJobs() {
-  const now = Date.now();
-  for (const [reqId, exp] of activeInFlightRequests.entries()) {
-    if (exp <= now) {
-      activeInFlightRequests.delete(reqId);
+function applyBackendBusyTabIds(rawIds) {
+  const next = new Set(
+    (Array.isArray(rawIds) ? rawIds : [])
+      .map((n) => Number(n))
+      .filter((n) => Number.isFinite(n) && n > 0)
+  );
+  let changed = next.size !== backendBusyTabIds.size;
+  if (!changed) {
+    for (const id of next) {
+      if (!backendBusyTabIds.has(id)) {
+        changed = true;
+        break;
+      }
     }
   }
-  return activeInFlightRequests.size > 0;
+  if (changed) {
+    backendBusyTabIds = next;
+    void broadcastTabTakeoverStates();
+  }
 }
 
-async function getUpdateState() {
-  const { updateState = {} } = await chrome.storage.local.get("updateState");
-  return {
-    githubRepo: DEFAULT_GITHUB_REPO,
-    extensionVersion: getExtensionVersion(),
-    backendVersion: "",
-    latestGitHubVersion: "",
-    releaseUrl: `https://github.com/${DEFAULT_GITHUB_REPO}/releases`,
-    backendUpdateRequired: false,
-    extensionOutdated: false,
-    pendingExtensionReloadVersion: "",
-    justAutoUpdatedTo: "",
-    attemptedReloadTargetVersion: "",
-    attemptedReloadFromVersion: "",
-    lastCheckedAt: 0,
-    lastCheckError: "",
-    ...updateState,
-    currentExtensionVersion: getExtensionVersion()
-  };
+async function getManualExclusions() {
+  try {
+    const data = await chrome.storage.local.get(["manualTabIds", "manualSessionKeys"]);
+    const tabIds = Array.isArray(data?.manualTabIds)
+      ? data.manualTabIds.map((n) => Number(n)).filter((n) => Number.isFinite(n) && n > 0)
+      : [];
+    const sessionKeys = Array.isArray(data?.manualSessionKeys)
+      ? data.manualSessionKeys.map((s) => String(s || "").trim()).filter(Boolean)
+      : [];
+    return {
+      manualTabIds: new Set(tabIds),
+      manualSessionKeys: new Set(sessionKeys)
+    };
+  } catch (_) {
+    return { manualTabIds: new Set(), manualSessionKeys: new Set() };
+  }
 }
 
-async function patchUpdateState(patch) {
-  const prev = await getUpdateState();
-  const merged = {
-    ...prev,
-    ...patch,
-    extensionVersion: getExtensionVersion()
-  };
-  delete merged.currentExtensionVersion;
-  await chrome.storage.local.set({ updateState: merged });
-  await setSessionStatus({
-    backendUpdateRequired: Boolean(merged.backendUpdateRequired),
-    extensionOutdated: Boolean(merged.extensionOutdated)
+async function setTabManualState(tabId, explicitManual = null) {
+  const numId = Number(tabId);
+  if (!Number.isFinite(numId) || numId <= 0) {
+    throw new Error("无效的标签页编号");
+  }
+  let tab = null;
+  try {
+    tab = await chrome.tabs.get(numId);
+  } catch (_) {}
+  const { manualTabIds, manualSessionKeys } = await getManualExclusions();
+  const skey = tab && tab.url ? extractVertexSessionKey(tab.url) : "";
+  const currentlyManual = manualTabIds.has(numId) || Boolean(skey && manualSessionKeys.has(skey));
+  const targetManual = typeof explicitManual === "boolean" ? explicitManual : !currentlyManual;
+
+  if (targetManual) {
+    manualTabIds.add(numId);
+    if (skey) manualSessionKeys.add(skey);
+    managedTabOrder.delete(numId);
+  } else {
+    manualTabIds.delete(numId);
+    if (skey) manualSessionKeys.delete(skey);
+  }
+
+  const cappedSessions = Array.from(manualSessionKeys).slice(-200);
+  await chrome.storage.local.set({
+    manualTabIds: Array.from(manualTabIds),
+    manualSessionKeys: cappedSessions
   });
-  return merged;
+  await appendLog(
+    "info",
+    targetManual
+      ? `标签页 #${numId} 已设为手动自用（Bridge 不接管此会话）`
+      : `标签页 #${numId} 已恢复交给 Bridge 接管`
+  );
+  await reportTabStatusToBackend();
+  return targetManual;
+}
+
+async function classifyAllVertexTabs() {
+  const settings = await getSettings();
+  const maxTabs = Math.max(1, Number(settings.maxParallelTabs) || 6);
+  const wsConnected = Boolean(socketRuntime.ws && socketRuntime.ws.readyState === WebSocket.OPEN);
+  const rawTabs = (await chrome.tabs.query({ url: VERTEX_MATCH_PATTERN })) || [];
+  const allTabs = rawTabs.filter((t) => Boolean(t && t.id));
+  const { manualTabIds, manualSessionKeys } = await getManualExclusions();
+
+  let sessionKeysDirty = false;
+  const manualSet = new Set();
+  for (const t of allTabs) {
+    const skey = extractVertexSessionKey(t.url || "");
+    const byTab = manualTabIds.has(t.id);
+    const bySession = Boolean(skey && manualSessionKeys.has(skey));
+    if (byTab || bySession) {
+      manualSet.add(t.id);
+      if (byTab && skey && !manualSessionKeys.has(skey)) {
+        manualSessionKeys.add(skey);
+        sessionKeysDirty = true;
+      }
+    }
+  }
+  if (sessionKeysDirty) {
+    try {
+      await chrome.storage.local.set({
+        manualSessionKeys: Array.from(manualSessionKeys).slice(-200)
+      });
+    } catch (_) {}
+  }
+
+  const candidates = allTabs.filter((t) => !manualSet.has(t.id));
+  const prioritized = candidates.slice().sort((a, b) => {
+    const aBusy = isTabCurrentlyBusy(a.id) ? 0 : 1;
+    const bBusy = isTabCurrentlyBusy(b.id) ? 0 : 1;
+    if (aBusy !== bBusy) return aBusy - bBusy;
+    const aKnown = managedTabOrder.has(a.id) ? 0 : 1;
+    const bKnown = managedTabOrder.has(b.id) ? 0 : 1;
+    if (aKnown !== bKnown) return aKnown - bKnown;
+    return 0;
+  });
+  const admittedIds = new Set(prioritized.slice(0, maxTabs).map((t) => t.id));
+  managedTabOrder = new Set(admittedIds);
+
+  const managedTabs = allTabs.filter((t) => admittedIds.has(t.id));
+  const manualTabs = allTabs.filter((t) => manualSet.has(t.id));
+  const overflowTabs = allTabs.filter((t) => !manualSet.has(t.id) && !admittedIds.has(t.id));
+
+  const seatMap = new Map();
+  managedTabs.forEach((t, idx) => seatMap.set(t.id, idx + 1));
+
+  const perTabState = new Map();
+  let busyCount = 0;
+  for (const t of allTabs) {
+    const isManual = manualSet.has(t.id);
+    const isAdmitted = admittedIds.has(t.id);
+    const isBusy = isTabCurrentlyBusy(t.id);
+    if (isBusy) busyCount += 1;
+    const seatIndex = seatMap.get(t.id) || null;
+    let mode = "managed";
+    if (isManual) {
+      mode = "manual";
+    } else if (!settings.enabled) {
+      mode = "paused";
+    } else if (!isAdmitted) {
+      mode = "overflow";
+    } else if (isBusy) {
+      mode = "working";
+    } else if (!wsConnected) {
+      mode = "disconnected";
+    }
+    perTabState.set(t.id, {
+      tabId: t.id,
+      mode,
+      manual: isManual,
+      managed: isAdmitted && Boolean(settings.enabled),
+      admitted: isAdmitted,
+      overflow: !isManual && !isAdmitted,
+      busy: isBusy,
+      seatIndex,
+      maxTabs,
+      wsConnected,
+      enabled: Boolean(settings.enabled)
+    });
+  }
+
+  return {
+    settings,
+    wsConnected,
+    maxTabs,
+    busyCount,
+    allTabs,
+    managedTabs,
+    manualTabs,
+    overflowTabs,
+    perTabState
+  };
+}
+
+async function broadcastTabTakeoverStates(precomputed = null) {
+  try {
+    const cls = precomputed || (await classifyAllVertexTabs());
+    for (const t of cls.allTabs) {
+      if (!t.id) continue;
+      const state = cls.perTabState.get(t.id);
+      if (!state) continue;
+      chrome.tabs
+        .sendMessage(t.id, { type: "GEB_TAB_TAKEOVER_STATE", state })
+        .catch(() => {});
+    }
+  } catch (_) {}
 }
 
 async function getSettings() {
@@ -159,9 +291,7 @@ async function setSessionStatus(patch) {
       "activeTabUrl",
       "activeTabTitle",
       "capturedRpc",
-      "tabCount",
-      "backendUpdateRequired",
-      "extensionOutdated"
+      "tabCount"
     ]);
     const next = { ...current, ...patch };
     await chrome.storage.session.set(next);
@@ -176,10 +306,7 @@ async function updateActionBadge(status) {
     await chrome.action.setBadgeBackgroundColor({ color: "#64748B" });
     return;
   }
-  if (status.wsConnected && status.backendUpdateRequired) {
-    await chrome.action.setBadgeText({ text: "UPD" });
-    await chrome.action.setBadgeBackgroundColor({ color: "#D97706" });
-  } else if (status.wsConnected && status.activeTabId) {
+  if (status.wsConnected && status.activeTabId) {
     const count = Number(status.tabCount) || 1;
     await chrome.action.setBadgeText({ text: count > 1 ? `${count}T` : "ON" });
     await chrome.action.setBadgeBackgroundColor({ color: "#0D9488" });
@@ -192,29 +319,25 @@ async function updateActionBadge(status) {
   }
 }
 
+async function getPreferredTabId() {
+  return null;
+}
+
 async function getEligibleVertexTabs() {
-  const tabs = await chrome.tabs.query({ url: VERTEX_MATCH_PATTERN });
-  if (!tabs || tabs.length === 0) {
-    return [];
-  }
-  const { preferredTabId } = await chrome.storage.session.get("preferredTabId");
-  if (preferredTabId) {
-    const pinned = tabs.find((t) => t.id === preferredTabId);
-    if (pinned) {
-      return [pinned];
-    }
-  }
-  return tabs.filter((t) => Boolean(t.id));
+  const cls = await classifyAllVertexTabs();
+  return cls.managedTabs;
 }
 
 async function findTargetVertexTab(requestedTabId = null) {
   if (requestedTabId !== null && requestedTabId !== undefined) {
     try {
-      const exact = await chrome.tabs.get(Number(requestedTabId));
+      const eligible = await getEligibleVertexTabs();
+      const exact = eligible.find((tab) => tab.id === Number(requestedTabId));
       if (exact && exact.id) {
         return exact;
       }
     } catch (_) {}
+    return null;
   }
   return await findBestVertexTab();
 }
@@ -253,6 +376,39 @@ async function ensureScriptsInjected(tabId) {
   }
 }
 
+// Probe the receiver before sending; error pages can retain a normal tab URL.
+async function ensureTabBridgeReady(tabId) {
+  const probe = async () => {
+    const response = await chrome.tabs.sendMessage(tabId, { type: "GEB_GET_VISIBILITY" });
+    if (!response || !response.ok) throw new Error("Page bridge did not respond");
+    return response;
+  };
+  try {
+    const status = await probe();
+    const needsDriverUpgrade = status.driverVersion
+      ? status.driverVersion !== EXPECTED_DRIVER_VERSION
+      : Boolean(status.visibilityState);
+    if (!needsDriverUpgrade) {
+      injectedTabVersions.set(tabId, status.driverVersion || EXPECTED_DRIVER_VERSION);
+      return;
+    }
+  } catch (_) {}
+  await ensureScriptsInjected(tabId);
+  try {
+    const status = await probe();
+    injectedTabVersions.set(tabId, status.driverVersion || EXPECTED_DRIVER_VERSION);
+    return;
+  } catch (_) {}
+
+  await appendLog("warn", `Recovering unavailable page bridge on tab #${tabId}`);
+  const loaded = waitForTabComplete(tabId, 20000);
+  await chrome.tabs.reload(tabId);
+  await loaded;
+  await ensureScriptsInjected(tabId);
+  const status = await probe();
+  injectedTabVersions.set(tabId, status.driverVersion || EXPECTED_DRIVER_VERSION);
+}
+
 async function injectIntoExistingTabs() {
   const tabs = await chrome.tabs.query({ url: VERTEX_MATCH_PATTERN });
   for (const tab of tabs) {
@@ -263,8 +419,9 @@ async function injectIntoExistingTabs() {
   }
 }
 
-async function buildReportedTabsSnapshot() {
-  const tabs = await getEligibleVertexTabs();
+async function buildReportedTabsSnapshot(precomputedCls = null) {
+  const cls = precomputedCls || (await classifyAllVertexTabs());
+  const tabs = cls.managedTabs;
   const { capturedRpc = false, activeModel = "" } = await chrome.storage.session.get([
     "capturedRpc",
     "activeModel"
@@ -283,12 +440,12 @@ async function buildReportedTabsSnapshot() {
 }
 
 async function reportTabStatusToBackend() {
-  const settings = await getSettings();
-  const tabsSnapshot = await buildReportedTabsSnapshot();
+  const cls = await classifyAllVertexTabs();
+  const settings = cls.settings;
+  const tabsSnapshot = await buildReportedTabsSnapshot(cls);
   const primary = tabsSnapshot[0] || null;
-  const { preferredTabId } = await chrome.storage.session.get("preferredTabId");
-  const capabilities = ["multi_tab", "usage_push", "auto_update"];
-  if (settings.autoSpawnTabs !== false && !preferredTabId) {
+  const capabilities = ["multi_tab", "reset_tab", "open_session", "session_busy_sync", "usage_push", "auto_update"];
+  if (settings.autoSpawnTabs !== false) {
     capabilities.push("spawn_tab");
   }
 
@@ -304,6 +461,7 @@ async function reportTabStatusToBackend() {
   sendWsJson({
     type: "tab_status",
     extension_version: getExtensionVersion(),
+    driver_version: EXPECTED_DRIVER_VERSION,
     tab_id: primary ? primary.tab_id : null,
     tab_url: primary ? primary.tab_url : "",
     tab_title: primary ? primary.tab_title : "",
@@ -316,6 +474,8 @@ async function reportTabStatusToBackend() {
     tabs: tabsSnapshot,
     user_agent: navigator.userAgent
   });
+
+  await broadcastTabTakeoverStates(cls);
 }
 
 function sendWsJson(payload) {
@@ -345,14 +505,15 @@ function startHeartbeatInterval() {
       const settings = await getSettings();
       const tabsSnapshot = await buildReportedTabsSnapshot();
       const primary = tabsSnapshot[0] || null;
-      const { preferredTabId } = await chrome.storage.session.get("preferredTabId");
-      const capabilities = ["multi_tab", "usage_push", "auto_update"];
+      const preferredTabId = await getPreferredTabId();
+      const capabilities = ["multi_tab", "reset_tab", "open_session", "session_busy_sync", "usage_push", "auto_update"];
       if (settings.autoSpawnTabs !== false && !preferredTabId) {
         capabilities.push("spawn_tab");
       }
       sendWsJson({
         type: "heartbeat",
         extension_version: getExtensionVersion(),
+        driver_version: EXPECTED_DRIVER_VERSION,
         tab_id: primary ? primary.tab_id : null,
         tab_url: primary ? primary.tab_url : "",
         tab_title: primary ? primary.tab_title : "",
@@ -401,6 +562,10 @@ async function disconnectWebSocket() {
     } catch (_) {}
   }
   socketRuntime.connecting = false;
+  if (backendBusyTabIds.size > 0) {
+    backendBusyTabIds.clear();
+    void broadcastTabTakeoverStates();
+  }
   await setSessionStatus({ wsConnected: false });
 }
 
@@ -436,51 +601,10 @@ async function ensureWebSocketConnected(forceReconnect = false, fromBackoffTimer
 
   clearReconnectTimer();
   socketRuntime.connecting = true;
-
-  const rawWsUrl = settings.wsUrl.trim() || DEFAULT_SETTINGS.wsUrl;
-  const httpBase = deriveHttpBaseFromWs(rawWsUrl);
-
-  // Preflight HTTP /health before opening WebSocket so Chromium never logs
-  // unsuppressible net::ERR_CONNECTION_REFUSED or 403 handshake errors in chrome://extensions.
-  try {
-    const healthRes = await fetchJsonWithTimeout(
-      `${httpBase}/health`,
-      { method: "GET", cache: "no-store" },
-      1800
-    );
-    const isBridgeHealthy =
-      healthRes.ok &&
-      healthRes.data &&
-      healthRes.data.status === "ok" &&
-      typeof healthRes.data.browser_connected === "boolean";
-    if (!isBridgeHealthy) {
-      socketRuntime.connecting = false;
-      await setSessionStatus({
-        wsConnected: false,
-        lastError: `本地端口响应异常 (${httpBase}/health HTTP ${healthRes.status})，请确认运行的是最新 Gemini Enterprise Bridge 后端。`
-      });
-      scheduleReconnectWithBackoff();
-      return;
-    }
-  } catch (_) {
-    socketRuntime.connecting = false;
-    await setSessionStatus({
-      wsConnected: false,
-      lastError: `等待本地后端启动 (${httpBase})... 请确认 start.bat / server.py 正在运行。`
-    });
-    scheduleReconnectWithBackoff();
-    return;
-  }
-
-  const latestSettingsAfterProbe = await getSettings();
-  if (!socketRuntime.connecting || !latestSettingsAfterProbe.enabled) {
-    socketRuntime.connecting = false;
-    return;
-  }
-
   const clientId = await getClientId();
-  const separator = rawWsUrl.includes("?") ? "&" : "?";
-  const targetUrl = `${rawWsUrl}${separator}client_id=${encodeURIComponent(clientId)}`;
+  let targetUrl = settings.wsUrl.trim() || DEFAULT_SETTINGS.wsUrl;
+  const separator = targetUrl.includes("?") ? "&" : "?";
+  targetUrl = `${targetUrl}${separator}client_id=${encodeURIComponent(clientId)}`;
 
   try {
     const ws = new WebSocket(targetUrl);
@@ -513,7 +637,6 @@ async function ensureWebSocketConnected(forceReconnect = false, fromBackoffTimer
     ws.addEventListener("close", () => {
       void (async () => {
         clearHeartbeatInterval();
-        activeInFlightRequests.clear();
         if (socketRuntime.ws === ws) {
           socketRuntime.ws = null;
           socketRuntime.connecting = false;
@@ -563,6 +686,89 @@ function computeCleanVertexHomeUrl(rawUrl) {
   return "";
 }
 
+function extractVertexSessionIdFromUrl(rawUrl) {
+  if (!rawUrl || typeof rawUrl !== "string") return "";
+  try {
+    const u = new URL(rawUrl.trim());
+    if (!u.hostname.toLowerCase().endsWith("vertexaisearch.cloud.google.com")) {
+      return "";
+    }
+    const m = u.pathname.match(/\/(?:r\/session|session|c)\/([^/?#]+)/i);
+    return m && m[1] ? decodeURIComponent(m[1]).trim() : "";
+  } catch (_) {
+    return "";
+  }
+}
+
+async function waitForSessionPageReady(tabId, targetSessionId, timeoutMs = 12000) {
+  const startedAt = Date.now();
+  const deadline = startedAt + Math.max(1000, Number(timeoutMs) || 12000);
+  let lastUrl = "";
+  let lastTitle = "";
+  let lastActiveModel = "";
+  while (Date.now() < deadline) {
+    let latestTab = null;
+    try {
+      latestTab = await chrome.tabs.get(tabId);
+      if (latestTab) {
+        lastUrl = latestTab.url || lastUrl;
+        lastTitle = latestTab.title || lastTitle;
+      }
+    } catch (_) {}
+
+    let diag = null;
+    try {
+      diag = await chrome.tabs.sendMessage(tabId, { type: "GEB_DIAGNOSE_PAGE" });
+    } catch (_) {
+      await ensureScriptsInjected(tabId);
+    }
+
+    if (diag && diag.ok) {
+      lastUrl = diag.url || lastUrl;
+      lastTitle = diag.title || lastTitle;
+      if (diag.activeModel) {
+        lastActiveModel = diag.activeModel;
+      }
+      const currentSid = extractVertexSessionIdFromUrl(lastUrl);
+      if (targetSessionId) {
+        if (!currentSid && Date.now() - startedAt >= 800) {
+          return {
+            ok: false,
+            redirected: true,
+            tab_url: lastUrl,
+            tab_title: lastTitle,
+            active_model: lastActiveModel,
+            error: "历史会话已被重定向回空白首页"
+          };
+        }
+        if (currentSid === targetSessionId && diag.inputFound) {
+          return {
+            ok: true,
+            tab_url: lastUrl,
+            tab_title: lastTitle,
+            active_model: lastActiveModel
+          };
+        }
+      } else if (diag.inputFound) {
+        return {
+          ok: true,
+          tab_url: lastUrl,
+          tab_title: lastTitle,
+          active_model: lastActiveModel
+        };
+      }
+    }
+    await new Promise((r) => setTimeout(r, 250));
+  }
+  return {
+    ok: false,
+    tab_url: lastUrl,
+    tab_title: lastTitle,
+    active_model: lastActiveModel,
+    error: "等待历史会话输入框就绪超时"
+  };
+}
+
 function waitForTabComplete(tabId, timeoutMs = 12000) {
   return new Promise((resolve) => {
     let settled = false;
@@ -601,7 +807,7 @@ async function prepareTabForBackgroundExecution(tab) {
     await reloadWait;
     await new Promise((r) => setTimeout(r, 650));
     await ensureScriptsInjected(freshTab.id);
-    injectedTabVersions.set(freshTab.id, "2.6");
+    injectedTabVersions.set(freshTab.id, EXPECTED_DRIVER_VERSION);
     try {
       freshTab = await chrome.tabs.get(freshTab.id);
     } catch (_) {}
@@ -610,17 +816,19 @@ async function prepareTabForBackgroundExecution(tab) {
   return freshTab;
 }
 
-async function spawnParallelWorkerTab(baseUrlHint = "") {
-  const allVertexTabs = await chrome.tabs.query({ url: VERTEX_MATCH_PATTERN });
-  const settings = await getSettings();
-  const maxTabs = Math.max(1, Number(settings.maxParallelTabs) || 6);
-  if (allVertexTabs.length >= maxTabs) {
+async function spawnParallelWorkerTab(baseUrlHint = "", preserveSessionUrl = false) {
+  const cls = await classifyAllVertexTabs();
+  const allVertexTabs = cls.allTabs;
+  const maxTabs = cls.maxTabs;
+  if (cls.managedTabs.length >= maxTabs) {
     throw new Error(`已达到最大并行标签页上限 (${maxTabs})`);
   }
 
   let targetUrl = "";
   if (baseUrlHint && baseUrlHint.startsWith("https://vertexaisearch.cloud.google.com")) {
-    targetUrl = computeCleanVertexHomeUrl(baseUrlHint) || baseUrlHint;
+    targetUrl = preserveSessionUrl
+      ? baseUrlHint
+      : (computeCleanVertexHomeUrl(baseUrlHint) || baseUrlHint);
   }
   if (!targetUrl && allVertexTabs.length > 0) {
     const refUrl = allVertexTabs[0].url || "";
@@ -640,11 +848,24 @@ async function spawnParallelWorkerTab(baseUrlHint = "") {
     throw new Error("无法创建新的后台工作标签页");
   }
 
+  const loadPromise =
+    created.status === "complete" ? Promise.resolve() : waitForTabComplete(created.id, 14000);
   await protectTabFromFreeze(created.id);
-  await waitForTabComplete(created.id, 14000);
+  managedTabOrder.add(created.id);
+  await loadPromise;
   await new Promise((r) => setTimeout(r, 600));
   await ensureScriptsInjected(created.id);
-  injectedTabVersions.set(created.id, "2.6");
+  injectedTabVersions.set(created.id, EXPECTED_DRIVER_VERSION);
+
+  const targetSid = preserveSessionUrl ? extractVertexSessionIdFromUrl(targetUrl) : "";
+  let sessionProbe = null;
+  if (targetSid) {
+    sessionProbe = await waitForSessionPageReady(created.id, targetSid, 10000);
+    if (sessionProbe.active_model) {
+      const prevMeta = runtimeTabMeta.get(created.id) || {};
+      runtimeTabMeta.set(created.id, { ...prevMeta, activeModel: sessionProbe.active_model });
+    }
+  }
 
   let latest = created;
   try {
@@ -655,8 +876,9 @@ async function spawnParallelWorkerTab(baseUrlHint = "") {
   await reportTabStatusToBackend();
   return {
     tab_id: latest.id,
-    tab_url: latest.url || targetUrl,
-    tab_title: latest.title || "Gemini Enterprise",
+    tab_url: (sessionProbe && sessionProbe.tab_url) || latest.url || targetUrl,
+    tab_title: (sessionProbe && sessionProbe.tab_title) || latest.title || "Gemini Enterprise",
+    active_model: (sessionProbe && sessionProbe.active_model) || "",
     ready: true
   };
 }
@@ -703,9 +925,6 @@ async function resetTabChatWithFallback(tab) {
     (inPageResult && inPageResult.cleanUrl) || preCleanUrl;
   if (targetCleanUrl && targetCleanUrl !== tab.url) {
     await appendLog("info", "Navigating tab to clean New Chat URL: " + targetCleanUrl);
-    try {
-      await chrome.tabs.sendMessage(tab.id, { type: "GEB_PREPARE_UNLOAD" });
-    } catch (_) {}
     const loadPromise = waitForTabComplete(tab.id, 12000);
     await chrome.tabs.update(tab.id, { url: targetCleanUrl });
     await loadPromise;
@@ -719,8 +938,28 @@ async function resetTabChatWithFallback(tab) {
 
 const LARGE_REPLY_THRESHOLD = 24576;
 const TAB_IPC_CHUNK_SIZE = 24576;
+function assembleChunks(entry, total) {
+  if (!entry || !Number.isInteger(total) || total < 1 || total > 10000 || entry.total !== total || entry.parts.length !== total) {
+    throw new Error("传输分段缺失或数量不一致，已停止处理不完整内容。");
+  }
+  const parts = Array.from({length: total}, (_, index) => entry.parts[index]);
+  if (parts.some(part => typeof part !== "string")) {
+    throw new Error("传输分段缺失，已停止处理不完整内容。");
+  }
+  return parts.join("");
+}
+
 const swPromptReassembly = new Map();
 const swReplyReassembly = new Map();
+
+function getExtensionVersion() {
+  try {
+    const mf = chrome.runtime?.getManifest?.();
+    return mf && mf.version ? String(mf.version) : "1.4.1";
+  } catch (_) {
+    return "1.4.1";
+  }
+}
 
 function deriveHttpBaseFromWs(wsUrl) {
   try {
@@ -736,260 +975,155 @@ function deriveCallbackUrlFromWs(wsUrl) {
   return `${deriveHttpBaseFromWs(wsUrl)}/api/bridge/callback`;
 }
 
-async function fetchJsonWithTimeout(url, options = {}, timeoutMs = 8000) {
-  const ctrl = new AbortController();
-  const timer = setTimeout(() => ctrl.abort(), timeoutMs);
-  try {
-    const resp = await fetch(url, { ...options, signal: ctrl.signal });
-    const data = await resp.json();
-    return { ok: resp.ok, status: resp.status, data };
-  } finally {
-    clearTimeout(timer);
-  }
-}
-
-async function scheduleOrTriggerExtensionReload(targetVersion, reason = "auto_update", forceManual = false) {
-  const currentExtVer = getExtensionVersion();
-  const normalizedTarget = normalizeVersion(targetVersion);
-  const state = await getUpdateState();
-
-  // Prevent infinite reload loop if user loaded unpacked extension from a non-default directory
-  if (
-    !forceManual &&
-    normalizedTarget &&
-    state.attemptedReloadFromVersion === currentExtVer &&
-    state.attemptedReloadTargetVersion === normalizedTarget
-  ) {
-    await appendLog(
-      "warn",
-      `已同步插件目录至 v${normalizedTarget}，但当前运行实例仍为 v${currentExtVer}；请在扩展弹窗点击重载或确认加载目录为 extension/`
-    );
-    await patchUpdateState({
-      extensionOutdated: true,
-      pendingExtensionReloadVersion: normalizedTarget
-    });
-    return { reloaded: false, deferred: false, manualRequired: true };
-  }
-
-  if (!forceManual && hasActiveInFlightJobs()) {
-    await appendLog(
-      "info",
-      `检测到插件新版本 v${normalizedTarget || "latest"} (${reason})，等待当前对话生成完成后自动无感热重载...`
-    );
-    await patchUpdateState({
-      extensionOutdated: true,
-      pendingExtensionReloadVersion: normalizedTarget || "latest"
-    });
-    return { reloaded: false, deferred: true };
-  }
-
-  await patchUpdateState({
-    justAutoUpdatedTo: normalizedTarget || currentExtVer,
-    pendingExtensionReloadVersion: "",
-    extensionOutdated: false,
-    attemptedReloadFromVersion: currentExtVer,
-    attemptedReloadTargetVersion: normalizedTarget || currentExtVer
-  });
-  await appendLog(
-    "info",
-    `正在自动热重载浏览器扩展至 v${normalizedTarget || currentExtVer} (${reason})...`
-  );
-  setTimeout(() => {
-    chrome.runtime.reload();
-  }, 180);
-  return { reloaded: true, deferred: false };
-}
-
-async function maybeReloadPendingExtensionUpdate() {
-  if (hasActiveInFlightJobs()) return;
-  const state = await getUpdateState();
-  if (state.pendingExtensionReloadVersion) {
-    await scheduleOrTriggerExtensionReload(state.pendingExtensionReloadVersion, "idle_deferred_reload", false);
-  }
-}
-
-async function syncExtensionDiskAndReload(targetVersionHint = "", forceManual = false) {
-  const settings = await getSettings();
-  const httpBase = deriveHttpBaseFromWs(settings.wsUrl);
-  try {
-    const res = await fetchJsonWithTimeout(
-      `${httpBase}/api/update/extension`,
-      { method: "POST", headers: { "Content-Type": "application/json" } },
-      45000
-    );
-    if (res.ok && res.data && res.data.ok) {
-      const ver = normalizeVersion(res.data.updated_version || targetVersionHint);
-      await appendLog("info", `已从 GitHub Release 下载并更新本地 extension/ 目录至 v${ver}`);
-      const reloadInfo = await scheduleOrTriggerExtensionReload(ver, "github_extension_sync", forceManual);
-      return { ok: true, updatedVersion: ver, ...reloadInfo };
-    }
-    const errMsg = (res.data && res.data.error) || `HTTP ${res.status}`;
-    await appendLog("warn", `同步扩展更新包失败: ${errMsg}`);
-    return { ok: false, error: errMsg };
-  } catch (err) {
-    await appendLog("warn", `无法请求本地后端同步扩展目录: ${err.message}`);
-    return { ok: false, error: err.message };
-  }
+function resolveAttachmentUrl(att, wsUrl) {
+  const raw = String((att && (att.fetch_url || att.url || att.path)) || "").trim();
+  if (!raw) return "";
+  if (/^https?:\/\//i.test(raw)) return raw;
+  const base = deriveHttpBaseFromWs(wsUrl).replace(/\/+$/, "");
+  return `${base}${raw.startsWith("/") ? raw : "/" + raw}`;
 }
 
 async function checkGitHubReleaseDirectly(repo = DEFAULT_GITHUB_REPO) {
   const cleanRepo = String(repo || DEFAULT_GITHUB_REPO).trim().replace(/^\/+|\/+$/g, "");
-  const latestApiUrl = `https://api.github.com/repos/${cleanRepo}/releases/latest`;
-  const manifestUrl = `https://github.com/${cleanRepo}/releases/latest/download/release-manifest.json`;
-  let apiErrMessage = "";
-
-  // 1. Prefer GitHub REST API first (native CORS support, zero cross-domain 302 redirects)
   try {
-    const apiRes = await fetchJsonWithTimeout(
-      latestApiUrl,
-      {
-        cache: "no-store",
-        credentials: "omit",
-        headers: { Accept: "application/vnd.github+json" }
-      },
-      7000
-    );
-    if (apiRes.ok && apiRes.data && apiRes.data.tag_name) {
-      const ver = normalizeVersion(apiRes.data.tag_name);
-      return {
-        ok: true,
-        version: ver,
-        releaseUrl:
-          apiRes.data.html_url || `https://github.com/${cleanRepo}/releases/tag/${apiRes.data.tag_name}`
-      };
+    const apiRes = await fetch(`https://api.github.com/repos/${cleanRepo}/releases/latest`);
+    if (apiRes.ok) {
+      const data = await apiRes.json();
+      const tag = String(data.tag_name || "").replace(/^[vV]/, "");
+      if (tag) {
+        return { ok: true, version: tag, releaseUrl: data.html_url || `https://github.com/${cleanRepo}/releases` };
+      }
+    }
+  } catch (_) {}
+  try {
+    const mfRes = await fetch(`https://github.com/${cleanRepo}/releases/latest/download/release-manifest.json`);
+    if (mfRes.ok) {
+      const mf = await mfRes.json();
+      if (mf && mf.version) {
+        return { ok: true, version: String(mf.version).replace(/^[vV]/, ""), releaseUrl: mf.release_url || `https://github.com/${cleanRepo}/releases` };
+      }
     }
   } catch (err) {
-    apiErrMessage = err && err.message ? err.message : String(err || "");
+    return { ok: false, error: err && err.message ? err.message : String(err) };
   }
-
-  // 2. Fallback to release-manifest.json as a strict CORS-simple GET (no custom headers -> zero OPTIONS preflight)
-  try {
-    const mfRes = await fetchJsonWithTimeout(
-      manifestUrl,
-      { cache: "no-store" },
-      7000
-    );
-    if (mfRes.ok && mfRes.data && mfRes.data.version) {
-      const ver = normalizeVersion(mfRes.data.version);
-      return {
-        ok: true,
-        version: ver,
-        releaseUrl:
-          mfRes.data.release_url || `https://github.com/${cleanRepo}/releases/tag/v${ver}`
-      };
-    }
-  } catch (err) {
-    return {
-      ok: false,
-      version: "",
-      error: (err && err.message) || apiErrMessage || "github_release_unreachable"
-    };
-  }
-
-  return { ok: false, version: "", error: apiErrMessage || "no_github_release" };
+  return { ok: false, error: "no_release" };
 }
 
 async function checkUpdatesAndAutoSync(force = false) {
-  const { checkingUpdateLock = 0 } = await chrome.storage.session.get("checkingUpdateLock");
-  if (!force && checkingUpdateLock && Date.now() - checkingUpdateLock < 20000) {
-    return await getUpdateState();
-  }
-  await chrome.storage.session.set({ checkingUpdateLock: Date.now() });
-
+  const settings = await getSettings();
+  const httpBase = deriveHttpBaseFromWs(settings.wsUrl);
+  let backendReturnedRemoteVersion = false;
+  let latestGitHubVersion = "";
+  let githubRepo = DEFAULT_GITHUB_REPO;
   try {
-    const settings = await getSettings();
-    const httpBase = deriveHttpBaseFromWs(settings.wsUrl);
-    const prev = await getUpdateState();
-    const extVer = getExtensionVersion();
-    let backendVer = prev.backendVersion || "";
-    let latestGitHubVer = prev.latestGitHubVersion || "";
-    let releaseUrl = prev.releaseUrl || `https://github.com/${DEFAULT_GITHUB_REPO}/releases`;
-    let githubRepo = prev.githubRepo || DEFAULT_GITHUB_REPO;
-    let lastCheckError = "";
-
-    // Path A: Query local backend /api/update/status (supports private repos via gh CLI / token)
-    let backendReturnedRemoteVersion = false;
-    try {
-      const bRes = await fetchJsonWithTimeout(
-        `${httpBase}/api/update/status?force=${force ? "true" : "false"}`,
-        { method: "GET", cache: "no-store" },
-        8500
-      );
-      if (bRes.ok && bRes.data) {
-        if (bRes.data.repo) githubRepo = bRes.data.repo;
-        if (bRes.data.current_backend_version) {
-          backendVer = normalizeVersion(bRes.data.current_backend_version);
-        }
-        if (bRes.data.latest_github_version) {
-          const bRemote = normalizeVersion(bRes.data.latest_github_version);
-          if (bRemote) {
-            backendReturnedRemoteVersion = true;
-            if (!latestGitHubVer || compareSemver(bRemote, latestGitHubVer) >= 0) {
-              latestGitHubVer = bRemote;
-            }
-          }
-        }
-        if (bRes.data.release_url) releaseUrl = bRes.data.release_url;
-      }
-    } catch (_) {}
-
-    // Path B: Only poll GitHub Releases directly from MV3 Service Worker when local backend is offline or omitted remote version
-    if (!backendReturnedRemoteVersion) {
-      const direct = await checkGitHubReleaseDirectly(githubRepo);
-      if (direct.ok && direct.version) {
-        if (!latestGitHubVer || compareSemver(direct.version, latestGitHubVer) >= 0) {
-          latestGitHubVer = direct.version;
-          if (direct.releaseUrl) releaseUrl = direct.releaseUrl;
-        }
-      } else if (!latestGitHubVer && direct.error) {
-        lastCheckError = direct.error;
+    const bRes = await fetch(`${httpBase}/api/update/status?force=${force ? "true" : "false"}`);
+    if (bRes.ok) {
+      const data = await bRes.json();
+      if (data && data.repo) githubRepo = data.repo;
+      if (data && data.latest_github_version) {
+        latestGitHubVersion = String(data.latest_github_version).replace(/^[vV]/, "");
+        backendReturnedRemoteVersion = true;
       }
     }
-
-    const extNewerThanBackend = Boolean(backendVer && compareSemver(extVer, backendVer) > 0);
-    const githubNewerThanBackend = Boolean(
-      backendVer && latestGitHubVer && compareSemver(latestGitHubVer, backendVer) > 0
-    );
-    const backendUpdateRequired = extNewerThanBackend || githubNewerThanBackend;
-
-    const githubNewerThanExt = Boolean(latestGitHubVer && compareSemver(latestGitHubVer, extVer) > 0);
-    const backendNewerThanExt = Boolean(backendVer && compareSemver(backendVer, extVer) > 0);
-    const extensionOutdated = githubNewerThanExt || backendNewerThanExt;
-
-    // Clear justAutoUpdatedTo notice once backend catches up
-    let justAutoUpdatedTo = prev.justAutoUpdatedTo || "";
-    if (justAutoUpdatedTo && backendVer && compareSemver(backendVer, justAutoUpdatedTo) >= 0 && !backendUpdateRequired) {
-      justAutoUpdatedTo = "";
+  } catch (_) {}
+  if (!backendReturnedRemoteVersion) {
+    const direct = await checkGitHubReleaseDirectly(githubRepo);
+    if (direct.ok && direct.version) {
+      latestGitHubVersion = direct.version;
     }
-
-    const updatedState = await patchUpdateState({
-      githubRepo,
-      backendVersion: backendVer,
-      latestGitHubVersion: latestGitHubVer,
-      releaseUrl,
-      backendUpdateRequired,
-      extensionOutdated,
-      justAutoUpdatedTo,
-      lastCheckedAt: Date.now(),
-      lastCheckError
-    });
-
-    // Automatically sync & hot-reload unpacked extension when GitHub has a newer release
-    if (githubNewerThanExt) {
-      await syncExtensionDiskAndReload(latestGitHubVer, false);
-    } else if (backendNewerThanExt) {
-      await scheduleOrTriggerExtensionReload(backendVer, "backend_ahead", false);
-    }
-
-    return updatedState;
-  } finally {
-    await chrome.storage.session.set({ checkingUpdateLock: 0 });
   }
+  return { ok: true, latestGitHubVersion, extensionVersion: getExtensionVersion() };
+}
+
+function arrayBufferToBase64(buffer) {
+  const bytes = new Uint8Array(buffer);
+  const chunk = 0x8000;
+  const parts = [];
+  for (let i = 0; i < bytes.length; i += chunk) {
+    parts.push(String.fromCharCode.apply(null, bytes.subarray(i, i + chunk)));
+  }
+  return btoa(parts.join(""));
+}
+
+const ATTACHMENT_IPC_CHUNK_SIZE = 196608;
+
+function sanitizeMimeHeader(rawMime) {
+  const cleaned = String(rawMime || "").split(";")[0].split(",")[0].trim();
+  return cleaned && cleaned.includes("/") ? cleaned : "application/octet-stream";
+}
+
+async function prepareAttachmentsForTab(tabId, requestId, rawAttachments) {
+  const list = Array.isArray(rawAttachments) ? rawAttachments : [];
+  if (list.length === 0) return [];
+  const prepared = [];
+  for (let idx = 0; idx < list.length; idx += 1) {
+    const att = { ...list[idx] };
+    const declaredMime = sanitizeMimeHeader(att.mime_type);
+    let dataUrl = String(att.data_url || "").trim();
+    if (dataUrl && !/^data:/i.test(dataUrl) && !/^(?:https?|blob|file):/i.test(dataUrl)) {
+      dataUrl = `data:${declaredMime};base64,${dataUrl.replace(/\s+/g, "")}`;
+    }
+    if (!dataUrl) {
+      const rawB64 = att.data_b64 || att.b64_json || att.file_data || att.data || "";
+      if (typeof rawB64 === "string" && rawB64.trim().length > 0) {
+        dataUrl = /^data:/i.test(rawB64.trim())
+          ? rawB64.trim()
+          : `data:${declaredMime};base64,${rawB64.replace(/\s+/g, "")}`;
+      }
+    }
+    if (!dataUrl && (att.fetch_url || att.url || att.path)) {
+      const settingsForAtt = await getSettings();
+      const targetFetchUrl = resolveAttachmentUrl(att, settingsForAtt.wsUrl);
+      const resp = await fetch(targetFetchUrl);
+      if (!resp.ok) {
+        throw new Error(`拉取本地暂存附件失败 (${att.name || att.filename || idx}): HTTP ${resp.status}`);
+      }
+      const buf = await resp.arrayBuffer();
+      const headerMime = resp.headers && resp.headers.get ? resp.headers.get("content-type") : "";
+      const mime = sanitizeMimeHeader(att.mime_type || headerMime);
+      dataUrl = `data:${mime};base64,${arrayBufferToBase64(buf)}`;
+    }
+    if (dataUrl.length > ATTACHMENT_IPC_CHUNK_SIZE) {
+      const attId = String(att.id || `att-${idx}`);
+      const attKey = `${requestId}:${idx}`;
+      const totalChunks = Math.ceil(dataUrl.length / ATTACHMENT_IPC_CHUNK_SIZE);
+      for (let c = 0; c < totalChunks; c += 1) {
+        await chrome.tabs.sendMessage(tabId, {
+          type: "GEB_ATTACHMENT_CHUNK",
+          att_key: attKey,
+          request_id: requestId,
+          attachment_id: attId,
+          chunk_index: c,
+          total_chunks: totalChunks,
+          data: dataUrl.slice(c * ATTACHMENT_IPC_CHUNK_SIZE, (c + 1) * ATTACHMENT_IPC_CHUNK_SIZE)
+        });
+      }
+      prepared.push({
+        ...att,
+        data_url: "",
+        chunked_att_key: attKey,
+        total_chunks: totalChunks
+      });
+    } else {
+      prepared.push({ ...att, data_url: dataUrl });
+    }
+  }
+  return prepared;
 }
 
 async function deliverResultToBackend(eventData) {
+  if (
+    eventData &&
+    (eventData.type === "request_complete" || eventData.type === "request_error") &&
+    eventData.request_id
+  ) {
+    if (busyRequestsByTab.delete(eventData.request_id)) {
+      void broadcastTabTakeoverStates();
+    }
+  }
   const replyStr = String(eventData.reply || "");
-  if (eventData.type === "request_complete" && replyStr.length > LARGE_REPLY_THRESHOLD) {
+  const hasMediaOutputs = (eventData.output_images || []).length > 0 || (eventData.output_files || []).length > 0;
+  if (eventData.type === "request_complete" && (replyStr.length > LARGE_REPLY_THRESHOLD || hasMediaOutputs)) {
     const settings = await getSettings();
     const clientId = await getClientId();
     const callbackUrl = eventData.callback_url || deriveCallbackUrlFromWs(settings.wsUrl);
@@ -1004,7 +1138,11 @@ async function deliverResultToBackend(eventData) {
           reply: replyStr,
           citations: eventData.citations || [],
           source: eventData.source || "http_callback",
-          active_model: eventData.active_model || null
+          output_images: eventData.output_images || [],
+          output_files: eventData.output_files || [],
+          active_model: eventData.active_model || null,
+          tab_url: eventData.tab_url || null,
+          tab_title: eventData.tab_title || null
         })
       });
       if (resp.ok) {
@@ -1045,50 +1183,10 @@ async function deliverResultToBackend(eventData) {
 
 async function handleBackendCommand(msg) {
   const type = msg.type || "";
-  if (msg && msg.usage_snapshot && typeof msg.usage_snapshot === "object") {
-    try {
-      await chrome.storage.session.set({ usageSnapshot: msg.usage_snapshot });
-    } catch (_) {}
+  if (Array.isArray(msg.busy_tab_ids)) {
+    applyBackendBusyTabIds(msg.busy_tab_ids);
   }
-  if (msg && msg.backend_version) {
-    const bVer = normalizeVersion(msg.backend_version);
-    const extVer = getExtensionVersion();
-    const state = await getUpdateState();
-    const remoteVer = state.latestGitHubVersion || "";
-    const backendOutdated =
-      Boolean(msg.backend_update_required) ||
-      compareSemver(extVer, bVer) > 0 ||
-      Boolean(remoteVer && compareSemver(remoteVer, bVer) > 0);
-    const extOutdated =
-      compareSemver(bVer, extVer) > 0 ||
-      Boolean(remoteVer && compareSemver(remoteVer, extVer) > 0);
-    let clearedNotice = state.justAutoUpdatedTo || "";
-    if (clearedNotice && compareSemver(bVer, clearedNotice) >= 0 && !backendOutdated) {
-      clearedNotice = "";
-    }
-    await patchUpdateState({
-      backendVersion: bVer,
-      backendUpdateRequired: backendOutdated,
-      extensionOutdated: extOutdated,
-      justAutoUpdatedTo: clearedNotice
-    });
-    if (compareSemver(extVer, bVer) > 0) {
-      await appendLog(
-        "warn",
-        `插件已更新至 v${extVer}，检测到本地后端仍为 v${bVer} — 请在插件弹窗或控制台一键更新后端`
-      );
-    }
-  }
-
-  if (type === "extension_reload_available") {
-    const targetVer = normalizeVersion(msg.version || "");
-    if (!targetVer || compareSemver(targetVer, getExtensionVersion()) > 0) {
-      await scheduleOrTriggerExtensionReload(targetVer || getExtensionVersion(), "backend_ws_push", false);
-    }
-    return;
-  }
-
-  if (type === "welcome" || type === "pong" || type === "ack" || type === "usage_update") {
+  if (type === "sync_busy_tabs" || type === "welcome" || type === "pong" || type === "ack") {
     return;
   }
   if (type === "ping") {
@@ -1096,10 +1194,30 @@ async function handleBackendCommand(msg) {
     return;
   }
 
+  if (type === "extension_reload_available" || type === "reload_extension") {
+    if (type === "reload_extension") {
+      sendWsJson({ type: "reload_extension_ack", ok: true });
+    }
+    if (busyRequestsByTab.size > 0) {
+      return;
+    }
+    if (typeof chrome.runtime?.reload === "function") {
+      setTimeout(() => {
+        try {
+          chrome.runtime.reload();
+        } catch (_) {}
+      }, 120);
+    }
+    return;
+  }
+
   if (type === "spawn_tab") {
     const spawnId = msg.spawn_id || "";
     try {
-      const spawned = await spawnParallelWorkerTab(msg.base_url || "");
+      const spawned = await spawnParallelWorkerTab(
+        msg.base_url || "",
+        Boolean(msg.preserve_session_url)
+      );
       sendWsJson({
         type: "spawn_tab_result",
         spawn_id: spawnId,
@@ -1113,6 +1231,82 @@ async function handleBackendCommand(msg) {
         spawn_id: spawnId,
         ok: false,
         error: err.message
+      });
+    }
+    return;
+  }
+
+  if (type === "reset_tab") {
+    const resetId = msg.reset_id || "";
+    try {
+      const rawTab = await findTargetVertexTab(msg.tab_id);
+      if (!rawTab || !rawTab.id) {
+        throw new Error("未找到对应的 Google 工作标签页");
+      }
+      const tab = await prepareTabForBackgroundExecution(rawTab);
+      const ok = await resetTabChatWithFallback(tab);
+      await reportTabStatusToBackend();
+      sendWsJson({
+        type: "reset_tab_result",
+        reset_id: resetId,
+        ok: Boolean(ok),
+        tab_id: tab.id
+      });
+    } catch (err) {
+      sendWsJson({
+        type: "reset_tab_result",
+        reset_id: resetId,
+        ok: false,
+        error: err.message
+      });
+    }
+    return;
+  }
+
+  if (type === "open_session") {
+    const openId = msg.open_id || "";
+    const sessionUrl = String(msg.session_url || "").trim();
+    const targetSid = extractVertexSessionIdFromUrl(sessionUrl);
+    try {
+      if (!sessionUrl || !sessionUrl.startsWith("https://vertexaisearch.cloud.google.com") || !targetSid) {
+        throw new Error("无效的历史会话地址");
+      }
+      const rawTab = await findTargetVertexTab(msg.tab_id);
+      if (!rawTab || !rawTab.id) {
+        throw new Error("未找到对应的 Google 工作标签页");
+      }
+      const tab = await prepareTabForBackgroundExecution(rawTab);
+      const currentSid = extractVertexSessionIdFromUrl(tab.url || "");
+      if (currentSid !== targetSid) {
+        const loadPromise = waitForTabComplete(tab.id, 14000);
+        await chrome.tabs.update(tab.id, { url: sessionUrl });
+        await loadPromise;
+        await new Promise((r) => setTimeout(r, 450));
+      }
+      await ensureTabBridgeReady(tab.id);
+      const readyRes = await waitForSessionPageReady(tab.id, targetSid, 12000);
+      if (readyRes.active_model) {
+        const prevMeta = runtimeTabMeta.get(tab.id) || {};
+        runtimeTabMeta.set(tab.id, { ...prevMeta, activeModel: readyRes.active_model });
+      }
+      await reportTabStatusToBackend();
+      sendWsJson({
+        type: "open_session_result",
+        open_id: openId,
+        ok: Boolean(readyRes.ok),
+        tab_id: tab.id,
+        tab_url: readyRes.tab_url || "",
+        tab_title: readyRes.tab_title || "",
+        active_model: readyRes.active_model || "",
+        error: readyRes.ok ? undefined : (readyRes.error || "历史会话未能打开或已被重定向")
+      });
+    } catch (err) {
+      await reportTabStatusToBackend();
+      sendWsJson({
+        type: "open_session_result",
+        open_id: openId,
+        ok: false,
+        error: err && err.message ? err.message : String(err)
       });
     }
     return;
@@ -1133,131 +1327,136 @@ async function handleBackendCommand(msg) {
 
   if (type === "execute_prompt") {
     const requestId = msg.request_id;
-    let assembledPrompt = String(msg.prompt || "");
-    if (msg.chunked) {
-      const entry = swPromptReassembly.get(requestId);
-      swPromptReassembly.delete(requestId);
-      const total = msg.total_chunks || (entry ? entry.total : 0);
-      assembledPrompt = entry
-        ? Array.from({ length: total }, (_, idx) => entry.parts[idx] || "").join("")
-        : "";
-    }
-
-    const rawTab = await findTargetVertexTab(msg.tab_id);
-    if (!rawTab || !rawTab.id) {
-      sendWsJson({
-        type: "request_error",
-        request_id: requestId,
-        error: "未找到已打开的 https://vertexaisearch.cloud.google.com 标签页。"
-      });
-      return;
-    }
-
-    const reqTtlMs = Math.max(60000, Number(msg.timeout_ms) || 600000) + 15000;
-    activeInFlightRequests.set(requestId, Date.now() + reqTtlMs);
-    sendWsJson({ type: "request_ack", request_id: requestId, tab_id: rawTab.id });
-    const tab = await prepareTabForBackgroundExecution(rawTab);
-
-    await appendLog(
-      "info",
-      `Dispatching request ${String(requestId).slice(0, 8)} to tab #${tab.id}` +
-        ` [len=${assembledPrompt.length}]` +
-        (tab.active ? "" : " [bg]") +
-        (msg.target_model ? ` [model=${msg.target_model}]` : "") +
-        (msg.reset_chat ? " [new_chat]" : "")
-    );
-
-    // Ensure hot-swapped latest page-driver.js & content-bridge.js are active on this tab (race-free per-tab map)
-    if (injectedTabVersions.get(tab.id) !== "2.6") {
-      await ensureScriptsInjected(tab.id);
-      injectedTabVersions.set(tab.id, "2.6");
-    }
-
-    let remainingResetChat = Boolean(msg.reset_chat);
-    if (remainingResetChat) {
-      const resetDone = await resetTabChatWithFallback(tab);
-      if (resetDone) {
-        remainingResetChat = false;
-      }
-    }
-
-    const settings = await getSettings();
-    const callbackUrl = msg.callback_url || deriveCallbackUrlFromWs(settings.wsUrl);
-
-    const dispatchToReadyTab = async () => {
-      if (assembledPrompt.length > TAB_IPC_CHUNK_SIZE) {
-        const totalChunks = Math.ceil(assembledPrompt.length / TAB_IPC_CHUNK_SIZE);
-        for (let i = 0; i < totalChunks; i += 1) {
-          await chrome.tabs.sendMessage(tab.id, {
-            type: "GEB_PROMPT_CHUNK",
-            request_id: requestId,
-            chunk_index: i,
-            total_chunks: totalChunks,
-            data: assembledPrompt.slice(i * TAB_IPC_CHUNK_SIZE, (i + 1) * TAB_IPC_CHUNK_SIZE)
-          });
-        }
-        await chrome.tabs.sendMessage(tab.id, {
-          type: "GEB_EXECUTE_PROMPT",
-          request_id: requestId,
-          prompt: "",
-          chunked: true,
-          total_chunks: totalChunks,
-          callback_url: callbackUrl,
-          target_model: msg.target_model || null,
-          reset_chat: remainingResetChat,
-          timeout_ms: msg.timeout_ms || 600000,
-          driver_config: {
-            driverMode: settings.driverMode,
-            customModelSelector: settings.customModelSelector,
-            customInputSelector: settings.customInputSelector,
-            customSendSelector: settings.customSendSelector,
-            customReplySelector: settings.customReplySelector
-          }
-        });
-      } else {
-        await chrome.tabs.sendMessage(tab.id, {
-          type: "GEB_EXECUTE_PROMPT",
-          request_id: requestId,
-          prompt: assembledPrompt,
-          chunked: false,
-          total_chunks: 0,
-          callback_url: callbackUrl,
-          target_model: msg.target_model || null,
-          reset_chat: remainingResetChat,
-          timeout_ms: msg.timeout_ms || 600000,
-          driver_config: {
-            driverMode: settings.driverMode,
-            customModelSelector: settings.customModelSelector,
-            customInputSelector: settings.customInputSelector,
-            customSendSelector: settings.customSendSelector,
-            customReplySelector: settings.customReplySelector
-          }
-        });
-      }
-    };
-
+    let tabResetDone = false;
     try {
-      await dispatchToReadyTab();
-    } catch (_) {
-      await ensureScriptsInjected(tab.id);
-      try {
-        await dispatchToReadyTab();
-      } catch (retryErr) {
-        activeInFlightRequests.delete(requestId);
+      let assembledPrompt = String(msg.prompt || "");
+      if (msg.chunked) {
+        const entry = swPromptReassembly.get(requestId);
+        swPromptReassembly.delete(requestId);
+        const total = msg.total_chunks || (entry ? entry.total : 0);
+        assembledPrompt = assembleChunks(entry, total);
+      }
+
+      const rawTab = await findTargetVertexTab(msg.tab_id);
+      if (!rawTab || !rawTab.id) {
         sendWsJson({
           type: "request_error",
           request_id: requestId,
-          error: "无法向 Gemini Enterprise 标签页注入桥接脚本，请刷新该网页后重试: " + retryErr.message
+          submitted: false,
+          tab_reset: false,
+          error: "未找到已打开的 https://vertexaisearch.cloud.google.com 标签页。"
         });
-        await maybeReloadPendingExtensionUpdate();
+        return;
       }
+
+      sendWsJson({ type: "request_ack", request_id: requestId, tab_id: rawTab.id });
+      busyRequestsByTab.set(requestId, rawTab.id);
+      void broadcastTabTakeoverStates();
+
+      const tab = await prepareTabForBackgroundExecution(rawTab);
+
+      await appendLog(
+        "info",
+        `Dispatching request ${String(requestId).slice(0, 8)} to tab #${tab.id}` +
+          ` [len=${assembledPrompt.length}]` +
+          (tab.active ? "" : " [bg]") +
+          (msg.target_model ? ` [model=${msg.target_model}]` : "") +
+          (msg.reset_chat ? " [new_chat]" : "")
+      );
+
+      await ensureTabBridgeReady(tab.id);
+
+      let remainingResetChat = Boolean(msg.reset_chat);
+      if (remainingResetChat) {
+        const resetDone = await resetTabChatWithFallback(tab);
+        if (resetDone) {
+          tabResetDone = true;
+          remainingResetChat = false;
+        }
+      }
+
+      await ensureTabBridgeReady(tab.id);
+      const settings = await getSettings();
+      const callbackUrl = msg.callback_url || deriveCallbackUrlFromWs(settings.wsUrl);
+
+      const dispatchToReadyTab = async () => {
+        const tabAttachments = await prepareAttachmentsForTab(tab.id, requestId, msg.attachments || []);
+        if (assembledPrompt.length > TAB_IPC_CHUNK_SIZE) {
+          const totalChunks = Math.ceil(assembledPrompt.length / TAB_IPC_CHUNK_SIZE);
+          for (let i = 0; i < totalChunks; i += 1) {
+            await chrome.tabs.sendMessage(tab.id, {
+              type: "GEB_PROMPT_CHUNK",
+              request_id: requestId,
+              chunk_index: i,
+              total_chunks: totalChunks,
+              data: assembledPrompt.slice(i * TAB_IPC_CHUNK_SIZE, (i + 1) * TAB_IPC_CHUNK_SIZE)
+            });
+          }
+          await chrome.tabs.sendMessage(tab.id, {
+            type: "GEB_EXECUTE_PROMPT",
+            request_id: requestId,
+            prompt: "",
+            chunked: true,
+            total_chunks: totalChunks,
+            callback_url: callbackUrl,
+            attachments: tabAttachments,
+            image_generation: Boolean(msg.image_generation),
+            video_generation: Boolean(msg.video_generation),
+            target_model: msg.target_model || null,
+            reset_chat: remainingResetChat,
+            timeout_ms: msg.timeout_ms || 600000,
+            driver_config: {
+              driverMode: settings.driverMode,
+              customModelSelector: settings.customModelSelector,
+              customInputSelector: settings.customInputSelector,
+              customSendSelector: settings.customSendSelector,
+              customReplySelector: settings.customReplySelector
+            }
+          });
+        } else {
+          await chrome.tabs.sendMessage(tab.id, {
+            type: "GEB_EXECUTE_PROMPT",
+            request_id: requestId,
+            prompt: assembledPrompt,
+            chunked: false,
+            total_chunks: 0,
+            callback_url: callbackUrl,
+            attachments: tabAttachments,
+            image_generation: Boolean(msg.image_generation),
+            video_generation: Boolean(msg.video_generation),
+            target_model: msg.target_model || null,
+            reset_chat: remainingResetChat,
+            timeout_ms: msg.timeout_ms || 600000,
+            driver_config: {
+              driverMode: settings.driverMode,
+              customModelSelector: settings.customModelSelector,
+              customInputSelector: settings.customInputSelector,
+              customSendSelector: settings.customSendSelector,
+              customReplySelector: settings.customReplySelector
+            }
+          });
+        }
+      };
+
+      await dispatchToReadyTab();
+    } catch (err) {
+      if (busyRequestsByTab.delete(requestId)) {
+        void broadcastTabTakeoverStates();
+      }
+      sendWsJson({
+        type: "request_error",
+        request_id: requestId,
+        submitted: false,
+        tab_reset: tabResetDone,
+        error: "Gemini 工作页面恢复或发送失败: " + err.message
+      });
     }
     return;
   }
 
   if (type === "cancel_request") {
-    if (msg.request_id) {
-      activeInFlightRequests.delete(msg.request_id);
+    if (msg.request_id && busyRequestsByTab.delete(msg.request_id)) {
+      void broadcastTabTakeoverStates();
     }
     const tab = await findTargetVertexTab(msg.tab_id);
     if (tab && tab.id) {
@@ -1268,35 +1467,21 @@ async function handleBackendCommand(msg) {
         });
       } catch (_) {}
     }
-    await maybeReloadPendingExtensionUpdate();
   }
 }
 
 async function setupAlarms() {
   await chrome.alarms.create(ALARM_NAME, { periodInMinutes: 0.4 });
-  await chrome.alarms.create(GITHUB_UPDATE_ALARM, { periodInMinutes: 30 });
 }
 
-chrome.runtime.onInstalled.addListener((details) => {
+chrome.runtime.onInstalled.addListener(() => {
   void (async () => {
     const existing = await chrome.storage.local.get(Object.keys(DEFAULT_SETTINGS));
     const merged = { ...DEFAULT_SETTINGS, ...existing };
     await chrome.storage.local.set(merged);
-    if (details && details.reason === "update") {
-      const curVer = getExtensionVersion();
-      await patchUpdateState({
-        justAutoUpdatedTo: curVer,
-        pendingExtensionReloadVersion: "",
-        extensionOutdated: false,
-        attemptedReloadFromVersion: "",
-        attemptedReloadTargetVersion: ""
-      });
-      await appendLog("info", `浏览器扩展已升级并热重载至 v${curVer}`);
-    }
     await setupAlarms();
     await injectIntoExistingTabs();
     await ensureWebSocketConnected(false);
-    void checkUpdatesAndAutoSync(false);
   })();
 });
 
@@ -1305,19 +1490,17 @@ chrome.runtime.onStartup.addListener(() => {
     await setupAlarms();
     await injectIntoExistingTabs();
     await ensureWebSocketConnected(false);
-    void checkUpdatesAndAutoSync(false);
   })();
 });
 
 chrome.alarms.onAlarm.addListener((alarm) => {
   if (alarm.name === ALARM_NAME) {
     void ensureWebSocketConnected(false);
-  } else if (alarm.name === GITHUB_UPDATE_ALARM) {
-    void checkUpdatesAndAutoSync(false);
   }
 });
 
 chrome.tabs.onUpdated.addListener((tabId, changeInfo, tab) => {
+  if (changeInfo.status === "loading") injectedTabVersions.delete(tabId);
   if (changeInfo.status === "complete" && tab.url && tab.url.startsWith("https://vertexaisearch.cloud.google.com/")) {
     void (async () => {
       await protectTabFromFreeze(tabId);
@@ -1330,7 +1513,19 @@ chrome.tabs.onUpdated.addListener((tabId, changeInfo, tab) => {
 chrome.tabs.onRemoved.addListener((tabId) => {
   runtimeTabMeta.delete(tabId);
   injectedTabVersions.delete(tabId);
-  void reportTabStatusToBackend();
+  managedTabOrder.delete(tabId);
+  for (const [reqId, tid] of busyRequestsByTab) {
+    if (tid === tabId) busyRequestsByTab.delete(reqId);
+  }
+  void (async () => {
+    try {
+      const { manualTabIds } = await getManualExclusions();
+      if (manualTabIds.delete(tabId)) {
+        await chrome.storage.local.set({ manualTabIds: Array.from(manualTabIds) });
+      }
+    } catch (_) {}
+    await reportTabStatusToBackend();
+  })();
 });
 
 chrome.tabs.onActivated.addListener(() => {
@@ -1339,10 +1534,6 @@ chrome.tabs.onActivated.addListener(() => {
 
 // Keep-alive port from hidden/background Gemini Enterprise content scripts
 chrome.runtime.onConnect.addListener((port) => {
-  port.onDisconnect.addListener(() => {
-    // Consume runtime.lastError when tab navigates or enters bfcache
-    void chrome.runtime?.lastError;
-  });
   if (port.name !== "geb-keepalive") return;
   port.onMessage.addListener((msg) => {
     if (msg && msg.type === "keepalive_ping") {
@@ -1354,21 +1545,12 @@ chrome.runtime.onConnect.addListener((port) => {
   });
 });
 
-let tabActivationTail = Promise.resolve();
-async function withTabActivationLock(fn) {
-  const prev = tabActivationTail;
-  let release;
-  tabActivationTail = new Promise((resolve) => {
-    release = resolve;
-  });
-  try {
-    await prev;
-  } catch (_) {}
-  try {
-    return await fn();
-  } finally {
-    release();
-  }
+let tabActivationMutex = Promise.resolve();
+
+function withTabActivationLock(fn) {
+  const next = tabActivationMutex.then(fn, fn);
+  tabActivationMutex = next.catch(() => {});
+  return next;
 }
 
 chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
@@ -1426,6 +1608,14 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
       if (senderTabId !== null && eventData.tab_id === undefined) {
         eventData.tab_id = senderTabId;
       }
+      if (sender && sender.tab) {
+        if (!eventData.tab_url && sender.tab.url) {
+          eventData.tab_url = sender.tab.url;
+        }
+        if (!eventData.tab_title && sender.tab.title) {
+          eventData.tab_title = sender.tab.title;
+        }
+      }
 
       if (senderTabId !== null) {
         const prevMeta = runtimeTabMeta.get(senderTabId) || {};
@@ -1452,36 +1642,37 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
         await appendLog(eventData.level || "info", tabPrefix + (eventData.message || ""));
         sendWsJson({ ...eventData, message: tabPrefix + (eventData.message || "") });
       } else if (eventData.type === "sw_reply_chunk") {
-        let entry = swReplyReassembly.get(eventData.request_id);
+        const rkey = eventData.stream_key || eventData.request_id;
+        let entry = swReplyReassembly.get(rkey);
         if (!entry) {
           entry = { parts: [], total: eventData.total_chunks || 0 };
-          swReplyReassembly.set(eventData.request_id, entry);
+          swReplyReassembly.set(rkey, entry);
         }
         entry.parts[eventData.chunk_index] = eventData.data || "";
         if (eventData.total_chunks) entry.total = eventData.total_chunks;
       } else {
-        // stream_chunk | request_progress | request_complete | request_error
-        if ((eventData.type === "stream_chunk" || eventData.type === "request_progress") && eventData.request_id) {
-          if (activeInFlightRequests.has(eventData.request_id)) {
-            activeInFlightRequests.set(eventData.request_id, Date.now() + 180000);
+        // stream_chunk | request_complete | request_error
+        if (eventData.type === "request_complete" && eventData.json_envelope_chunked) {
+          const rkey = eventData.stream_key || (eventData.request_id + ":json");
+          const entry = swReplyReassembly.get(rkey);
+          swReplyReassembly.delete(rkey);
+          const total = eventData.total_chunks || (entry ? entry.total : 0);
+          const mergedJson = assembleChunks(entry, total);
+          const unpacked = JSON.parse(mergedJson);
+          if (senderTabId !== null && !unpacked.tab_id) unpacked.tab_id = senderTabId;
+          if (sender && sender.tab) {
+            if (!unpacked.tab_url && sender.tab.url) unpacked.tab_url = sender.tab.url;
+            if (!unpacked.tab_title && sender.tab.title) unpacked.tab_title = sender.tab.title;
           }
-        }
-        if (eventData.type === "request_complete" && eventData.chunked) {
+          await deliverResultToBackend(unpacked);
+        } else if (eventData.type === "request_complete" && eventData.chunked) {
           const entry = swReplyReassembly.get(eventData.request_id);
           swReplyReassembly.delete(eventData.request_id);
           const total = eventData.total_chunks || (entry ? entry.total : 0);
-          const merged = entry
-            ? Array.from({ length: total }, (_, idx) => entry.parts[idx] || "").join("")
-            : "";
+          const merged = assembleChunks(entry, total);
           await deliverResultToBackend({ ...eventData, reply: merged, chunked: false });
         } else {
           await deliverResultToBackend(eventData);
-        }
-        if (eventData.type === "request_complete" || eventData.type === "request_error") {
-          if (eventData.request_id) {
-            activeInFlightRequests.delete(eventData.request_id);
-          }
-          await maybeReloadPendingExtensionUpdate();
         }
       }
       sendResponse({ ok: true });
@@ -1490,53 +1681,119 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
 
     if (msgType === "GEB_POPUP_GET_STATE") {
       await ensureWebSocketConnected(false);
-      const settings = await getSettings();
-      const updateState = await getUpdateState();
-      const tab = await findBestVertexTab();
+      const cls = await classifyAllVertexTabs();
+      const settings = cls.settings;
+      const tab = cls.managedTabs[0] || null;
       const session = await chrome.storage.session.get([
         "wsConnected",
         "lastError",
         "capturedRpc",
         "activeModel",
-        "logs",
-        "preferredTabId",
-        "usageSnapshot"
+        "logs"
       ]);
-      const allTabs = await chrome.tabs.query({ url: VERTEX_MATCH_PATTERN });
+      let focusedTabInfo = null;
+      try {
+        const activeTabs = await chrome.tabs.query({ active: true, currentWindow: true });
+        const fTab = activeTabs && activeTabs[0] ? activeTabs[0] : null;
+        if (fTab && fTab.id) {
+          const isVertex = Boolean(fTab.url && fTab.url.startsWith("https://vertexaisearch.cloud.google.com/"));
+          const tState = isVertex ? cls.perTabState.get(fTab.id) || null : null;
+          focusedTabInfo = {
+            id: fTab.id,
+            url: fTab.url || "",
+            title: fTab.title || "",
+            isVertex,
+            state: tState
+          };
+        }
+      } catch (_) {}
+
       sendResponse({
         ok: true,
-        extensionVersion: getExtensionVersion(),
-        updateState,
         settings,
-        wsConnected: Boolean(socketRuntime.ws && socketRuntime.ws.readyState === WebSocket.OPEN),
+        wsConnected: cls.wsConnected,
         lastError: session.lastError || "",
         capturedRpc: Boolean(session.capturedRpc),
         activeModel: session.activeModel || "",
-        preferredTabId: session.preferredTabId || null,
-        usageSnapshot: session.usageSnapshot || null,
+        preferredTabId: null,
+        focusedTab: focusedTabInfo,
+        poolSummary: {
+          totalVertexTabs: cls.allTabs.length,
+          managedCount: cls.managedTabs.length,
+          manualCount: cls.manualTabs.length,
+          overflowCount: cls.overflowTabs.length,
+          busyCount: cls.busyCount,
+          maxTabs: cls.maxTabs
+        },
         activeTab: tab
           ? { id: tab.id, url: tab.url || "", title: tab.title || "" }
           : null,
-        vertexTabs: allTabs.map((t) => ({
+        vertexTabs: cls.allTabs.map((t) => ({
           id: t.id,
           url: t.url || "",
           title: t.title || "",
-          active: Boolean(t.active)
+          active: Boolean(t.active),
+          state: cls.perTabState.get(t.id) || null
         })),
         logs: session.logs || []
       });
       return;
     }
 
-    if (msgType === "GEB_POPUP_CHECK_UPDATE") {
-      const uState = await checkUpdatesAndAutoSync(true);
-      sendResponse({ ok: true, updateState: uState });
+    if (msgType === "GEB_GET_MY_TAKEOVER_STATE") {
+      const senderTabId = sender && sender.tab && sender.tab.id ? sender.tab.id : message.tabId;
+      if (!senderTabId) {
+        sendResponse({ ok: false });
+        return;
+      }
+      const cls = await classifyAllVertexTabs();
+      sendResponse({
+        ok: true,
+        state: cls.perTabState.get(Number(senderTabId)) || null
+      });
       return;
     }
 
-    if (msgType === "GEB_POPUP_SYNC_EXTENSION") {
-      const syncRes = await syncExtensionDiskAndReload(message.targetVersion || "", true);
-      sendResponse(syncRes);
+    if (msgType === "GEB_TOGGLE_TAB_MANUAL") {
+      const targetTabId =
+        message.tabId !== undefined && message.tabId !== null
+          ? Number(message.tabId)
+          : sender && sender.tab && sender.tab.id
+            ? sender.tab.id
+            : null;
+      if (!targetTabId) {
+        sendResponse({ ok: false, error: "未找到目标标签页" });
+        return;
+      }
+      const manual = await setTabManualState(
+        targetTabId,
+        typeof message.manual === "boolean" ? message.manual : null
+      );
+      const cls = await classifyAllVertexTabs();
+      sendResponse({
+        ok: true,
+        manual,
+        state: cls.perTabState.get(targetTabId) || null
+      });
+      return;
+    }
+
+    if (msgType === "GEB_POPUP_OPEN_MANUAL_TAB") {
+      const cls = await classifyAllVertexTabs();
+      let targetUrl = "https://vertexaisearch.cloud.google.com/";
+      if (cls.allTabs.length > 0) {
+        const refUrl = cls.allTabs[0].url || "";
+        targetUrl = computeCleanVertexHomeUrl(refUrl) || targetUrl;
+      }
+      const created = await chrome.tabs.create({ url: targetUrl, active: true });
+      if (created && created.id) {
+        await setTabManualState(created.id, true);
+        waitForTabComplete(created.id, 14000)
+          .then(() => ensureScriptsInjected(created.id))
+          .then(() => reportTabStatusToBackend())
+          .catch(() => {});
+      }
+      sendResponse({ ok: true, tabId: created ? created.id : null });
       return;
     }
 
@@ -1546,6 +1803,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
       const updated = { ...current, ...patch };
       await chrome.storage.local.set(updated);
       if (message.preferredTabId !== undefined) {
+        await chrome.storage.local.set({ preferredTabId: message.preferredTabId });
         await chrome.storage.session.set({ preferredTabId: message.preferredTabId });
       }
       const wsChanged = patch.wsUrl !== undefined && patch.wsUrl !== current.wsUrl;
@@ -1611,7 +1869,13 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     }
 
     sendResponse({ ok: true, senderTab: sender && sender.tab ? sender.tab.id : null });
-  })();
+  })().catch(async (error) => {
+    if (msgType === "GEB_DRIVER_EVENT" && message.payload && message.payload.request_id) {
+      await deliverResultToBackend({type: "request_error", request_id: message.payload.request_id,
+        tab_id: sender && sender.tab ? sender.tab.id : undefined, error: error.message}).catch(() => {});
+    }
+    sendResponse({ok: false, error: error.message});
+  });
   return true;
 });
 

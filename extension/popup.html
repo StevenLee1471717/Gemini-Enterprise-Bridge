@@ -9,185 +9,157 @@
 <body>
   <main class="container">
     <header class="header">
-      <div>
-        <div class="title-row">
-          <h1>Gemini Enterprise Bridge</h1>
-          <span class="ver-pill" id="extVersionPill">v1.1.3</span>
+      <div class="brand">
+        <div class="brand-icon" aria-hidden="true">
+          <svg viewBox="0 0 24 24" width="16" height="16" fill="none">
+            <path d="M12 2.5C12.7 7.4 16.6 11.3 21.5 12C16.6 12.7 12.7 16.6 12 21.5C11.3 16.6 7.4 12.7 2.5 12C7.4 11.3 11.3 7.4 12 2.5Z" fill="currentColor"/>
+          </svg>
         </div>
-        <div class="subtitle-row">
-          <p class="subtitle">Vertex AI Search / Agentspace 本地网关</p>
-          <button type="button" id="checkUpdateBtn" class="link-btn subtle" title="从 GitHub Releases 检查插件与后端新版本">检查更新</button>
+        <div>
+          <h1>Gemini Enterprise</h1>
+          <p class="subtitle">本地智能网关连接器</p>
         </div>
       </div>
-      <label class="switch" title="启用或暂停桥接">
-        <input type="checkbox" id="enabledToggle" checked />
-        <span class="slider"></span>
-      </label>
+      <div class="header-right">
+        <span class="save-toast" id="saveToast" hidden>已自动生效</span>
+        <label class="switch" title="启用或暂停桥接">
+          <input type="checkbox" id="enabledToggle" checked />
+          <span class="slider"></span>
+        </label>
+      </div>
     </header>
 
-    <section class="update-banner" id="updateBanner" hidden aria-live="polite">
-      <div class="update-banner-head">
-        <strong id="updateBannerTitle">检测到可用更新</strong>
-        <a id="updateReleaseLink" class="link-btn subtle" href="https://github.com/StevenLee1471717/Gemini-Enterprise-Bridge/releases" target="_blank" rel="noreferrer">GitHub Release</a>
+    <section class="hero-card" id="heroCard" aria-live="polite">
+      <div class="hero-top">
+        <span class="status-dot" id="heroDot"></span>
+        <div class="hero-copy">
+          <div class="hero-title" id="heroTitle">正在检查连接状态...</div>
+          <div class="hero-sub" id="heroSub">正在同步本地服务与浏览器工作页</div>
+        </div>
       </div>
-      <p class="update-banner-desc" id="updateBannerDesc"></p>
-      <div class="update-banner-actions">
-        <button type="button" id="applyBackendUpdateBtn" class="btn primary compact">立即自动更新并重启后端</button>
-        <button type="button" id="syncExtUpdateBtn" class="btn compact" hidden>同步并重载插件</button>
-      </div>
-    </section>
 
-    <section class="status-card" aria-live="polite">
-      <div class="status-row">
-        <span class="label">本地 FastAPI</span>
-        <span class="pill" id="wsStatusPill">检测中...</span>
+      <div class="metrics-strip">
+        <div class="metric-item">
+          <span class="metric-label">本地服务</span>
+          <span class="pill" id="wsStatusPill">检测中</span>
+        </div>
+        <div class="metric-item">
+          <span class="metric-label">接管工作池</span>
+          <span class="metric-val truncate" id="tabStatusText">-</span>
+        </div>
+        <div class="metric-item">
+          <span class="metric-label">手动自用页</span>
+          <span class="metric-val truncate" id="rpcStatusText">-</span>
+        </div>
       </div>
-      <div class="status-row">
-        <span class="label">并行工作池</span>
-        <span class="value truncate" id="tabStatusText">-</span>
-      </div>
-      <div class="status-row">
-        <span class="label">RPC 流与模型</span>
-        <span class="value" id="rpcStatusText">-</span>
-      </div>
+
+      <button type="button" id="openVertexBtn" class="btn subtle-cta" hidden>
+        一键打开 Google 登录页
+      </button>
       <p class="error-banner" id="errorBanner" hidden></p>
     </section>
 
-    <section class="telemetry-card" aria-label="官方 API 等价价值与上下文监控">
-      <div class="hero-header">
-        <div class="hero-title-group">
-          <span class="eyebrow">官方 API 等价价值 · Google Gemini 定价</span>
-          <span class="rate-badge" id="activeRateBadge">4 Carbon: $2/$10 / 1M</span>
+    <button type="button" id="openConsoleBtn" class="btn primary console-btn">
+      <span class="console-btn-main">
+        <span class="console-btn-title">打开本地控制台</span>
+        <span class="console-btn-sub">查看省钱账本 · 工作席位 · 一键体检</span>
+      </span>
+      <span class="console-port">8000 ↗</span>
+    </button>
+
+    <section class="control-card">
+      <div class="cur-tab-panel" id="curTabPanel">
+        <div class="cur-tab-head">
+          <span class="field-title" id="curTabTitle">当前浏览标签页</span>
+          <span class="pill" id="curTabBadge">检测中</span>
         </div>
-        <button type="button" id="resetUsageBtn" class="link-btn subtle" title="清空本地累计用量统计">重置统计</button>
+        <p class="cur-tab-desc" id="curTabDesc">正在识别当前窗口的 Gemini 页面接管状态...</p>
+        <button type="button" id="toggleManualBtn" class="btn manual-toggle-btn">
+          设为我自己用 · 不接管此会话
+        </button>
       </div>
 
-      <div class="cost-grid">
-        <div class="cost-main">
-          <span class="cost-caption">累计无缓存等价节省</span>
-          <div class="cost-amount-row">
-            <strong class="cost-usd" id="allTimeUsdText">$0.00</strong>
-            <span class="cost-cny" id="allTimeCnyText">≈ ¥0.00</span>
-          </div>
-          <span class="cost-subline" id="cachedSublineText">含隐式缓存折算: $0.00 · 累计 0 次</span>
+      <div class="pool-controls" id="poolControlsWrap">
+        <div class="field-head">
+          <span class="field-title">Bridge 接管页数上限</span>
+          <label class="inline-check" title="请求繁忙时自动在后台新开工作页">
+            <input type="checkbox" id="autoSpawnCheck" checked />
+            <span>繁忙时自动多开</span>
+          </label>
         </div>
-        <div class="cost-today">
-          <span class="cost-caption">今日等价消耗</span>
-          <strong class="today-usd" id="todayUsdText">$0.00</strong>
-          <span class="cost-subline" id="todayMetaText">≈ ¥0.00 · 0 次调用</span>
+        <div class="pool-rule-note">默认自动接管打开的聊天页；超出上限或手动自用页不接入</div>
+        <div class="seg-group" id="maxTabsSegments" role="group" aria-label="自动开页上限">
+          <button type="button" class="seg-btn" data-val="1">1 页</button>
+          <button type="button" class="seg-btn" data-val="4">4 页</button>
+          <button type="button" class="seg-btn" data-val="6">6 页</button>
+          <button type="button" class="seg-btn" data-val="8">8 页</button>
+          <button type="button" class="seg-btn" data-val="10">10 页</button>
         </div>
-      </div>
-
-      <div class="token-strip" id="tokenSummaryStrip">
-        <span>输入 <strong id="totalPromptTokensText">0</strong></span>
-        <span class="dot-sep">·</span>
-        <span>缓存命中 <strong id="totalCachedTokensText">0</strong></span>
-        <span class="dot-sep">·</span>
-        <span>输出 <strong id="totalCompletionTokensText">0</strong> Tokens</span>
-      </div>
-
-      <div class="context-monitor">
-        <div class="context-header">
-          <span class="context-title">实时上下文窗口 · Context</span>
-          <span class="context-summary" id="contextSummaryText">0 / 1.05M (0.0%)</span>
-        </div>
-        <progress id="contextProgressBar" class="ctx-progress tier-low" max="100" value="0"></progress>
-        <div class="context-meta-row">
-          <span id="contextTurnMetaText">空闲待命 · 尚未建立会话</span>
-          <span id="contextBreakdownText">Sys 0 · Tools 0 · Hist 0</span>
-        </div>
-        <div id="slotContextPills" class="slot-pills" hidden></div>
-      </div>
-
-      <details class="model-breakdown" id="modelBreakdownDetails">
-        <summary>
-          <span>按模型用量与官方单价明细</span>
-          <span class="summary-hint" id="modelCountHint">0 个模型</span>
-        </summary>
-        <div id="modelBreakdownList" class="model-list"></div>
-      </details>
-    </section>
-
-    <section class="form-section">
-      <label class="field">
-        <span>会话调度模式（支持多窗口 / 多智能体并行）</span>
-        <select id="tabSelect">
-          <option value="">多标签页并行池（自动负载均衡 + 粘性会话）</option>
-        </select>
-      </label>
-
-      <div class="status-row" style="gap: 8px;">
-        <label class="field" style="flex: 1;">
-          <span>后台自动扩容标签页</span>
+        <div hidden>
           <select id="autoSpawnSelect">
-            <option value="true">开启（推荐）</option>
-            <option value="false">仅使用已打开标签页</option>
+            <option value="true">开启</option>
+            <option value="false">关闭</option>
           </select>
-        </label>
-        <label class="field" style="width: 112px;">
-          <span>最大并行数</span>
           <select id="maxTabsSelect">
-            <option value="1">1 个标签页</option>
-            <option value="2">2 个标签页</option>
-            <option value="4">4 个标签页</option>
-            <option value="6" selected>6 个标签页</option>
-            <option value="8">8 个标签页</option>
+            <option value="1">1</option>
+            <option value="2">2</option>
+            <option value="4">4</option>
+            <option value="6">6</option>
+            <option value="8">8</option>
+            <option value="10" selected>10</option>
+          </select>
+        </div>
+      </div>
+    </section>
+
+    <details class="drawer">
+      <summary class="drawer-summary">
+        <span>故障排查与高级设置</span>
+        <span class="drawer-chevron" aria-hidden="true">▾</span>
+      </summary>
+      <div class="drawer-body">
+        <div class="tool-grid">
+          <button type="button" id="reconnectBtn" class="btn small">重连本地服务</button>
+          <button type="button" id="spawnTabBtn" class="btn small">+ 手动加开一页</button>
+          <button type="button" id="newChatBtn" class="btn small">当前页换新对话</button>
+          <button type="button" id="diagnoseBtn" class="btn small">检测页面结构</button>
+        </div>
+
+        <label class="field compact">
+          <span class="field-title">连接地址</span>
+          <input type="url" id="wsUrlInput" placeholder="ws://127.0.0.1:8000/ws/browser" />
+        </label>
+
+        <label class="field compact">
+          <span class="field-title">底层驱动模式</span>
+          <select id="driverModeSelect">
+            <option value="auto">自动混合模式（推荐）</option>
+            <option value="dom">纯页面组件驱动</option>
+            <option value="replay">页面请求重放</option>
           </select>
         </label>
-      </div>
 
-      <label class="field">
-        <span>执行引擎模式</span>
-        <select id="driverModeSelect">
-          <option value="auto">Auto 混合（推荐：流式嗅探 + Shadow DOM）</option>
-          <option value="dom">DOM 纯网页组件驱动（高兼容）</option>
-          <option value="replay">Replay 页面内 Fetch 重放（需先发 1 条）</option>
-        </select>
-      </label>
+        <details class="sub-drawer">
+          <summary>自定义页面元素定位（仅网页改版时用）</summary>
+          <div class="advanced-fields">
+            <input type="text" id="modelSelector" placeholder="模型选择器（默认自动识别）" />
+            <input type="text" id="inputSelector" placeholder="输入框选择器（默认自动识别）" />
+            <input type="text" id="sendSelector" placeholder="发送按钮选择器（默认自动识别）" />
+            <input type="text" id="replySelector" placeholder="回复区域选择器（默认自动识别）" />
+          </div>
+        </details>
 
-      <label class="field">
-        <span>后端 WebSocket 地址</span>
-        <input type="url" id="wsUrlInput" placeholder="ws://127.0.0.1:8000/ws/browser" />
-      </label>
+        <button type="button" id="saveBtn" class="btn small full">应用高级参数</button>
 
-      <details class="advanced">
-        <summary>高级：自定义 Shadow DOM 选择器（可选）</summary>
-        <div class="advanced-fields">
-          <label class="field">
-            <span>模型下拉触发器选择器</span>
-            <input type="text" id="modelSelector" placeholder="默认自动识别 3.1 Pro / 4 Argon / 4 Carbon / 3.8 Flash" />
-          </label>
-          <label class="field">
-            <span>输入框选择器</span>
-            <input type="text" id="inputSelector" placeholder="默认自动穿透 ProseMirror / contenteditable" />
-          </label>
-          <label class="field">
-            <span>发送按钮选择器</span>
-            <input type="text" id="sendSelector" placeholder="默认自动识别 Send / Enter" />
-          </label>
-          <label class="field">
-            <span>回复容器选择器</span>
-            <input type="text" id="replySelector" placeholder="默认自动识别 ucs-summary / ucs-markdown" />
-          </label>
+        <div class="logs-section">
+          <div class="logs-header">
+            <span>最近连接记录</span>
+            <button type="button" id="clearLogsBtn" class="link-btn">清空</button>
+          </div>
+          <pre id="diagOutput" class="log-box">就绪</pre>
         </div>
-      </details>
-    </section>
-
-    <section class="button-grid">
-      <button type="button" id="saveBtn" class="btn primary">保存并重连</button>
-      <button type="button" id="spawnTabBtn" class="btn">+ 新增并行标签页</button>
-      <button type="button" id="diagnoseBtn" class="btn">检测页面元素</button>
-      <button type="button" id="newChatBtn" class="btn">网页新建对话</button>
-      <button type="button" id="openConsoleBtn" class="btn" style="grid-column: span 2;">打开本地控制台 (http://127.0.0.1:8000)</button>
-    </section>
-
-    <section class="logs-section">
-      <div class="logs-header">
-        <span>诊断与运行日志</span>
-        <button type="button" id="clearLogsBtn" class="link-btn">清空</button>
       </div>
-      <pre id="diagOutput" class="log-box">就绪</pre>
-    </section>
+    </details>
   </main>
 
   <script src="popup.js"></script>

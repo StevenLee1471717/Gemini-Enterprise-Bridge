@@ -1,21 +1,35 @@
-// Popup controller for Gemini Enterprise Web-to-API Bridge (MV3 compliant, async/await)
+// Popup controller for Gemini Enterprise Bridge (MV3 compliant)
+
+if (
+  typeof window !== "undefined" &&
+  typeof URLSearchParams === "function" &&
+  new URLSearchParams(window.location?.search || "").get("geb_reload") === "1" &&
+  typeof chrome !== "undefined" &&
+  typeof chrome.runtime?.reload === "function"
+) {
+  chrome.runtime.reload();
+}
 
 const elEnabled = document.getElementById("enabledToggle");
-const elExtVersionPill = document.getElementById("extVersionPill");
-const elCheckUpdateBtn = document.getElementById("checkUpdateBtn");
-const elUpdateBanner = document.getElementById("updateBanner");
-const elUpdateTitle = document.getElementById("updateBannerTitle");
-const elUpdateReleaseLink = document.getElementById("updateReleaseLink");
-const elUpdateDesc = document.getElementById("updateBannerDesc");
-const elApplyBackendUpdateBtn = document.getElementById("applyBackendUpdateBtn");
-const elSyncExtUpdateBtn = document.getElementById("syncExtUpdateBtn");
+const elHeroDot = document.getElementById("heroDot");
+const elHeroTitle = document.getElementById("heroTitle");
+const elHeroSub = document.getElementById("heroSub");
 const elWsPill = document.getElementById("wsStatusPill");
 const elTabStatus = document.getElementById("tabStatusText");
 const elRpcStatus = document.getElementById("rpcStatusText");
+const elOpenVertexBtn = document.getElementById("openVertexBtn");
 const elErrorBanner = document.getElementById("errorBanner");
 const elTabSelect = document.getElementById("tabSelect");
+const elCurTabPanel = document.getElementById("curTabPanel");
+const elCurTabTitle = document.getElementById("curTabTitle");
+const elCurTabBadge = document.getElementById("curTabBadge");
+const elCurTabDesc = document.getElementById("curTabDesc");
+const elToggleManualBtn = document.getElementById("toggleManualBtn");
 const elAutoSpawn = document.getElementById("autoSpawnSelect");
+const elAutoSpawnCheck = document.getElementById("autoSpawnCheck");
 const elMaxTabs = document.getElementById("maxTabsSelect");
+const elMaxTabsSegments = document.getElementById("maxTabsSegments");
+const elPoolControlsWrap = document.getElementById("poolControlsWrap");
 const elModeSelect = document.getElementById("driverModeSelect");
 const elWsUrl = document.getElementById("wsUrlInput");
 const elModelSel = document.getElementById("modelSelector");
@@ -23,37 +37,142 @@ const elInputSel = document.getElementById("inputSelector");
 const elSendSel = document.getElementById("sendSelector");
 const elReplySel = document.getElementById("replySelector");
 const elDiagOut = document.getElementById("diagOutput");
-
-const elActiveRateBadge = document.getElementById("activeRateBadge");
-const elResetUsageBtn = document.getElementById("resetUsageBtn");
-const elAllTimeUsd = document.getElementById("allTimeUsdText");
-const elAllTimeCny = document.getElementById("allTimeCnyText");
-const elCachedSubline = document.getElementById("cachedSublineText");
-const elTodayUsd = document.getElementById("todayUsdText");
-const elTodayMeta = document.getElementById("todayMetaText");
-const elTotalPromptTokens = document.getElementById("totalPromptTokensText");
-const elTotalCachedTokens = document.getElementById("totalCachedTokensText");
-const elTotalCompletionTokens = document.getElementById("totalCompletionTokensText");
-const elContextSummary = document.getElementById("contextSummaryText");
-const elContextProgress = document.getElementById("contextProgressBar");
-const elContextTurnMeta = document.getElementById("contextTurnMetaText");
-const elContextBreakdown = document.getElementById("contextBreakdownText");
-const elSlotPills = document.getElementById("slotContextPills");
-const elModelCountHint = document.getElementById("modelCountHint");
-const elModelBreakdownList = document.getElementById("modelBreakdownList");
+const elSaveToast = document.getElementById("saveToast");
 
 let initialFormHydrated = false;
+let toastTimer = null;
+
+function flashSavedToast() {
+  if (!elSaveToast) return;
+  elSaveToast.hidden = false;
+  if (toastTimer) clearTimeout(toastTimer);
+  toastTimer = setTimeout(() => {
+    elSaveToast.hidden = true;
+  }, 1500);
+}
+
+function friendlyModelName(raw) {
+  const s = String(raw || "").toLowerCase();
+  if (!s) return "Carbon (默认)";
+  if (s.includes("carbon")) return "Carbon";
+  if (s.includes("argon")) return "Argon";
+  if (s.includes("3.1") || s.includes("pro")) return "3.1 Pro";
+  if (s.includes("flash")) return "3.8 Flash";
+  return raw;
+}
+
+function cleanTabTitle(rawTitle, index) {
+  const text = String(rawTitle || "")
+    .replace(/\s*[-·|]\s*Gemini Enterprise\s*$/i, "")
+    .trim();
+  const low = text.toLowerCase();
+  if (
+    !text ||
+    low === "gemini enterprise" ||
+    low === "new chat" ||
+    low.startsWith("[system instructions]") ||
+    low.includes("you are codex") ||
+    low.includes("original_stream_") ||
+    low.startsWith("tool_call") ||
+    low.includes("stream disconnected") ||
+    text.length > 42
+  ) {
+    return `${index + 1} 号工作页`;
+  }
+  return `${index + 1} 号页 · ${text.slice(0, 16)}`;
+}
+
+function syncSegmentUI(maxTabsVal, autoSpawnEnabled, isFixedSingleTab) {
+  if (elAutoSpawnCheck) {
+    elAutoSpawnCheck.checked = Boolean(autoSpawnEnabled);
+    elAutoSpawnCheck.disabled = Boolean(isFixedSingleTab);
+  }
+  if (elPoolControlsWrap) {
+    elPoolControlsWrap.classList.toggle("disabled", Boolean(isFixedSingleTab));
+  }
+  if (elMaxTabsSegments) {
+    const buttons = elMaxTabsSegments.querySelectorAll(".seg-btn");
+    const target = String(maxTabsVal || 10);
+    let matched = false;
+    buttons.forEach((btn) => {
+      const isHit = btn.getAttribute("data-val") === target;
+      if (isHit) matched = true;
+      btn.classList.toggle("active", isHit);
+      btn.disabled = Boolean(isFixedSingleTab);
+    });
+    if (!matched && buttons.length > 0) {
+      buttons[buttons.length - 1].classList.add("active");
+    }
+  }
+}
+
+function renderCurrentTabControl(focusedTab, settings, maxCap) {
+  if (!elCurTabPanel || !elCurTabBadge || !elCurTabDesc || !elToggleManualBtn) {
+    return;
+  }
+  if (focusedTab && focusedTab.isVertex && focusedTab.id) {
+    const st = focusedTab.state || {};
+    if (elCurTabTitle) {
+      elCurTabTitle.textContent = st.seatIndex
+        ? `当前标签页（席位 #${st.seatIndex}）`
+        : "当前 Gemini 标签页";
+    }
+    elToggleManualBtn.dataset.action = "toggle";
+    elToggleManualBtn.dataset.tabId = String(focusedTab.id);
+
+    if (st.manual) {
+      elCurTabPanel.className = "cur-tab-panel is-manual";
+      elCurTabBadge.textContent = "手动自用 · 免接管";
+      elCurTabBadge.className = "pill warn";
+      elCurTabDesc.textContent = "此页面与当前会话已锁定为你手动操作，Bridge 不会接管或清空。";
+      elToggleManualBtn.textContent = "恢复交给 Bridge 自动接管";
+      elToggleManualBtn.className = "btn manual-toggle-btn to-bridge";
+    } else if (st.overflow) {
+      elCurTabPanel.className = "cur-tab-panel";
+      elCurTabBadge.textContent = "超出上限 · 未接管";
+      elCurTabBadge.className = "pill";
+      elCurTabDesc.textContent = `已达 ${maxCap} 页接管上限，此页暂未接入；也可锁定为你的专属自用页。`;
+      elToggleManualBtn.textContent = "设为我自己用 · 不接管此会话";
+      elToggleManualBtn.className = "btn manual-toggle-btn to-manual";
+    } else {
+      elCurTabPanel.className = "cur-tab-panel is-managed";
+      if (!settings.enabled) {
+        elCurTabBadge.textContent = "桥接已暂停";
+        elCurTabBadge.className = "pill";
+      } else if (st.busy) {
+        elCurTabBadge.textContent = "Bridge 工作中";
+        elCurTabBadge.className = "pill ok";
+      } else {
+        elCurTabBadge.textContent = "Bridge 已接管";
+        elCurTabBadge.className = "pill ok";
+      }
+      elCurTabDesc.textContent = "此页面已接入 Bridge 工作池；如需自己手动聊天，点击下方按钮即可免除接管。";
+      elToggleManualBtn.textContent = "设为我自己用 · 不接管此会话";
+      elToggleManualBtn.className = "btn manual-toggle-btn to-manual";
+    }
+  } else {
+    if (elCurTabTitle) elCurTabTitle.textContent = "当前浏览标签页";
+    elCurTabPanel.className = "cur-tab-panel";
+    elCurTabBadge.textContent = "非 Gemini 页";
+    elCurTabBadge.className = "pill";
+    elCurTabDesc.textContent = "切换到任意 Gemini 页面可随时免除接管，或直接新开一个免接管的自用页面：";
+    elToggleManualBtn.textContent = "+ 新开自用 Gemini 聊天页（免接管）";
+    elToggleManualBtn.className = "btn manual-toggle-btn to-bridge";
+    elToggleManualBtn.dataset.action = "open_manual";
+    elToggleManualBtn.dataset.tabId = "";
+  }
+}
 
 function formatLogs(logs) {
   if (!Array.isArray(logs) || logs.length === 0) {
-    return "暂无日志。打开 vertexaisearch.cloud.google.com 并启动 server.py 即可开始。";
+    return "暂无连接记录";
   }
   return logs
     .slice()
     .reverse()
     .map((item) => {
       const t = new Date(item.ts).toLocaleTimeString();
-      return `[${t}] [${String(item.level || "info").toUpperCase()}] ${item.message}`;
+      return `[${t}] ${item.message}`;
     })
     .join("\n");
 }
@@ -68,277 +187,31 @@ function deriveHttpConsoleUrl(wsUrl) {
   }
 }
 
-function formatTokensCompact(n) {
-  const num = Number(n || 0);
-  if (!Number.isFinite(num) || num <= 0) return "0";
-  if (num >= 1_000_000) return `${(num / 1_000_000).toFixed(2)}M`;
-  if (num >= 1_000) return `${(num / 1_000).toFixed(1)}K`;
-  return String(Math.round(num));
-}
-
-function formatUsd(val) {
-  const num = Number(val || 0);
-  if (!Number.isFinite(num) || num <= 0) return "$0.00";
-  if (num < 0.01) return `$${num.toFixed(4)}`;
-  return `$${num.toFixed(2)}`;
-}
-
-function formatCny(val) {
-  const num = Number(val || 0);
-  if (!Number.isFinite(num) || num <= 0) return "¥0.00";
-  if (num < 0.01) return `¥${num.toFixed(3)}`;
-  return `¥${num.toFixed(2)}`;
-}
-
-function formatStrategyLabel(strategy) {
-  const map = {
-    smart_incremental_delta: "增量续聊",
-    smart_single_turn: "首轮/单轮",
-    smart_packed_context: "全量重装",
-    gcloud_direct: "GCloud 直连",
-    gcloud_stream: "GCloud 流式",
-    idle: "待命"
-  };
-  return map[strategy] || strategy || "待命";
-}
-
-function renderUsageAndContext(snapshot) {
-  if (!snapshot || typeof snapshot !== "object") {
-    return;
-  }
-  const usage = snapshot.usage || {};
-  const ctxMon = snapshot.context_monitor || {};
-  const allTime = usage.all_time || {};
-  const today = usage.today || {};
-  const activePricing = usage.active_pricing || {};
-
-  if (elActiveRateBadge && activePricing.display_name) {
-    const shortName = String(activePricing.display_name).replace(/^Gemini\s+/i, "");
-    elActiveRateBadge.textContent = `${shortName} 官方价: $${activePricing.input_per_1m}/$${activePricing.output_per_1m} / 1M`;
-    elActiveRateBadge.title = `${activePricing.display_name} · 输入 $${activePricing.input_per_1m}/1M · 缓存 $${activePricing.cached_input_per_1m}/1M · 输出 $${activePricing.output_per_1m}/1M (${activePricing.rate_note || ""})`;
-  }
-
-  if (elAllTimeUsd) elAllTimeUsd.textContent = formatUsd(allTime.equivalent_cost_usd);
-  if (elAllTimeCny) elAllTimeCny.textContent = `≈ ${formatCny(allTime.equivalent_cost_cny)}`;
-  if (elCachedSubline) {
-    elCachedSubline.textContent = `含缓存折算: ${formatUsd(allTime.cached_equivalent_cost_usd)} · 累计 ${allTime.requests || 0} 次`;
-  }
-
-  if (elTodayUsd) elTodayUsd.textContent = formatUsd(today.equivalent_cost_usd);
-  if (elTodayMeta) {
-    elTodayMeta.textContent = `≈ ${formatCny(today.equivalent_cost_cny)} · ${today.requests || 0} 次调用`;
-  }
-
-  if (elTotalPromptTokens) elTotalPromptTokens.textContent = formatTokensCompact(allTime.prompt_tokens);
-  if (elTotalCachedTokens) elTotalCachedTokens.textContent = formatTokensCompact(allTime.cached_tokens);
-  if (elTotalCompletionTokens) elTotalCompletionTokens.textContent = formatTokensCompact(allTime.completion_tokens);
-
-  const primary = ctxMon.primary || {};
-  const totalCtx = Number(primary.total_context_tokens || 0);
-  const limitCtx = Number(primary.context_limit_tokens || 1048576);
-  const utilPct = Number(primary.utilization_pct || 0);
-
-  if (elContextSummary) {
-    elContextSummary.textContent = `${formatTokensCompact(totalCtx)} / ${formatTokensCompact(limitCtx)} (${utilPct.toFixed(1)}%)`;
-  }
-  if (elContextProgress) {
-    elContextProgress.value = Math.min(100, Math.max(0, utilPct));
-    elContextProgress.classList.remove("tier-low", "tier-mid", "tier-high");
-    if (utilPct >= 85) {
-      elContextProgress.classList.add("tier-high");
-    } else if (utilPct >= 60) {
-      elContextProgress.classList.add("tier-mid");
-    } else {
-      elContextProgress.classList.add("tier-low");
-    }
-  }
-
-  if (elContextTurnMeta) {
-    if ((primary.turn_count || 0) > 0) {
-      const tabTag = primary.tab_id ? `#${primary.tab_id} ` : "";
-      const modelTag = primary.active_model ? `${primary.active_model} · ` : "";
-      const compactTag = primary.compaction_count ? ` · 重装${primary.compaction_count}次` : "";
-      elContextTurnMeta.textContent = `${tabTag}${modelTag}第 ${primary.user_turns || primary.turn_count} 轮 · ${formatStrategyLabel(primary.last_strategy)}${compactTag}`;
-    } else {
-      elContextTurnMeta.textContent = "空闲待命 · 发送首条请求后实时追踪";
-    }
-  }
-  if (elContextBreakdown) {
-    elContextBreakdown.textContent = `Sys ${formatTokensCompact(primary.system_tokens)} · Tools ${formatTokensCompact(primary.tools_tokens)} · Hist ${formatTokensCompact(primary.history_tokens)}`;
-  }
-
-  if (elSlotPills) {
-    const slots = Array.isArray(ctxMon.slots) ? ctxMon.slots : [];
-    elSlotPills.replaceChildren();
-    if (slots.length > 1 || (slots.length === 1 && (slots[0].turn_count || 0) > 0)) {
-      elSlotPills.hidden = false;
-      for (const s of slots.slice(0, 6)) {
-        const pill = document.createElement("span");
-        pill.className = s.busy ? "slot-pill busy" : "slot-pill";
-        const tid = s.tab_id ? `Tab #${s.tab_id}` : s.slot_key || "Slot";
-        const mShort = String(s.active_model || "Auto").replace(/^Gemini\s+/i, "");
-        pill.textContent = `${tid} (${mShort}): ${formatTokensCompact(s.total_context_tokens)} (${Number(s.utilization_pct || 0).toFixed(1)}%)`;
-        pill.title = `轮次: ${s.turn_count || 0} | 策略: ${formatStrategyLabel(s.last_strategy)} | 增量: ${formatTokensCompact(s.last_delta_tokens)}`;
-        elSlotPills.appendChild(pill);
-      }
-    } else {
-      elSlotPills.hidden = true;
-    }
-  }
-
-  if (elModelBreakdownList && elModelCountHint) {
-    const byModel = usage.by_model || {};
-    const entries = Object.entries(byModel);
-    elModelCountHint.textContent = entries.length > 0 ? `${entries.length} 个模型` : "暂无记录";
-    elModelBreakdownList.replaceChildren();
-    if (entries.length === 0) {
-      const emptyRow = document.createElement("div");
-      emptyRow.className = "cost-subline";
-      emptyRow.textContent = "发起对话后自动按模型统计官方 API 等价账单。";
-      elModelBreakdownList.appendChild(emptyRow);
-    } else {
-      for (const [modelKey, info] of entries) {
-        const row = document.createElement("div");
-        row.className = "model-item";
-
-        const left = document.createElement("div");
-        left.className = "model-item-left";
-        const nameEl = document.createElement("span");
-        nameEl.className = "model-item-name";
-        nameEl.textContent = info.display_name || modelKey;
-        const subEl = document.createElement("span");
-        subEl.className = "model-item-sub";
-        subEl.textContent = `$${info.input_rate_per_1m}/$${info.output_rate_per_1m} · ${info.requests || 0}次 · In ${formatTokensCompact(info.prompt_tokens)} / Out ${formatTokensCompact(info.completion_tokens)}`;
-        left.appendChild(nameEl);
-        left.appendChild(subEl);
-
-        const right = document.createElement("div");
-        right.className = "model-item-right";
-        const usdEl = document.createElement("span");
-        usdEl.className = "model-item-usd";
-        usdEl.textContent = formatUsd(info.equivalent_cost_usd);
-        const cnyEl = document.createElement("span");
-        cnyEl.className = "model-item-sub";
-        cnyEl.textContent = `Cached ${formatUsd(info.cached_equivalent_cost_usd)}`;
-        right.appendChild(usdEl);
-        right.appendChild(cnyEl);
-
-        row.appendChild(left);
-        row.appendChild(right);
-        elModelBreakdownList.appendChild(row);
-      }
-    }
-  }
-}
-
-function renderUpdateBanner(extVer, updateState, liveApiStatus = null) {
-  if (elExtVersionPill && extVer) {
-    elExtVersionPill.textContent = `v${String(extVer).replace(/^v/i, "")}`;
-  }
-  if (!elUpdateBanner) return;
-
-  const u = updateState || {};
-  const apiUpd = (liveApiStatus && liveApiStatus.update) || {};
-  const cleanExtVer = String(extVer || u.extensionVersion || "1.1.3").replace(/^v/i, "");
-  const backendVer = String(
-    (liveApiStatus && liveApiStatus.backend_version) ||
-      apiUpd.current_backend_version ||
-      u.backendVersion ||
-      ""
-  ).replace(/^v/i, "");
-  const remoteVer = String(
-    apiUpd.latest_github_version || u.latestGitHubVersion || ""
-  ).replace(/^v/i, "");
-  const releaseUrl =
-    apiUpd.release_url ||
-    u.releaseUrl ||
-    "https://github.com/StevenLee1471717/Gemini-Enterprise-Bridge/releases";
-
-  if (elUpdateReleaseLink) {
-    elUpdateReleaseLink.href = releaseUrl;
-  }
-
-  const backendNeedsUpdate = Boolean(
-    (liveApiStatus && liveApiStatus.backend_update_required) ||
-      apiUpd.backend_outdated ||
-      u.backendUpdateRequired
-  );
-  const extNeedsUpdate = Boolean(apiUpd.extension_outdated || u.extensionOutdated);
-
-  if (backendNeedsUpdate) {
-    elUpdateBanner.hidden = false;
-    const targetV = remoteVer || cleanExtVer;
-    if (elUpdateTitle) {
-      elUpdateTitle.textContent = `请更新本地后端 -> v${targetV}`;
-    }
-    if (elUpdateDesc) {
-      const prefix =
-        backendVer && cleanExtVer !== backendVer
-          ? `插件已更新至 v${cleanExtVer}`
-          : `检测到 GitHub 新版本 v${targetV}`;
-      elUpdateDesc.textContent = `${prefix}，当前本地后端为 v${backendVer || "旧版"} — 点击下方按钮即可从 GitHub 自动更新并平滑重启后端（保留 .env 与统计）。`;
-    }
-    if (elApplyBackendUpdateBtn) elApplyBackendUpdateBtn.hidden = false;
-    if (elSyncExtUpdateBtn) elSyncExtUpdateBtn.hidden = !extNeedsUpdate;
-  } else if (extNeedsUpdate) {
-    elUpdateBanner.hidden = false;
-    const targetV = remoteVer || backendVer || "latest";
-    if (elUpdateTitle) {
-      elUpdateTitle.textContent = `检测到插件新版本 v${targetV}`;
-    }
-    if (elUpdateDesc) {
-      elUpdateDesc.textContent = u.pendingExtensionReloadVersion
-        ? `本地 extension/ 已同步至 v${targetV}，将在空闲时自动重载；也可点击立即重载。`
-        : `当前浏览器插件为 v${cleanExtVer}，可从 GitHub Releases 自动同步并热重载至 v${targetV}。`;
-    }
-    if (elApplyBackendUpdateBtn) elApplyBackendUpdateBtn.hidden = true;
-    if (elSyncExtUpdateBtn) elSyncExtUpdateBtn.hidden = false;
-  } else {
-    elUpdateBanner.hidden = true;
-  }
-}
-
-async function refreshBackendUsageLive(wsUrl, fallbackSnapshot, extVer, cachedUpdateState) {
-  const baseHttp = deriveHttpConsoleUrl(wsUrl);
-  try {
-    const ctrl = new AbortController();
-    const timer = setTimeout(() => ctrl.abort(), 1600);
-    const resp = await fetch(`${baseHttp}api/status`, { signal: ctrl.signal });
-    clearTimeout(timer);
-    if (resp.ok) {
-      const data = await resp.json();
-      renderUpdateBanner(extVer, cachedUpdateState, data);
-      if (data && data.usage) {
-        renderUsageAndContext({
-          usage: data.usage,
-          context_monitor: data.context_monitor || {}
-        });
-        return;
-      }
-    }
-  } catch (_) {
-    // Fall back to cached WebSocket snapshot when backend HTTP is unreachable
-  }
-  renderUpdateBanner(extVer, cachedUpdateState, null);
-  if (fallbackSnapshot) {
-    renderUsageAndContext(fallbackSnapshot);
-  }
-}
-
 async function loadState(overwriteInputs = false) {
   try {
     const state = await chrome.runtime.sendMessage({ type: "GEB_POPUP_GET_STATE" });
     if (!state || !state.ok) {
       return;
     }
-    const { extensionVersion, updateState, settings, wsConnected, lastError, capturedRpc, activeModel, activeTab, vertexTabs, preferredTabId, usageSnapshot, logs } = state;
-    renderUpdateBanner(extensionVersion, updateState, null);
+
+    const {
+      settings,
+      wsConnected,
+      lastError,
+      vertexTabs,
+      focusedTab,
+      poolSummary,
+      logs
+    } = state;
+
+    const maxCap = Number(settings.maxParallelTabs || 10);
+    const autoSpawnOn = settings.autoSpawnTabs !== false;
 
     if (!initialFormHydrated || overwriteInputs) {
       elEnabled.checked = Boolean(settings.enabled);
       elModeSelect.value = settings.driverMode || "auto";
-      if (elAutoSpawn) elAutoSpawn.value = settings.autoSpawnTabs === false ? "false" : "true";
-      if (elMaxTabs) elMaxTabs.value = String(settings.maxParallelTabs || 6);
+      if (elAutoSpawn) elAutoSpawn.value = autoSpawnOn ? "true" : "false";
+      if (elMaxTabs) elMaxTabs.value = String(maxCap);
       elWsUrl.value = settings.wsUrl || "ws://127.0.0.1:8000/ws/browser";
       if (elModelSel) elModelSel.value = settings.customModelSelector || "";
       elInputSel.value = settings.customInputSelector || "";
@@ -347,53 +220,86 @@ async function loadState(overwriteInputs = false) {
       initialFormHydrated = true;
     }
 
-    // Populate open Vertex AI Search tabs dropdown (Trusted-Types safe)
-    const currentSelected = preferredTabId ? String(preferredTabId) : "";
-    elTabSelect.replaceChildren();
-    const autoOpt = document.createElement("option");
-    autoOpt.value = "";
-    autoOpt.textContent = `多标签页并行池（已挂载 ${(vertexTabs || []).length} 个标签页）`;
-    elTabSelect.appendChild(autoOpt);
+    const tabList = Array.isArray(vertexTabs) ? vertexTabs : [];
+    const summary = poolSummary || {
+      totalVertexTabs: tabList.length,
+      managedCount: Math.min(tabList.length, maxCap),
+      manualCount: 0,
+      overflowCount: Math.max(0, tabList.length - maxCap),
+      busyCount: 0,
+      maxTabs: maxCap
+    };
 
-    for (const t of vertexTabs || []) {
-      const opt = document.createElement("option");
-      opt.value = String(t.id);
-      const shortTitle = (t.title || "Gemini Enterprise").slice(0, 26);
-      const acctMatch = (t.url || "").match(/\/u\/(\d+)\//);
-      const acctTag = acctMatch ? ` [/u/${acctMatch[1]}]` : "";
-      opt.textContent = `仅固定 #${t.id}${acctTag} ${shortTitle}`;
-      if (String(t.id) === currentSelected) {
-        opt.selected = true;
-      }
-      elTabSelect.appendChild(opt);
-    }
+    syncSegmentUI(
+      elMaxTabs ? elMaxTabs.value : maxCap,
+      elAutoSpawn ? elAutoSpawn.value !== "false" : autoSpawnOn,
+      false
+    );
+    renderCurrentTabControl(focusedTab, settings, maxCap);
+
+    const managedTotal = Number(summary.managedCount || 0);
+    const manualTotal = Number(summary.manualCount || 0);
+    const overflowTotal = Number(summary.overflowCount || 0);
+    const busyTotal = Number(summary.busyCount || 0);
+    const allOpenTotal = Number(summary.totalVertexTabs || tabList.length);
+
+    elRpcStatus.textContent = manualTotal > 0 ? `${manualTotal} 页免接管` : "0 页";
 
     if (!settings.enabled) {
+      if (elHeroDot) elHeroDot.className = "status-dot err";
+      if (elHeroTitle) elHeroTitle.textContent = "桥接已暂停";
+      if (elHeroSub) elHeroSub.textContent = "打开右上角开关即可恢复本地接口服务";
       elWsPill.textContent = "已暂停";
       elWsPill.className = "pill err";
-    } else if (wsConnected) {
-      elWsPill.textContent = "已连接 (WS)";
-      elWsPill.className = "pill ok";
-    } else {
-      elWsPill.textContent = "未连接后端";
+      elTabStatus.textContent = allOpenTotal > 0 ? `已暂停 (${allOpenTotal}页)` : "未挂载";
+      if (elOpenVertexBtn) elOpenVertexBtn.hidden = true;
+    } else if (!wsConnected) {
+      if (elHeroDot) elHeroDot.className = "status-dot err";
+      if (elHeroTitle) elHeroTitle.textContent = "本地服务未连接";
+      if (elHeroSub) elHeroSub.textContent = "请确认本机 8000 服务已启动，插件会自动重连";
+      elWsPill.textContent = "未连接";
       elWsPill.className = "pill err";
-    }
-
-    const tabTotal = (vertexTabs || []).length;
-    if (preferredTabId && activeTab) {
-      elTabStatus.textContent = `固定单页 #${activeTab.id} · ${activeTab.title || activeTab.url}`;
-      elTabStatus.title = activeTab.url;
-    } else if (tabTotal > 0) {
-      elTabStatus.textContent = `${tabTotal} 个工作页就绪 (上限 ${settings.maxParallelTabs || 4})`;
-      elTabStatus.title = (vertexTabs || []).map((t) => `#${t.id}: ${t.url}`).join("\n");
+      elTabStatus.textContent = managedTotal > 0 ? `${managedTotal} / ${maxCap} 页` : "0 页";
+      if (elOpenVertexBtn) elOpenVertexBtn.hidden = allOpenTotal > 0;
+    } else if (managedTotal === 0) {
+      if (elHeroDot) elHeroDot.className = "status-dot";
+      if (elHeroTitle) {
+        elHeroTitle.textContent = manualTotal > 0
+          ? "所有已开页面均设为手动自用"
+          : "还差一步：未打开 Google 登录页";
+      }
+      if (elHeroSub) {
+        elHeroSub.textContent = manualTotal > 0
+          ? "如需恢复接口调用，可新开一个页面或将现有页恢复接管"
+          : "本地服务已连通，打开并登录 Google 页面即自动接管";
+      }
+      elWsPill.textContent = "已在线";
+      elWsPill.className = "pill ok";
+      elTabStatus.textContent = `0 / ${maxCap} 页`;
+      if (elOpenVertexBtn) elOpenVertexBtn.hidden = false;
     } else {
-      elTabStatus.textContent = "未打开 vertexaisearch.cloud.google.com";
-      elTabStatus.title = "";
+      if (elHeroDot) elHeroDot.className = "status-dot ok";
+      elWsPill.textContent = "已在线";
+      elWsPill.className = "pill ok";
+      if (elOpenVertexBtn) elOpenVertexBtn.hidden = true;
+      const busySuffix = busyTotal > 0 ? `（${busyTotal} 页工作中）` : "";
+      if (elHeroTitle) {
+        elHeroTitle.textContent = `运行正常 · 已接管 ${managedTotal} 页${busySuffix}`;
+      }
+      if (elHeroSub) {
+        const extraParts = [];
+        if (manualTotal > 0) extraParts.push(`${manualTotal} 页自用免接管`);
+        if (overflowTotal > 0) extraParts.push(`${overflowTotal} 页超上限未接入`);
+        if (extraParts.length > 0) {
+          elHeroSub.textContent = extraParts.join(" · ") + ` · 接管上限 ${maxCap} 页`;
+        } else {
+          elHeroSub.textContent = autoSpawnOn
+            ? `新开页面自动接入（上限 ${maxCap} 页），繁忙时可自动扩容`
+            : `新开页面自动接入（上限 ${maxCap} 页），仅用已打开页面`;
+        }
+      }
+      elTabStatus.textContent = `${managedTotal} / ${maxCap} 页`;
     }
-
-    const modelBadge = activeModel ? ` · ${activeModel}` : "";
-    elRpcStatus.textContent =
-      (capturedRpc ? "已捕获 RPC" : "流监听 + DOM") + modelBadge;
 
     if (lastError && !wsConnected && settings.enabled) {
       elErrorBanner.hidden = false;
@@ -403,23 +309,23 @@ async function loadState(overwriteInputs = false) {
       elErrorBanner.textContent = "";
     }
 
-    if (usageSnapshot) {
-      renderUsageAndContext(usageSnapshot);
-    }
-    void refreshBackendUsageLive(settings.wsUrl, usageSnapshot, extensionVersion, updateState);
-
     if (!elDiagOut.dataset.showingDiag) {
       elDiagOut.textContent = formatLogs(logs);
     }
   } catch (err) {
-    elWsPill.textContent = "通信错误";
+    if (elHeroDot) elHeroDot.className = "status-dot err";
+    if (elHeroTitle) elHeroTitle.textContent = "插件状态读取异常";
+    elWsPill.textContent = "异常";
     elWsPill.className = "pill err";
-    elDiagOut.textContent = "读取扩展状态失败: " + err.message;
+    elDiagOut.textContent = "读取状态失败: " + err.message;
   }
 }
 
 async function saveSettings() {
-  const chosenTabVal = elTabSelect.value;
+  const chosenTabVal =
+    typeof elTabSelect !== "undefined" && elTabSelect && elTabSelect.value
+      ? elTabSelect.value
+      : "";
   const preferredTabId = chosenTabVal ? Number(chosenTabVal) : null;
   const settings = {
     enabled: elEnabled.checked,
@@ -439,17 +345,19 @@ async function saveSettings() {
     settings,
     preferredTabId
   });
-  await chrome.runtime.sendMessage({ type: "GEB_POPUP_RECONNECT" });
+  if (typeof flashSavedToast === "function") {
+    flashSavedToast();
+  }
   await loadState(true);
 }
 
 async function runPageDiagnosis() {
   elDiagOut.dataset.showingDiag = "1";
-  elDiagOut.textContent = "正在扫描页面 Shadow DOM 与 RPC 状态...";
+  elDiagOut.textContent = "正在检查当前页面结构...";
   const res = await chrome.runtime.sendMessage({ type: "GEB_POPUP_DIAGNOSE_TAB" });
   if (!res || !res.ok) {
     elDiagOut.textContent =
-      "诊断失败: " + ((res && res.error) || "请先打开 https://vertexaisearch.cloud.google.com");
+      "检测未通过: " + ((res && res.error) || "请先打开 https://vertexaisearch.cloud.google.com");
     return;
   }
   elDiagOut.textContent = JSON.stringify(res.diagnosis, null, 2);
@@ -458,7 +366,7 @@ async function runPageDiagnosis() {
 async function triggerNewChat() {
   elDiagOut.dataset.showingDiag = "1";
   const res = await chrome.runtime.sendMessage({ type: "GEB_POPUP_NEW_CHAT" });
-  elDiagOut.textContent = JSON.stringify(res, null, 2);
+  elDiagOut.textContent = res && res.ok ? "已触发网页开启新对话" : JSON.stringify(res, null, 2);
 }
 
 document.getElementById("saveBtn").addEventListener("click", () => {
@@ -469,16 +377,100 @@ elEnabled.addEventListener("change", () => {
   void saveSettings();
 });
 
+if (elTabSelect) {
+  elTabSelect.addEventListener("change", () => {
+    void saveSettings();
+  });
+}
+
+if (elToggleManualBtn) {
+  elToggleManualBtn.addEventListener("click", () => {
+    void (async () => {
+      const act = elToggleManualBtn.dataset.action || "toggle";
+      elToggleManualBtn.disabled = true;
+      try {
+        if (act === "open_manual") {
+          await chrome.runtime.sendMessage({ type: "GEB_POPUP_OPEN_MANUAL_TAB" });
+          window.close();
+          return;
+        }
+        const tid = Number(elToggleManualBtn.dataset.tabId || 0);
+        if (tid > 0) {
+          await chrome.runtime.sendMessage({ type: "GEB_TOGGLE_TAB_MANUAL", tabId: tid });
+          flashSavedToast();
+          await loadState(false);
+        }
+      } finally {
+        elToggleManualBtn.disabled = false;
+      }
+    })();
+  });
+}
+
+if (elModeSelect) {
+  elModeSelect.addEventListener("change", () => {
+    void saveSettings();
+  });
+}
+
+if (elAutoSpawnCheck) {
+  elAutoSpawnCheck.addEventListener("change", () => {
+    if (elAutoSpawn) {
+      elAutoSpawn.value = elAutoSpawnCheck.checked ? "true" : "false";
+    }
+    void saveSettings();
+  });
+}
+
+if (elMaxTabsSegments) {
+  elMaxTabsSegments.addEventListener("click", (ev) => {
+    const btn = ev.target && ev.target.closest(".seg-btn");
+    if (!btn || btn.disabled) return;
+    const val = btn.getAttribute("data-val");
+    if (!val) return;
+    if (elMaxTabs) {
+      let opt = elMaxTabs.querySelector(`option[value="${val}"]`);
+      if (!opt) {
+        opt = document.createElement("option");
+        opt.value = val;
+        opt.textContent = val;
+        elMaxTabs.appendChild(opt);
+      }
+      elMaxTabs.value = val;
+    }
+    void saveSettings();
+  });
+}
+
+const reconnectBtn = document.getElementById("reconnectBtn");
+if (reconnectBtn) {
+  reconnectBtn.addEventListener("click", () => {
+    void (async () => {
+      await chrome.runtime.sendMessage({ type: "GEB_POPUP_RECONNECT" });
+      flashSavedToast();
+      await loadState(false);
+    })();
+  });
+}
+
 const spawnBtn = document.getElementById("spawnTabBtn");
 if (spawnBtn) {
   spawnBtn.addEventListener("click", () => {
     void (async () => {
       elDiagOut.dataset.showingDiag = "1";
-      elDiagOut.textContent = "正在后台静默创建新的 Gemini Enterprise 并行工作标签页...";
+      elDiagOut.textContent = "正在后台新开工作标签页...";
       const res = await chrome.runtime.sendMessage({ type: "GEB_POPUP_SPAWN_TAB" });
-      elDiagOut.textContent = JSON.stringify(res, null, 2);
+      elDiagOut.textContent = res && res.ok
+        ? "已新增后台工作标签页"
+        : "新增失败: " + ((res && res.error) || "未知原因");
       await loadState(false);
     })();
+  });
+}
+
+if (elOpenVertexBtn) {
+  elOpenVertexBtn.addEventListener("click", () => {
+    void chrome.tabs.create({ url: "https://vertexaisearch.cloud.google.com/" });
   });
 }
 
@@ -504,112 +496,6 @@ document.getElementById("clearLogsBtn").addEventListener("click", () => {
     await loadState(false);
   })();
 });
-
-if (elResetUsageBtn) {
-  elResetUsageBtn.addEventListener("click", () => {
-    void (async () => {
-      const baseHttp = deriveHttpConsoleUrl(elWsUrl.value);
-      try {
-        const resp = await fetch(`${baseHttp}api/usage/reset`, {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ scope: "all" })
-        });
-        if (resp.ok) {
-          const data = await resp.json();
-          renderUsageAndContext({
-            usage: data.usage,
-            context_monitor: data.context_monitor || {}
-          });
-        }
-      } catch (err) {
-        elDiagOut.textContent = "重置用量统计失败: " + err.message;
-      }
-    })();
-  });
-}
-
-if (elCheckUpdateBtn) {
-  elCheckUpdateBtn.addEventListener("click", () => {
-    void (async () => {
-      elCheckUpdateBtn.disabled = true;
-      elCheckUpdateBtn.textContent = "检查中...";
-      try {
-        const res = await chrome.runtime.sendMessage({ type: "GEB_POPUP_CHECK_UPDATE" });
-        await loadState(false);
-        const u = (res && res.updateState) || {};
-        if (!u.backendUpdateRequired && !u.extensionOutdated) {
-          elCheckUpdateBtn.textContent = "已是最新";
-          setTimeout(() => {
-            elCheckUpdateBtn.textContent = "检查更新";
-          }, 2200);
-        } else {
-          elCheckUpdateBtn.textContent = `发现 v${u.latestGitHubVersion || u.backendVersion}`;
-        }
-      } catch (_) {
-        elCheckUpdateBtn.textContent = "检查失败";
-        setTimeout(() => {
-          elCheckUpdateBtn.textContent = "检查更新";
-        }, 2200);
-      } finally {
-        elCheckUpdateBtn.disabled = false;
-      }
-    })();
-  });
-}
-
-if (elApplyBackendUpdateBtn) {
-  elApplyBackendUpdateBtn.addEventListener("click", () => {
-    void (async () => {
-      const baseHttp = deriveHttpConsoleUrl(elWsUrl.value);
-      elApplyBackendUpdateBtn.disabled = true;
-      elApplyBackendUpdateBtn.textContent = "正在更新并重启后端...";
-      try {
-        const resp = await fetch(`${baseHttp}api/update/apply`, {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ restart: true })
-        });
-        const data = await resp.json();
-        if (resp.ok && data.ok) {
-          if (elUpdateDesc) {
-            elUpdateDesc.textContent =
-              data.message || `已更新至 v${data.updated_version}，后端正在平滑重启...`;
-          }
-        } else if (elUpdateDesc) {
-          elUpdateDesc.textContent = `自动更新失败: ${(data && data.error) || resp.status}`;
-        }
-      } catch (_) {
-        if (elUpdateDesc) {
-          elUpdateDesc.textContent = "后端已触发热重启更新，预计约 3 秒后自动恢复连接...";
-        }
-      } finally {
-        setTimeout(() => {
-          elApplyBackendUpdateBtn.disabled = false;
-          elApplyBackendUpdateBtn.textContent = "立即自动更新并重启后端";
-          void loadState(false);
-        }, 3500);
-      }
-    })();
-  });
-}
-
-if (elSyncExtUpdateBtn) {
-  elSyncExtUpdateBtn.addEventListener("click", () => {
-    void (async () => {
-      elSyncExtUpdateBtn.disabled = true;
-      elSyncExtUpdateBtn.textContent = "正在同步并重载...";
-      const res = await chrome.runtime.sendMessage({ type: "GEB_POPUP_SYNC_EXTENSION" });
-      if (!res || !res.ok) {
-        elSyncExtUpdateBtn.disabled = false;
-        elSyncExtUpdateBtn.textContent = "同步并重载插件";
-        if (elUpdateDesc) {
-          elUpdateDesc.textContent = "同步插件失败: " + ((res && res.error) || "请确认本地后端已启动");
-        }
-      }
-    })();
-  });
-}
 
 void loadState(true);
 setInterval(() => {

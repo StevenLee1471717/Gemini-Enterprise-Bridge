@@ -1,11 +1,7 @@
-// MAIN-world Hybrid Driver for Google Cloud Vertex AI Search / Agentspace (Gemini Enterprise)
-// Combines:
-//   1) Passive fetch/XHR RPC stream sniffer (extracts real-time StreamAssist / converse chunks + grounding links)
-//   2) Deep open-Shadow-DOM piercing composer & incremental reply watcher (works out-of-the-box on message #1)
-//   3) Optional in-page fetch replay once a chat RPC template is observed
+// MAIN-world driver: DOM controls the composer; the original RPC is the only reply source.
 
 (() => {
-  const DRIVER_VERSION = "2.4.0";
+  const DRIVER_VERSION = "2.8.6";
 
   // Optional Trusted Types policy (gracefully guarded if CSP `trusted-types` header restricts custom policy names;
   // all DOM mutations below strictly use `replaceChildren` + `createElement` + `textContent` and ZERO `innerHTML`!)
@@ -47,7 +43,7 @@
   const FROM_MAIN_CHANNEL = "GEB_MAIN_TO_ISOLATED";
 
   const driverConfig = {
-    driverMode: "auto", // auto | dom | replay
+    driverMode: "auto", // original RPC only
     customModelSelector: "",
     customInputSelector: "",
     customSendSelector: "",
@@ -177,31 +173,35 @@
   const CHAT_RPC_PATTERNS = [
     /streamAssist/i,
     /widgetStreamAssist/i,
-    /:converse/i,
-    /:assist/i,
-    /:answer/i,
+    /streamAnswer/i,
+    /streamGenerateContent/i,
+    /(?::|\/|\.)(?:widget)?converse(?:Conversation)?(?=$|[/?#])/i,
+    /(?::|\/|\.)(?:widget)?assist(?=$|[/?#])/i,
+    /(?::|\/|\.)(?:widget)?answer(?:Query)?(?=$|[/?#])/i,
     /ConversationalSearch/i,
-    /Agentspace.*batchexecute/i,
     /discoveryengine.*assist/i
   ];
 
-  function isLikelyChatRpc(url, method, bodyText) {
+  function isLikelyChatRpc(url, method) {
     if (!url || String(method || "GET").toUpperCase() !== "POST") {
       return false;
     }
-    if (CHAT_RPC_PATTERNS.some((re) => re.test(url))) {
-      return true;
+    if (
+      /batchexecute|(?:create|update|delete|get|list|purge|lookup)(?:Widget)?(?:Session|Conversation|Config)s?|addUserEvents|logClient/i.test(
+        url
+      )
+    ) {
+      return false;
     }
-    if (/batchexecute/i.test(url) && bodyText && bodyText.length > 20) {
-      return /query|assist|conversation|message/i.test(bodyText);
-    }
-    return false;
+    return CHAT_RPC_PATTERNS.some((re) => re.test(url));
   }
 
   function extractStructuredPieces(node, outTexts, outCitations) {
     if (!node || typeof node !== "object") {
       return;
     }
+    // A thought flag applies to its entire subtree, not just its direct text field.
+    if (node.thought === true || node.isThought === true || node.role === "thought" || node.type === "thought") return;
     if (Array.isArray(node)) {
       for (const item of node) {
         extractStructuredPieces(item, outTexts, outCitations);
@@ -213,21 +213,21 @@
     if (node.groundedContent && node.groundedContent.content) {
       const contentObj = node.groundedContent.content;
       if (!contentObj.thought && typeof contentObj.text === "string" && contentObj.text) {
-        outTexts.push(contentObj.text);
+        outTexts.push({ text: contentObj.text, snapshot: false });
       }
     } else if (
       typeof node.summaryText === "string" &&
       node.summaryText &&
       !node.thought
     ) {
-      outTexts.push(node.summaryText);
+      outTexts.push({ text: node.summaryText, snapshot: true });
     } else if (
       node.role === "model" &&
       Array.isArray(node.parts)
     ) {
       for (const p of node.parts) {
         if (p && !p.thought && typeof p.text === "string" && p.text) {
-          outTexts.push(p.text);
+          outTexts.push({ text: p.text, snapshot: false });
         }
       }
     }
@@ -247,6 +247,7 @@
     }
 
     for (const key of Object.keys(node)) {
+      if (["suggestedQuestions", "suggested_questions", "relatedQuestions"].includes(key)) continue;
       if (key === "groundedContent") {
         // Still inspect grounding metadata siblings, skip re-adding content.text
         const gc = node.groundedContent;
@@ -262,13 +263,244 @@
     }
   }
 
-  function parseJsonPacketIntoJob(jsonObj, job) {
-    if (!job || job.cancelled) {
+  function stripTrailingWebSuggestions(text) {
+    const raw = String(text || "").replace(
+      /(^[ \t]{0,3}```[ \t]*)(?=(?:`{3,}|~{3,})[ \t]*suggested_questions\b|\[\[(?:suggested_questions|section:suggested_questions)\]\])/gim,
+      "$1\n"
+    );
+    const lines = raw.split("\n");
+    const kept = [];
+    let outerFence = "";
+    let skipSuggestionFence = "";
+    const fenceLineRe = /^[ \t]{0,3}(`{3,}|~{3,})([^\r\n]*)\r?$/;
+
+    for (let i = 0; i < lines.length; i += 1) {
+      const line = lines[i];
+      if (skipSuggestionFence) {
+        const mClose = line.match(fenceLineRe);
+        if (
+          mClose &&
+          mClose[1][0] === skipSuggestionFence[0] &&
+          mClose[1].length >= skipSuggestionFence.length &&
+          !mClose[2].trim()
+        ) {
+          skipSuggestionFence = "";
+        }
+        continue;
+      }
+      if (!outerFence && /^[ \t]*\[\[(?:suggested_questions|section:suggested_questions)\]\]/i.test(line)) {
+        break;
+      }
+      const cleanedLine = line.replace(/\[\[section:[^\]]*\]\]/gi, "");
+      const mFence = cleanedLine.match(fenceLineRe);
+      if (!outerFence) {
+        if (mFence && /^suggested_questions(?:\b|$)/i.test(mFence[2].trim())) {
+          skipSuggestionFence = mFence[1];
+          continue;
+        }
+        if (mFence) {
+          outerFence = mFence[1];
+        }
+      } else if (
+        mFence &&
+        mFence[1][0] === outerFence[0] &&
+        mFence[1].length >= outerFence.length &&
+        !mFence[2].trim()
+      ) {
+        outerFence = "";
+      }
+      kept.push(line);
+    }
+    return kept.join("\n");
+  }
+
+  function stripExplicitWebDecorations(text) {
+    return stripTrailingWebSuggestions(text).replace(/\[\[section:[^\]]*\]\]/gi, "\n\n");
+  }
+
+  function replaceClientToolFences(text, replace) {
+    const opening = /(?:^[ \t]{0,3}|(?:\[\[section:[^\r\n]*?\]\][ \t]*)+)(?:\[\[section:[^\r\n]*?\]\][ \t]*)*(`{3,}|~{3,})([^\r\n]*)\r?$/gmi;
+    const wsOrSectionRe = /(?:\s+|\[\[section:[^\r\n]*?\]\])+/yi;
+    const exactCloseRe = /(?:```[ \t]*(?:(?:`{3,}|~{3,})[ \t]*)?suggested_questions\b[^\r\n]*(?:\r?\n[\s\S]*?^[ \t]{0,3}(?:`{3,}|~{3,})[ \t]*\r?$|\r?\n[\s\S]*$|\r?$)|```[ \t]*(?=(?:\[\[(?:section:[^\r\n]*?|suggested_questions|section:suggested_questions)\]\][ \t]*(?:\r?$|\r?\n)|\r?$|\r?\n)))/ymi;
+    let match, cursor = 0, output = "";
+    while ((match = opening.exec(text))) {
+      const fence = match[1];
+      const language = match[2].replace(/\[\[section:[^\]]*\]\]/gi, "").trim().toLowerCase();
+      const closing = new RegExp("^[ \\t]{0,3}" + fence[0] + "{" + fence.length + ",}[ \\t]*\\r?$", "gm");
+      closing.lastIndex = opening.lastIndex;
+      if (language !== "codex_tool_call" || fence !== "```") {
+        const end = closing.exec(text);
+        opening.lastIndex = end ? closing.lastIndex : text.length;
+        continue;
+      }
+      let pos = opening.lastIndex;
+      wsOrSectionRe.lastIndex = pos;
+      const leadWs = wsOrSectionRe.exec(text);
+      if (leadWs) pos = wsOrSectionRe.lastIndex;
+      if (text[pos] !== "{") continue;
+      const parsedValues = [];
+      let parseOk = true;
+      while (pos < text.length && text[pos] === "{") {
+        let depth = 0, quoted = false, escaped = false, end = pos;
+        for (; end < text.length; end += 1) {
+          const char = text[end];
+          if (quoted) {
+            if (escaped) escaped = false;
+            else if (char === "\\") escaped = true;
+            else if (char === '"') quoted = false;
+          } else if (char === '"') quoted = true;
+          else if (char === "{" || char === "[") depth += 1;
+          else if ((char === "}" || char === "]") && --depth === 0) { end += 1; break; }
+        }
+        if (depth !== 0) { parseOk = false; break; }
+        try {
+          parsedValues.push(JSON.parse(text.slice(pos, end)));
+        } catch (_) {
+          parseOk = false;
+          break;
+        }
+        pos = end;
+        wsOrSectionRe.lastIndex = pos;
+        const midWs = wsOrSectionRe.exec(text);
+        if (midWs) pos = wsOrSectionRe.lastIndex;
+      }
+      if (!parseOk || parsedValues.length === 0) continue;
+      exactCloseRe.lastIndex = pos;
+      const close = exactCloseRe.exec(text);
+      if (!close) continue;
+      output += text.slice(cursor, match.index) + parsedValues.map((v) => replace(v)).join("\n");
+      cursor = exactCloseRe.lastIndex;
+      opening.lastIndex = cursor;
+    }
+    return output + text.slice(cursor);
+  }
+
+  function replyFingerprint(text) {
+    const stable = (value) => {
+      if (Array.isArray(value)) return value.map(stable);
+      if (value && typeof value === "object") {
+        return Object.fromEntries(Object.keys(value).sort().map((key) => [key, stable(value[key])]));
+      }
+      return value;
+    };
+    text = String(text || "");
+    // Protect command strings before stripping webpage decorations from prose.
+    let marker = "\0GEB_CALL";
+    while (text.includes(marker)) marker += "_";
+    const calls = [];
+    const remember = (value) => {
+      calls.push(JSON.stringify(stable(value)));
+      return marker + (calls.length - 1) + "\0";
+    };
+    text = replaceClientToolFences(text, remember);
+    text = stripExplicitWebDecorations(text);
+    text = text
+      .replace(/\r\n?/g, "\n")
+      .replace(/[ \t]+\n/g, "\n")
+      .replace(/\n{2,}/g, "\n")
+      .replace(new RegExp("[ \\t\\r\\n]+(?=" + marker + ")", "g"), "\n")
+      .replace(new RegExp("(" + marker + "\\d+\\0)[ \\t\\r\\n]+", "g"), "$1\n")
+      .trim();
+    return text.replace(new RegExp(marker + "(\\d+)\\0", "g"), (_, index) => "CLIENT_CALL:" + calls[Number(index)]);
+  }
+
+  function findLastUnclosedToolFence(text) {
+    const opening = /(?:^[ \t]{0,3}|(?:\[\[section:[^\r\n]*?\]\][ \t]*)+)```[ \t]*(?:\[\[section:[^\r\n]*?\]\][ \t]*)*codex_tool_call(?:[ \t]*\[\[section:[^\r\n]*?\]\])*[ \t]*\r?$/gmi;
+    let m, lastOpen = -1;
+    while ((m = opening.exec(text))) {
+      const tailProbe = text.slice(m.index);
+      if (replaceClientToolFences(tailProbe, () => "") === tailProbe) {
+        lastOpen = m.index;
+      }
+    }
+    return lastOpen;
+  }
+
+  function extractSnapshotSuffixCore(snapshotText, existingText) {
+    const fpExisting = replyFingerprint(existingText);
+    if (!fpExisting) return null;
+    const fpSnapshot = replyFingerprint(snapshotText);
+    if (fpSnapshot === fpExisting) return "";
+    if (fpExisting.startsWith(fpSnapshot)) return "";
+    if (!fpSnapshot.startsWith(fpExisting)) return null;
+    const candidates = [];
+    for (let i = 0; i < snapshotText.length; i += 1) {
+      if (snapshotText[i] === "\n") candidates.push(i);
+    }
+    for (const cut of candidates) {
+      if (replyFingerprint(snapshotText.slice(0, cut)) === fpExisting) {
+        return snapshotText.slice(cut);
+      }
+    }
+    let lo = 1;
+    let hi = snapshotText.length;
+    while (lo < hi) {
+      const mid = (lo + hi) >> 1;
+      if (replyFingerprint(snapshotText.slice(0, mid)).length < fpExisting.length) {
+        lo = mid + 1;
+      } else {
+        hi = mid;
+      }
+    }
+    const startScan = Math.max(1, lo - 8);
+    const endScan = Math.min(snapshotText.length, lo + 8);
+    for (let cut = startScan; cut <= endScan; cut += 1) {
+      if (replyFingerprint(snapshotText.slice(0, cut)) === fpExisting) {
+        return snapshotText.slice(cut);
+      }
+    }
+    return null;
+  }
+
+  function extractSnapshotSuffix(snapshotText, existingText) {
+    const cleanSnapshot = stripTrailingWebSuggestions(snapshotText);
+    const direct = extractSnapshotSuffixCore(cleanSnapshot, existingText);
+    if (direct !== null) {
+      return direct;
+    }
+    const unclosedIdx = findLastUnclosedToolFence(existingText);
+    if (unclosedIdx >= 0) {
+      const closeToken = existingText.endsWith("\n") ? "```" : "\n```";
+      const closedProbe = existingText + closeToken;
+      if (replaceClientToolFences(closedProbe.slice(unclosedIdx), () => "") !== closedProbe.slice(unclosedIdx)) {
+        const afterClose = extractSnapshotSuffixCore(cleanSnapshot, closedProbe);
+        if (afterClose !== null) {
+          return stripExplicitWebDecorations(afterClose).trim() ? closeToken + afterClose : closeToken;
+        }
+      }
+      const prefixBefore = existingText.slice(0, unclosedIdx);
+      const fpBefore = prefixBefore ? replyFingerprint(prefixBefore) : "";
+      const unclosedTail = existingText.slice(unclosedIdx);
+      let searchFrom = 0;
+      while (searchFrom <= cleanSnapshot.length - unclosedTail.length) {
+        const pos = cleanSnapshot.indexOf(unclosedTail, searchFrom);
+        if (pos === -1) break;
+        const snapBefore = cleanSnapshot.slice(0, pos);
+        const prefixMatches = fpBefore
+          ? replyFingerprint(snapBefore) === fpBefore
+          : !stripExplicitWebDecorations(snapBefore).trim();
+        if (prefixMatches) {
+          return cleanSnapshot.slice(pos + unclosedTail.length);
+        }
+        searchFrom = pos + 1;
+      }
+    }
+    return null;
+  }
+
+  function parseJsonPacketIntoJob(jsonObj, job, streamToken = null) {
+    if (!job || job.cancelled || job.completed) {
+      return;
+    }
+    if (streamToken && job.primaryStreamToken && job.primaryStreamToken !== streamToken) {
       return;
     }
     const texts = [];
     const refs = [];
     extractStructuredPieces(jsonObj, texts, refs);
+    if (streamToken && !job.primaryStreamToken && texts.some((p) => p && p.text)) {
+      job.primaryStreamToken = streamToken;
+    }
 
     for (const ref of refs) {
       if (!job.citations.some((c) => c.url === ref.url)) {
@@ -276,9 +508,19 @@
       }
     }
 
-    if (texts.length > 0) {
-      const combined = texts.join("");
+    for (const piece of texts) {
+      const combined = piece.text;
       if (combined) {
+        if (piece.snapshot && job.networkText) {
+          const snapshotSuffix = extractSnapshotSuffix(combined, job.networkText);
+          if (snapshotSuffix !== null) {
+            if (snapshotSuffix && stripExplicitWebDecorations(snapshotSuffix).trim()) {
+              job.networkText += snapshotSuffix;
+              job.onNetworkDelta(snapshotSuffix);
+            }
+            continue;
+          }
+        }
         // Distinguish cumulative full-text snapshots from incremental token deltas
         const isCumulativeGrowth =
           job.networkText.length >= 4 &&
@@ -288,7 +530,7 @@
           combined === job.networkText && combined.length >= 16;
 
         if (isFinalEchoDuplicate) {
-          return;
+          continue;
         }
         if (isCumulativeGrowth) {
           const suffix = combined.slice(job.networkText.length);
@@ -297,8 +539,15 @@
             job.onNetworkDelta(suffix);
           }
         } else {
-          job.networkText += combined;
-          job.onNetworkDelta(combined);
+          const sep =
+            piece.snapshot &&
+            job.networkText &&
+            !job.networkText.endsWith("\n") &&
+            !combined.startsWith("\n")
+              ? "\n"
+              : "";
+          job.networkText += sep + combined;
+          job.onNetworkDelta(sep + combined);
         }
       }
     }
@@ -309,71 +558,170 @@
    * and invokes `onObject(parsed)` as soon as each top-level element closes.
    */
   async function consumeRpcReadableStream(readableStream, job) {
+    if (job && job.primaryStreamToken) {
+      return;
+    }
+    const streamToken = Symbol("rpc_stream");
+    if (job) {
+      if (!job.activeStreams) job.activeStreams = new Set();
+      job.activeStreams.add(streamToken);
+    }
     const reader = readableStream.getReader();
+    const cancelStream = () => { void reader.cancel().catch(() => {}); };
+    if (job && !job.cancelStream) {
+      job.cancelStream = cancelStream;
+    }
     const decoder = new TextDecoder("utf-8");
     let buffer = "";
     let cursor = 0;
     let inString = false;
     let escaped = false;
     let objDepth = 0;
+    let arrayDepth = 0;
+    let invalidPacket = false;
     let objStart = -1;
+    let streamEnded = false;
+    let xssiChecked = false;
+    let parsedPackets = 0;
+    let rpcErrorMessage = "";
+
+    const scanBuffer = () => {
+      if (job && job.primaryStreamToken && job.primaryStreamToken !== streamToken) {
+        return;
+      }
+      if (!xssiChecked) {
+        const trimmedLead = buffer.replace(/^\s+/, "");
+        if (!trimmedLead) {
+          cursor = buffer.length;
+          return;
+        }
+        if ((")]}'".startsWith(trimmedLead) || /^\)\]\}'[ \t]*$/.test(trimmedLead)) && !streamEnded) {
+          return;
+        }
+        const xssiMatch = buffer.match(/^\s*\)\]\}'[ \t]*(?:\r?\n)?/);
+        if (xssiMatch) {
+          buffer = buffer.slice(xssiMatch[0].length);
+          cursor = 0;
+        }
+        xssiChecked = true;
+      }
+
+      while (cursor < buffer.length) {
+        const ch = buffer[cursor];
+        if (inString) {
+          if (escaped) {
+            escaped = false;
+          } else if (ch === "\\") {
+            escaped = true;
+          } else if (ch === '"') {
+            inString = false;
+          }
+        } else {
+          if (ch === '"') {
+            inString = true;
+          } else if (ch === "{") {
+            if (objDepth === 0) {
+              objStart = cursor;
+            }
+            objDepth += 1;
+          } else if (ch === "}") {
+            if (objDepth > 0) {
+              objDepth -= 1;
+              if (objDepth === 0 && objStart >= 0) {
+                const candidate = buffer.slice(objStart, cursor + 1);
+                objStart = -1;
+                try {
+                  const parsed = JSON.parse(candidate);
+                  parsedPackets += 1;
+                  if (
+                    parsed &&
+                    typeof parsed === "object" &&
+                    !Array.isArray(parsed) &&
+                    parsed.error &&
+                    typeof parsed.error === "object" &&
+                    typeof parsed.error.message === "string" &&
+                    parsed.error.message
+                  ) {
+                    rpcErrorMessage = parsed.error.message;
+                  }
+                  parseJsonPacketIntoJob(parsed, job, streamToken);
+                } catch (_) {
+                  invalidPacket = true;
+                }
+              }
+            } else {
+              invalidPacket = true;
+            }
+          } else if (ch === "[") {
+            arrayDepth += 1;
+          } else if (ch === "]") {
+            if (arrayDepth > 0) {
+              arrayDepth -= 1;
+            } else {
+              invalidPacket = true;
+            }
+          }
+        }
+        cursor += 1;
+      }
+
+      // Compact processed prefix when outside any top-level object
+      if (objDepth === 0 && cursor > 8192) {
+        buffer = buffer.slice(cursor);
+        cursor = 0;
+      }
+    };
 
     try {
       while (true) {
         const { value, done } = await reader.read();
         if (done) {
+          streamEnded = true;
+          buffer += decoder.decode();
+          scanBuffer();
           break;
         }
         buffer += decoder.decode(value, { stream: true });
-
-        while (cursor < buffer.length) {
-          const ch = buffer[cursor];
-          if (inString) {
-            if (escaped) {
-              escaped = false;
-            } else if (ch === "\\") {
-              escaped = true;
-            } else if (ch === '"') {
-              inString = false;
-            }
-          } else {
-            if (ch === '"') {
-              inString = true;
-            } else if (ch === "{") {
-              if (objDepth === 0) {
-                objStart = cursor;
-              }
-              objDepth += 1;
-            } else if (ch === "}") {
-              if (objDepth > 0) {
-                objDepth -= 1;
-                if (objDepth === 0 && objStart >= 0) {
-                  const candidate = buffer.slice(objStart, cursor + 1);
-                  objStart = -1;
-                  try {
-                    const parsed = JSON.parse(candidate);
-                    parseJsonPacketIntoJob(parsed, job);
-                  } catch (_) {}
-                }
-              }
-            }
-          }
-          cursor += 1;
-        }
-
-        // Compact processed prefix when outside any top-level object
-        if (objDepth === 0 && cursor > 8192) {
-          buffer = buffer.slice(cursor);
-          cursor = 0;
-        }
+        scanBuffer();
       }
     } catch (_) {
-      // Page aborted or stream closed
+      streamEnded = false;
     } finally {
-      if (job && !job.cancelled && job.networkText) {
-        job.networkDone = true;
-        job.onNetworkDone();
+      if (job && job.activeStreams) {
+        job.activeStreams.delete(streamToken);
       }
+      const isPrimary = Boolean(job && job.primaryStreamToken === streamToken);
+      const noOtherStream = Boolean(
+        job &&
+        !job.primaryStreamToken &&
+        (!job.activeStreams || job.activeStreams.size === 0)
+      );
+      if (job && !job.cancelled && !job.completed) {
+        if (
+          isPrimary &&
+          streamEnded &&
+          parsedPackets > 0 &&
+          objDepth === 0 &&
+          arrayDepth === 0 &&
+          !inString &&
+          !invalidPacket &&
+          job.networkText
+        ) {
+          job.networkDone = true;
+          job.onNetworkDone();
+        } else if (
+          (isPrimary || noOtherStream) &&
+          (!streamEnded || objDepth > 0 || arrayDepth > 0 || inString || invalidPacket)
+        ) {
+          job.networkError = "网页响应流中断或数据不完整。";
+          logDriver("warn", job.networkError);
+        } else if ((isPrimary || noOtherStream) && rpcErrorMessage && !job.networkText) {
+          job.networkError = `网页接口返回错误: ${rpcErrorMessage}`;
+          logDriver("warn", job.networkError);
+        }
+      }
+      reader.releaseLock();
+      if (job && job.cancelStream === cancelStream) delete job.cancelStream;
     }
   }
 
@@ -383,11 +731,12 @@
   sharedState.parsePacket = parseJsonPacketIntoJob;
   sharedState.checkChatRpc = isLikelyChatRpc;
   sharedState.onRpcCaptured = () => {
-    emitToIsolated({ type: "driver_ready", captured_rpc: true });
+    emitToIsolated({ type: "driver_ready", captured_rpc: true, driver_version: DRIVER_VERSION });
   };
 
-  if (!sharedState.networkPatched) {
+  if (!sharedState.networkPatched || sharedState.networkPatchVersion !== DRIVER_VERSION) {
     sharedState.networkPatched = true;
+    sharedState.networkPatchVersion = DRIVER_VERSION;
 
     window.fetch = async function patchedFetch(input, init) {
       let url = "";
@@ -439,10 +788,46 @@
         }
       }
 
-      const response = await sharedState.nativeFetch(input, init);
-      const curJob = sharedState.getActiveJob ? sharedState.getActiveJob() : null;
+      // Bind before awaiting headers so a late response cannot attach to the next job.
+      const candidateJob =
+        matchedRpc && sharedState.getActiveJob ? sharedState.getActiveJob() : null;
+      const curJob =
+        candidateJob &&
+        candidateJob.awaitingRpc !== false &&
+        !candidateJob.cancelled &&
+        !candidateJob.completed &&
+        !candidateJob.primaryStreamToken
+          ? candidateJob
+          : null;
+      if (curJob) {
+        curJob.submissionStarted = true;
+      }
+      let response;
+      try {
+        response = await sharedState.nativeFetch(input, init);
+      } catch (error) {
+        if (
+          curJob &&
+          !curJob.cancelled &&
+          !curJob.primaryStreamToken &&
+          (!curJob.activeStreams || curJob.activeStreams.size === 0)
+        ) {
+          curJob.networkError = "网页请求失败，连接已中断。";
+        }
+        throw error;
+      }
+      if (
+        curJob &&
+        !curJob.cancelled &&
+        !curJob.primaryStreamToken &&
+        (!curJob.activeStreams || curJob.activeStreams.size === 0) &&
+        response &&
+        response.ok === false
+      ) {
+        curJob.networkError = `网页请求失败 (HTTP ${response.status})。`;
+      }
 
-      if (matchedRpc && curJob && !curJob.cancelled && response && response.body) {
+      if (curJob && !curJob.cancelled && !curJob.primaryStreamToken && response && response.body) {
         try {
           const cloned = response.clone();
           if (cloned.body && sharedState.consumeStream) {
@@ -462,15 +847,22 @@
 
     XMLHttpRequest.prototype.send = function patchedSend(body) {
       const bodyStr = typeof body === "string" ? body : "";
-      const curJob = sharedState.getActiveJob ? sharedState.getActiveJob() : null;
+      const candidateJob = sharedState.getActiveJob ? sharedState.getActiveJob() : null;
       if (
         sharedState.checkChatRpc &&
         sharedState.checkChatRpc(this.__gebUrl, this.__gebMethod, bodyStr) &&
-        curJob
+        candidateJob &&
+        candidateJob.awaitingRpc !== false &&
+        !candidateJob.cancelled &&
+        !candidateJob.completed &&
+        !candidateJob.primaryStreamToken
       ) {
-        const jobRef = curJob;
+        const jobRef = candidateJob;
+        jobRef.submissionStarted = true;
         let lastProcessedIdx = 0;
+        const xhrToken = Symbol("xhr_stream");
         this.addEventListener("readystatechange", () => {
+          if (jobRef.primaryStreamToken && jobRef.primaryStreamToken !== xhrToken) return;
           if (this.readyState >= 3 && typeof this.responseText === "string") {
             const fresh = this.responseText.slice(lastProcessedIdx);
             if (fresh && this.readyState === 4) {
@@ -479,9 +871,9 @@
                 const cleaned = this.responseText.replace(/^\)\]\}'\s*/, "");
                 const parsed = JSON.parse(cleaned);
                 if (sharedState.parsePacket) {
-                  sharedState.parsePacket(parsed, jobRef);
+                  sharedState.parsePacket(parsed, jobRef, xhrToken);
                 }
-                if (jobRef.networkText) {
+                if (jobRef.primaryStreamToken === xhrToken && jobRef.networkText) {
                   jobRef.networkDone = true;
                   jobRef.onNetworkDone();
                 }
@@ -501,6 +893,10 @@
   function collectDeepRoots(root = document) {
     const roots = [root];
     const queue = [root];
+    if (root && root.shadowRoot) {
+      roots.push(root.shadowRoot);
+      queue.push(root.shadowRoot);
+    }
     while (queue.length > 0) {
       const current = queue.shift();
       if (!current || !current.querySelectorAll) {
@@ -904,7 +1300,7 @@
   async function submitComposerWithVerification(inputEl, promptText, job = null, baselineCount = 0) {
     const promptTrimLen = String(promptText || "").trim().length;
     const hasSubmissionStarted = () => {
-      if (job && (job.networkText.length > 0 || job.networkDone)) return true;
+      if (job && (job.submissionStarted || job.networkText.length > 0 || job.networkDone)) return true;
       if (isPageStillGenerating()) return true;
       if (collectAssistantReplyTexts().length > baselineCount) return true;
       const curText = readComposerCurrentText(inputEl);
@@ -917,12 +1313,14 @@
     await nextAnimationFrame();
     let sendBtn = null;
     for (let i = 0; i < 12; i += 1) {
+      assertJobActive(job);
       sendBtn = findSendButton(inputEl);
       if (sendBtn) break;
       await sleep(80);
     }
 
     // Step A: Primary click or Enter keydown
+    assertJobActive(job);
     let method = "enter_keypress";
     if (sendBtn) {
       sendBtn.click();
@@ -933,27 +1331,29 @@
 
     for (let i = 0; i < 6; i += 1) {
       await sleep(90);
+      assertJobActive(job);
       if (hasSubmissionStarted()) {
         return method;
       }
     }
 
-    // Step B: Realistic pointer/mouse click sequence + form requestSubmit + Enter keydown
+    // Try one submission method at a time, then wait for acknowledgement.
     sendBtn = findSendButton(inputEl) || sendBtn;
     if (sendBtn) {
       dispatchRealisticClick(sendBtn);
       method = "realistic_button_click";
-    }
-    try {
+    } else {
       const form = inputEl.closest ? inputEl.closest("form") : null;
       if (form && typeof form.requestSubmit === "function") {
         form.requestSubmit();
+      } else {
+        dispatchEnterKeySequence(inputEl);
       }
-    } catch (_) {}
-    dispatchEnterKeySequence(inputEl);
+    }
 
     for (let i = 0; i < 7; i += 1) {
       await sleep(95);
+      assertJobActive(job);
       if (hasSubmissionStarted()) {
         return method;
       }
@@ -963,6 +1363,8 @@
     logDriver("warn", "检测到后台/并行标签页首次提交未触发，正在短暂激活标签页以完成发送...");
     await requestBriefTabActivation(240);
     await sleep(180);
+    assertJobActive(job);
+    if (hasSubmissionStarted()) return method;
 
     const activeInput = findComposerInput() || inputEl;
     if (!readComposerCurrentText(activeInput) && !hasSubmissionStarted()) {
@@ -970,6 +1372,7 @@
       await sleep(100);
     }
     const healedBtn = findSendButton(activeInput);
+    assertJobActive(job);
     if (healedBtn) {
       dispatchRealisticClick(healedBtn);
       method = "tab_activated_button_click";
@@ -980,11 +1383,12 @@
 
     for (let i = 0; i < 8; i += 1) {
       await sleep(100);
+      assertJobActive(job);
       if (hasSubmissionStarted()) {
-        break;
+        return method;
       }
     }
-    return method;
+    throw new Error("网页未确认发送成功，已停止重复提交，请重试。");
   }
 
   // =========================================================================
@@ -1120,10 +1524,11 @@
   function getComposerRootHost(inputEl) {
     let cur = inputEl;
     let best = null;
-    for (let i = 0; i < 10 && cur; i += 1) {
+    for (let i = 0; i < 20 && cur; i += 1) {
       const tag = (cur.tagName || "").toLowerCase();
       if (
         tag.includes("search-box") ||
+        tag.includes("search-bar") ||
         tag.includes("composer") ||
         tag.includes("chat-input") ||
         tag.includes("prompt-box")
@@ -1953,6 +2358,7 @@
   const ASSISTANT_CONTAINER_SELECTORS = [
     "ucs-summary",
     "ucs-markdown",
+    "ucs-response-markdown",
     "ucs-turn-answer",
     "ucs-response",
     "message-content",
@@ -1967,10 +2373,11 @@
     if (!el) {
       return "";
     }
-    const text = (el.innerText || el.textContent || "").trim();
-    return text
-      .replace(/\n{3,}/g, "\n\n")
-      .trim();
+    const documents = querySelectorAllDeep(".markdown-document", el);
+    let text = (documents.length
+      ? documents.map(node => node.innerText || node.textContent || "").join("\n\n")
+      : (el.innerText || el.textContent || "")).trim();
+    return text.replace(/\n{3,}/g, "\n\n").trim();
   }
 
   function containsDeep(ancestor, descendant) {
@@ -2010,17 +2417,32 @@
       .filter((txt) => txt.length > 0);
   }
 
-  function isPageStillGenerating() {
-    const stopBtns = querySelectorAllDeep(
+  function findGenerationStopButton() {
+    return querySelectorAllDeep(
       'button, md-icon-button, md-filled-icon-button, ucs-icon-button, [role="button"]'
-    ).filter((btn) => {
+    ).find((btn) => {
       if (!isElementVisible(btn)) return false;
       const label = readButtonIconAndLabelText(btn);
       return /\b(stop generating|stop response|cancel generation|stop_circle|stop_generating|^stop$)\b|停止生成|停止回答|停止/i.test(
         label.trim()
       );
     });
-    if (stopBtns.length > 0) {
+  }
+
+  function stopJob(job) {
+    job.cancelled = true;
+    if (job.cancelStream) job.cancelStream();
+    const stopButton = findGenerationStopButton();
+    if (stopButton) stopButton.click();
+  }
+
+  function assertJobActive(job) {
+    if (job && job.cancelled) throw new Error("任务已取消。");
+    if (job && job.networkError) throw new Error(job.networkError);
+  }
+
+  function isPageStillGenerating() {
+    if (findGenerationStopButton()) {
       return true;
     }
     const spinners = querySelectorAllDeep(
@@ -2030,116 +2452,594 @@
   }
 
   // =========================================================================
-  // 4. Optional Direct In-Page Fetch Replay Engine
+  // 4. Composer tools and generated artifacts
   // =========================================================================
 
-  async function tryDirectFetchReplay(promptText, job, timeoutMs) {
-    const rpc = sharedState.lastCapturedRpc;
-    if (!rpc || !rpc.bodyText) {
-      throw new Error("尚未捕获到网页对话 RPC 请求模板，请先使用 auto 模式发送一条消息。");
+  async function selectComposerTool(toolPattern, errorMissingTrigger, errorMissingTool) {
+    const alreadyActive = querySelectorAllDeep('button, md-filter-chip, mat-chip, [role="button"]').some((el) => {
+      if (!isElementVisible(el)) return false;
+      const label = readButtonIconAndLabelText(el);
+      return toolPattern.test(label) && (/close|cancel|remove|selected|active|已选/i.test(label) || el.getAttribute("aria-pressed") === "true");
+    });
+    if (alreadyActive) return;
+    const trigger = querySelectorAllDeep('button, md-icon-button, ucs-icon-button, [role="button"]').find((el) => {
+      if (!isElementVisible(el)) return false;
+      const aria = `${el.getAttribute("aria-label") || ""} ${el.getAttribute("title") || ""} ${getElementTooltipOrLabel(el)}`.trim();
+      return /\b(select tools|tools)\b|选择工具|工具/i.test(aria);
+    });
+    if (!trigger) throw new Error(errorMissingTrigger);
+    trigger.click();
+    await sleep(220);
+    let item = querySelectorAllDeep('[role="menuitem"],[role="menuitemcheckbox"],[role="option"],md-menu-item,button,span,div').find((el) =>
+      toolPattern.test(stripIconLigatures(String(el.textContent || "").trim())) && isElementVisible(el));
+    if (!item) {
+      dispatchRealisticClick(trigger);
+      await sleep(250);
+      item = querySelectorAllDeep('[role="menuitem"],[role="menuitemcheckbox"],[role="option"],md-menu-item,button,span,div').find((el) =>
+        toolPattern.test(stripIconLigatures(String(el.textContent || "").trim())) && isElementVisible(el));
     }
-
-    let parsedBody;
-    try {
-      parsedBody = JSON.parse(rpc.bodyText);
-    } catch (_) {
-      throw new Error("捕获的 RPC 请求体不是可直接替换的 JSON 格式，请切换回 auto 模式。");
+    if (!item) {
+      await dismissTransientOverlays(null);
+      throw new Error(errorMissingTool);
     }
-
-    let replaced = false;
-    function replaceQueryField(obj) {
-      if (!obj || typeof obj !== "object" || replaced) return;
-      if (obj.query && typeof obj.query.text === "string") {
-        obj.query.text = promptText;
-        replaced = true;
-        return;
-      }
-      if (Array.isArray(obj.queryParts)) {
-        obj.queryParts = [{ text: promptText }];
-        replaced = true;
-        return;
-      }
-      for (const k of Object.keys(obj)) {
-        if (typeof obj[k] === "object") {
-          replaceQueryField(obj[k]);
-        }
-      }
-    }
-    replaceQueryField(parsedBody);
-
-    if (!replaced) {
-      throw new Error("未能在 RPC 模板中定位 query.text 字段，自动回退至 DOM 模式。");
-    }
-
-    const controller = new AbortController();
-    const timer = setTimeout(() => controller.abort(), timeoutMs);
-    try {
-      const res = await nativeFetch(rpc.url, {
-        method: rpc.method || "POST",
-        headers: rpc.headers,
-        body: JSON.stringify(parsedBody),
-        credentials: "include",
-        signal: controller.signal
-      });
-      if (!res.ok || !res.body) {
-        throw new Error("Replay HTTP " + res.status);
-      }
-      await consumeRpcReadableStream(res.body, job);
-      if (!job.networkText.trim()) {
-        throw new Error("Replay 返回内容为空");
-      }
-      return job.networkText;
-    } finally {
-      clearTimeout(timer);
-    }
+    item.click();
+    await sleep(250);
   }
 
-  // =========================================================================
-  // 5. Unified Prompt Execution Orchestrator
-  // =========================================================================
+  async function selectImageGenerationTool() {
+    await selectComposerTool(
+      /^(create images|generate images|image generation|生成图片|创建图片)$/i,
+      "网页没有可用的生图工具入口。",
+      "当前账号没有 Create images 工具。"
+    );
+  }
+
+  async function selectVideoGenerationTool() {
+    await selectComposerTool(
+      /^(create videos?|generate videos?|video generation|生成视频|创建视频)$/i,
+      "网页没有可用的视频生成工具入口。",
+      "当前账号没有 Create videos 工具。"
+    );
+  }
+
+  function isAllowedArtifactUrl(rawSrc) {
+    try {
+      const url = new URL(rawSrc, location.href);
+      if (['blob:', 'data:'].includes(url.protocol)) return true;
+      if (url.origin === location.origin) return true;
+      if (/(^|\.)(googleusercontent|googleapis|gstatic|cloud\.google)\.com$/i.test(url.hostname)) return true;
+    } catch (_) {}
+    return false;
+  }
+
+  const B64_ALPHABET = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+
+  function encodeBytesBase64(bytes) {
+    if (typeof btoa === "function") {
+      const parts = [];
+      for (let i = 0; i < bytes.length; i += 0x8000) {
+        parts.push(String.fromCharCode.apply(null, bytes.subarray(i, i + 0x8000)));
+      }
+      return btoa(parts.join(""));
+    }
+    let out = "";
+    for (let i = 0; i < bytes.length; i += 3) {
+      const b0 = bytes[i];
+      const b1 = i + 1 < bytes.length ? bytes[i + 1] : 0;
+      const b2 = i + 2 < bytes.length ? bytes[i + 2] : 0;
+      const trip = (b0 << 16) | (b1 << 8) | b2;
+      out += B64_ALPHABET[(trip >> 18) & 63];
+      out += B64_ALPHABET[(trip >> 12) & 63];
+      out += i + 1 < bytes.length ? B64_ALPHABET[(trip >> 6) & 63] : "=";
+      out += i + 2 < bytes.length ? B64_ALPHABET[trip & 63] : "=";
+    }
+    return out;
+  }
+
+  function decodeBase64Bytes(b64) {
+    let clean = String(b64 || "").trim().replace(/-/g, "+").replace(/_/g, "/").replace(/[^A-Za-z0-9+/=]/g, "");
+    const rem = clean.replace(/=+$/, "").length % 4;
+    if (rem === 1) throw new Error("附件 base64 内容无效。");
+    clean = clean.replace(/=+$/, "") + (rem === 2 ? "==" : rem === 3 ? "=" : "");
+    if (typeof atob === "function") {
+      const bin = atob(clean);
+      const bytes = new Uint8Array(bin.length);
+      for (let i = 0; i < bin.length; i += 1) bytes[i] = bin.charCodeAt(i);
+      return bytes;
+    }
+    const lookup = new Int16Array(256).fill(-1);
+    for (let i = 0; i < B64_ALPHABET.length; i += 1) lookup[B64_ALPHABET.charCodeAt(i)] = i;
+    const pad = clean.endsWith("==") ? 2 : clean.endsWith("=") ? 1 : 0;
+    const outLen = Math.max(0, Math.floor((clean.length * 3) / 4) - pad);
+    const out = new Uint8Array(outLen);
+    let pos = 0;
+    for (let i = 0; i < clean.length; i += 4) {
+      const c0 = lookup[clean.charCodeAt(i)];
+      const c1 = lookup[clean.charCodeAt(i + 1)];
+      const c2 = clean[i + 2] === "=" ? 0 : lookup[clean.charCodeAt(i + 2)];
+      const c3 = clean[i + 3] === "=" ? 0 : lookup[clean.charCodeAt(i + 3)];
+      if (c0 < 0 || c1 < 0 || c2 < 0 || c3 < 0) throw new Error("附件 base64 内容无效。");
+      const trip = (c0 << 18) | (c1 << 12) | (c2 << 6) | c3;
+      if (pos < outLen) out[pos++] = (trip >> 16) & 255;
+      if (pos < outLen) out[pos++] = (trip >> 8) & 255;
+      if (pos < outLen) out[pos++] = trip & 255;
+    }
+    return out;
+  }
+
+  function blobToDataUrl(blob) {
+    if (typeof FileReader === "function") {
+      return new Promise((resolve, reject) => {
+        const reader = new FileReader();
+        reader.onload = () => resolve(reader.result);
+        reader.onerror = () => reject(new Error("无法读取媒体文件。"));
+        reader.readAsDataURL(blob);
+      });
+    }
+    return blob.arrayBuffer().then((buf) => {
+      const b64 = encodeBytesBase64(new Uint8Array(buf));
+      return `data:${blob.type || "application/octet-stream"};base64,${b64}`;
+    });
+  }
+
+  function normalizeMimeType(rawMime, defaultMime = "application/octet-stream") {
+    const cleaned = String(rawMime || "").split(";")[0].split(",")[0].trim();
+    return cleaned && cleaned.includes("/") ? cleaned : defaultMime;
+  }
+
+  function dataUrlToFile(dataUrl, fallbackName, fallbackMime) {
+    const raw = String(dataUrl || "").trim();
+    if (!raw || /^(?:https?|blob|file):/i.test(raw)) {
+      throw new Error("附件内容格式无效（需要 base64 data URL）。");
+    }
+    let headerMime = "";
+    let bytes;
+    if (/^data:/i.test(raw)) {
+      const commaIdx = raw.indexOf(",");
+      if (commaIdx < 0) {
+        throw new Error("附件内容格式无效（需要 base64 data URL）。");
+      }
+      const header = raw.slice(5, commaIdx);
+      const parts = header.split(";").map((s) => s.trim()).filter(Boolean);
+      const isBase64 = parts.some((p) => p.toLowerCase() === "base64");
+      if (parts.length > 0 && parts[0].toLowerCase() !== "base64") {
+        headerMime = parts[0];
+      }
+      const body = raw.slice(commaIdx + 1);
+      if (isBase64) {
+        bytes = decodeBase64Bytes(body);
+      } else {
+        let decodedText = body;
+        try {
+          decodedText = decodeURIComponent(body);
+        } catch (_) {}
+        if (typeof TextEncoder === "function") {
+          bytes = new TextEncoder().encode(decodedText);
+        } else {
+          const utf8 = unescape(encodeURIComponent(decodedText));
+          bytes = new Uint8Array(utf8.length);
+          for (let i = 0; i < utf8.length; i += 1) bytes[i] = utf8.charCodeAt(i);
+        }
+      }
+    } else {
+      const compact = raw.replace(/\s+/g, "");
+      if (!compact || /[^A-Za-z0-9+/=_-]/.test(compact) || compact.replace(/=+$/, "").length % 4 === 1) {
+        throw new Error("附件内容格式无效（需要 base64 data URL）。");
+      }
+      bytes = decodeBase64Bytes(compact);
+    }
+    const mime = normalizeMimeType(fallbackMime || headerMime, "application/octet-stream");
+    return new File([bytes], fallbackName || "attachment.bin", { type: mime });
+  }
+
+  function generatedImageNodes(baseline) {
+    return querySelectorAllDeep('img').filter((img) => img.complete && img.naturalWidth >= 128 &&
+      img.naturalHeight >= 128 && !/^https:\/\/www\.gstatic\.com\/vertexaisearch\/images\//i.test(img.currentSrc || img.src) &&
+      !baseline.has(img.currentSrc || img.src) && isElementVisible(img));
+  }
+
+  async function readGeneratedImages(nodes) {
+    const images = [];
+    const seen = new Set();
+    for (const img of nodes) {
+      const src = img.currentSrc || img.src;
+      if (!src || seen.has(src) || !isAllowedArtifactUrl(src)) continue;
+      seen.add(src);
+      let dataUrl = "";
+      let mime = "image/png";
+      if (src.startsWith("data:image/")) {
+        dataUrl = src;
+        mime = src.slice(5).split(";")[0] || "image/png";
+      } else {
+        const response = await nativeFetch(src, { credentials: "include" });
+        if (!response.ok) throw new Error("生成图片下载失败：HTTP " + response.status);
+        const blob = await response.blob();
+        if (!/^image\/(png|jpeg|webp|gif|bmp|svg\+xml|avif)$/i.test(blob.type) || blob.size === 0 || blob.size > 20 * 1024 * 1024) continue;
+        mime = blob.type;
+        dataUrl = await blobToDataUrl(blob);
+      }
+      images.push({ data_url: dataUrl, mime_type: mime, width: img.naturalWidth, height: img.naturalHeight });
+      if (images.length >= 6) break;
+    }
+    return images;
+  }
+
+  function collectMediaAndDownloadCandidates(baselineMedia, baselineLinks) {
+    const candidates = [];
+    for (const el of querySelectorAllDeep('video, audio')) {
+      if (!isElementVisible(el) && el.tagName.toLowerCase() !== 'audio') continue;
+      const src = el.currentSrc || el.src || (el.querySelector && el.querySelector('source') ? el.querySelector('source').src : "");
+      if (src && !baselineMedia.has(src)) {
+        const kind = el.tagName.toLowerCase();
+        candidates.push({ url: src, name: `generated-${kind}.${kind === 'video' ? 'mp4' : 'wav'}`, category: kind });
+      }
+    }
+    for (const a of querySelectorAllDeep('a[download], a[href^="blob:"], a[href^="data:"]')) {
+      if (!isElementVisible(a)) continue;
+      const href = a.href || a.getAttribute("href") || "";
+      if (!href || baselineLinks.has(href)) continue;
+      const dlName = (a.getAttribute("download") || a.textContent || "").trim().slice(0, 100) || "generated-file";
+      candidates.push({ url: href, name: dlName, category: "file" });
+    }
+    return candidates;
+  }
+
+  async function readGeneratedFiles(candidates) {
+    const out = [];
+    const seen = new Set();
+    for (const item of candidates) {
+      if (!item.url || seen.has(item.url) || !isAllowedArtifactUrl(item.url)) continue;
+      seen.add(item.url);
+      try {
+        if (item.url.startsWith("data:")) {
+          const mime = item.url.slice(5).split(";")[0] || "application/octet-stream";
+          out.push({ data_url: item.url, mime_type: mime, name: item.name });
+        } else {
+          const response = await nativeFetch(item.url, { credentials: "include" });
+          if (!response.ok) continue;
+          const blob = await response.blob();
+          if (!blob || blob.size === 0 || blob.size > 80 * 1024 * 1024) continue;
+          if (/^text\/html/i.test(blob.type) && item.category !== "file") continue;
+          const dataUrl = await blobToDataUrl(blob);
+          out.push({ data_url: dataUrl, mime_type: blob.type || "application/octet-stream", name: item.name });
+        }
+      } catch (_) {}
+      if (out.length >= 6) break;
+    }
+    return out;
+  }
+
+  const mainAttachmentReassembly = new Map();
+
+  function findSuitableFileInput(files) {
+    const inputs = querySelectorAllDeep('input[type="file"]').filter((el) => !el.disabled);
+    if (inputs.length === 0) return null;
+    const needsNonImage = files.some((f) => !String(f.type || "").startsWith("image/"));
+    if (!needsNonImage) return inputs[0];
+    const unrestricted = inputs.find((el) => {
+      const accept = String(el.getAttribute("accept") || "").trim().toLowerCase();
+      return !accept || accept.includes("*/*") || accept.includes("pdf") || !/^image\/\*$/.test(accept);
+    });
+    return unrestricted || inputs[0];
+  }
+
+  function composerAttachmentControls() {
+    const composer = findComposerInput();
+    const scope = composer && getComposerRootHost(composer);
+    if (!scope) return [];
+    // Remove controls are transparent until hovered; their existence still identifies a file.
+    const controls = querySelectorAllDeep('button, md-icon-button, ucs-icon-button, [role="button"]', scope).filter((el) =>
+      /remove file|remove attachment|delete file|delete attachment|cancel upload|删除附件|移除文件|移除附件/i.test(readButtonIconAndLabelText(el)));
+    // Material wrappers and their shadow buttons represent the same attachment.
+    return controls.filter((el) => !controls.some((other) => other !== el && containsDeep(other, el)));
+  }
+
+  function buildFileDataTransfer(files) {
+    if (typeof DataTransfer === "function") {
+      const transfer = new DataTransfer();
+      for (const file of files) transfer.items.add(file);
+      return transfer;
+    }
+    const fileList = files.slice();
+    fileList.item = (idx) => fileList[idx] || null;
+    return {
+      dropEffect: "copy",
+      effectAllowed: "all",
+      files: fileList,
+      items: files.map((f) => ({ kind: "file", type: f.type || "application/octet-stream", getAsFile: () => f })),
+      types: ["Files"],
+      getData: () => ""
+    };
+  }
+
+  function dispatchClipboardPasteAndDropFiles(targetInput, composerHost, files) {
+    const dt = buildFileDataTransfer(files);
+    const pasteTarget = targetInput || composerHost || document.body;
+    let sent = false;
+    if (pasteTarget) {
+      try {
+        if (typeof pasteTarget.focus === "function") pasteTarget.focus();
+      } catch (_) {}
+      try {
+        let pasteEv;
+        if (typeof ClipboardEvent === "function") {
+          pasteEv = new ClipboardEvent("paste", {
+            bubbles: true,
+            composed: true,
+            cancelable: true,
+            clipboardData: dt
+          });
+        } else {
+          pasteEv = new Event("paste", { bubbles: true, composed: true, cancelable: true });
+        }
+        if (!pasteEv.clipboardData) {
+          try {
+            Object.defineProperty(pasteEv, "clipboardData", { value: dt, configurable: true });
+          } catch (_) {}
+        }
+        pasteTarget.dispatchEvent(pasteEv);
+        sent = true;
+      } catch (_) {}
+    }
+    const dropTarget = composerHost || pasteTarget;
+    if (dropTarget) {
+      try {
+        for (const evType of ["dragenter", "dragover", "drop"]) {
+          let dragEv;
+          if (typeof DragEvent === "function") {
+            dragEv = new DragEvent(evType, {
+              bubbles: true,
+              composed: true,
+              cancelable: true,
+              dataTransfer: dt
+            });
+          } else {
+            dragEv = new Event(evType, { bubbles: true, composed: true, cancelable: true });
+          }
+          if (!dragEv.dataTransfer) {
+            try {
+              Object.defineProperty(dragEv, "dataTransfer", { value: dt, configurable: true });
+            } catch (_) {}
+          }
+          dropTarget.dispatchEvent(dragEv);
+        }
+        sent = true;
+      } catch (_) {}
+    }
+    return sent;
+  }
+
+  async function attachFilesToComposer(attachments, onProgress = null) {
+    if (composerAttachmentControls().length) {
+      throw new Error("输入框中残留了前次未提交的附件，已停止发送，避免把错误文件带入当前请求。");
+    }
+    if (!attachments || attachments.length === 0) return;
+    const files = [];
+    for (const att of attachments) {
+      const cleanMime = normalizeMimeType(att && att.mime_type, "application/octet-stream");
+      let dataUrl = String((att && att.data_url) || "").trim();
+      const chunkKey = (att && att.chunked_att_key) || (att && att.total_chunks && (att.id || att.attachment_id)) || "";
+      if (!dataUrl && chunkKey && mainAttachmentReassembly.has(chunkKey)) {
+        const entry = mainAttachmentReassembly.get(chunkKey);
+        mainAttachmentReassembly.delete(chunkKey);
+        const total = att.total_chunks || (entry ? entry.total : 0);
+        dataUrl = assembleChunks(entry, total);
+      }
+      if (!dataUrl) {
+        const rawB64 = (att && (att.data_b64 || att.b64_json || att.file_data || att.data)) || "";
+        if (typeof rawB64 === "string" && rawB64.trim().length > 0) {
+          dataUrl = /^data:/i.test(rawB64.trim())
+            ? rawB64.trim()
+            : `data:${cleanMime};base64,${rawB64.replace(/\s+/g, "")}`;
+        }
+      }
+      files.push(dataUrlToFile(dataUrl, (att && (att.name || att.filename)) || "attachment.bin", cleanMime));
+    }
+
+    const composerInputForScope = findComposerInput();
+    const composerScope = (composerInputForScope && getComposerRootHost(composerInputForScope)) || document;
+    const readComposerScopedText = () =>
+      querySelectorAllDeep('*', composerScope)
+        .map((el) => (el.shadowRoot ? "" : (el.textContent || "")))
+        .join("\n");
+    const baselineScopedText = readComposerScopedText();
+    const baselineControlCount = composerAttachmentControls().length;
+
+    let input = findSuitableFileInput(files);
+    if (!input) {
+      const composerInput = findComposerInput();
+      const composerHost = composerInput ? getComposerRootHost(composerInput) : null;
+      const addButton = querySelectorAllDeep('button, md-icon-button, ucs-icon-button, [role="button"]').find((el) => {
+        if (!isElementVisible(el) || el.disabled) return false;
+        const meta = `${el.getAttribute("aria-label") || ""} ${el.getAttribute("title") || ""} ${getElementTooltipOrLabel(el)} ${readButtonIconAndLabelText(el)}`;
+        if (/\b(add files|add files or sources|attach|upload files|add_circle|attach_file|paperclip)\b|添加文件|添加来源|上传文件|上传附件|附件/i.test(meta)) {
+          return true;
+        }
+        return Boolean(composerHost && containsDeep(composerHost, el) && /^\s*(add|\+|＋|attach_file)\s*$/i.test((el.textContent || "").trim()));
+      });
+      if (addButton) {
+        // Intercept HTMLInputElement.prototype.click so clicking 'Upload files' captures detached file inputs without opening OS dialog!
+        const hasInputProto =
+          typeof HTMLInputElement !== "undefined" &&
+          HTMLInputElement.prototype &&
+          typeof HTMLInputElement.prototype.click === "function";
+        const origInputClick = hasInputProto ? HTMLInputElement.prototype.click : null;
+        let interceptedFileInput = null;
+        if (hasInputProto) {
+          HTMLInputElement.prototype.click = function (...clickArgs) {
+            if (this && String(this.type || "").toLowerCase() === "file") {
+              interceptedFileInput = this;
+              return undefined;
+            }
+            return origInputClick.apply(this, clickArgs);
+          };
+        }
+        try {
+          addButton.click();
+          await sleep(220);
+          input = interceptedFileInput || findSuitableFileInput(files);
+          if (!input) {
+            const upload = querySelectorAllDeep('[role="menuitem"],md-menu-item,mat-menu-item,button,span,div').find((el) =>
+              /^(upload files?|upload from computer|from your computer|upload|from computer|local files?|choose files?|上传文件|从电脑上传|从设备上传|本地上传|本地文件)$/i.test(stripIconLigatures(String(el.textContent || "").trim())) && isElementVisible(el));
+            if (upload) {
+              upload.click();
+              await sleep(150);
+              if (!interceptedFileInput && isElementVisible(upload)) {
+                dispatchRealisticClick(upload);
+                await sleep(150);
+              }
+            }
+          }
+          input = interceptedFileInput || findSuitableFileInput(files);
+          for (let attempt = 0; attempt < 15 && !input; attempt += 1) {
+            await sleep(150);
+            input = interceptedFileInput || findSuitableFileInput(files);
+          }
+        } finally {
+          if (hasInputProto && origInputClick) {
+            HTMLInputElement.prototype.click = origInputClick;
+          }
+        }
+        await dismissTransientOverlays(null);
+      }
+    }
+
+    let usedClipboardFallback = false;
+    if (input) {
+      const transfer = buildFileDataTransfer(files);
+      try {
+        const desc =
+          typeof HTMLInputElement !== "undefined" && HTMLInputElement.prototype
+            ? Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, "files")
+            : null;
+        if (desc && typeof desc.set === "function") {
+          desc.set.call(input, transfer.files);
+        } else {
+          input.files = transfer.files;
+        }
+      } catch (_) {
+        input.files = transfer.files;
+      }
+      input.dispatchEvent(new Event("change", { bubbles: true, composed: true }));
+      input.dispatchEvent(new Event("input", { bubbles: true, composed: true }));
+    } else {
+      const liveComposer = findComposerInput();
+      const hostEl = liveComposer ? getComposerRootHost(liveComposer) : null;
+      if (!dispatchClipboardPasteAndDropFiles(liveComposer, hostEl, files)) {
+        throw new Error("没有找到网页的文件输入框或可粘贴输入区，附件未上传。");
+      }
+      usedClipboardFallback = true;
+      logDriver("info", `未发现显式 file input，已通过剪贴板粘贴/拖放直接向网页注入 ${files.length} 个文件。`);
+    }
+
+    const startedAt = Date.now();
+    let lastKeepalive = startedAt;
+    let sawUploadActivity = false;
+    let readySince = 0;
+    while (Date.now() - startedAt < 120000) {
+      await sleep(350);
+      if (onProgress && Date.now() - lastKeepalive >= 7500) {
+        lastKeepalive = Date.now();
+        onProgress();
+      }
+      const scopedText = readComposerScopedText();
+      const errors = querySelectorAllDeep('[role="alert"], .mat-mdc-snack-bar-label, md-dialog').map((el) => el.textContent || "").join(" ");
+      if (/failed|unsupported|too large|cannot upload|not supported|exceeds|无法上传|上传失败|不支持|超过限制|过大/i.test(errors)) {
+        throw new Error("网页拒绝附件：" + errors.trim().slice(0, 240));
+      }
+      const pending = querySelectorAllDeep('[role="progressbar"],[aria-busy="true"],md-circular-progress,mat-progress-spinner,mat-spinner', composerScope).some(isElementVisible);
+      if (pending) sawUploadActivity = true;
+      const curControlCount = composerAttachmentControls().length;
+      if (curControlCount > baselineControlCount) sawUploadActivity = true;
+      const chipAppeared = curControlCount === files.length ||
+        (new Set(files.map((file) => file.name)).size === files.length &&
+         files.every((file) => !baselineScopedText.includes(file.name) && scopedText.includes(file.name)));
+      if (chipAppeared) sawUploadActivity = true;
+      if (!sawUploadActivity && !pending && !usedClipboardFallback && Date.now() - startedAt > 2800) {
+        usedClipboardFallback = true;
+        const liveComposer = findComposerInput();
+        const hostEl = liveComposer ? getComposerRootHost(liveComposer) : null;
+        dispatchClipboardPasteAndDropFiles(liveComposer, hostEl, files);
+        logDriver("info", `file input 未触发上传反馈，已自动切换剪贴板粘贴/拖拽直传 (${files.map((f) => f.name).join(", ")})...`);
+      }
+      readySince = chipAppeared && !pending ? (readySince || Date.now()) : 0;
+      if (readySince && Date.now() - readySince >= 1200) {
+        logDriver("info", `已上传 ${files.length} 个多模态附件 (${files.map((f) => f.name).join(", ")})。`);
+        return;
+      }
+      if (!sawUploadActivity && !pending && Date.now() - startedAt > 25000) {
+        throw new Error(`网页未响应附件上传 (${files.map((f) => f.name).join(", ")})，该文件格式可能不受当前网页输入框支持。`);
+      }
+    }
+    throw new Error("附件上传在时限内未完成，已停止发送，避免模型在缺失附件的情况下回答。");
+  }
+
+  const attachImagesToComposer = attachFilesToComposer;
 
   const REPLY_POSTMSG_CHUNK_THRESHOLD = 32768;
   const REPLY_POSTMSG_CHUNK_SIZE = 24576;
+  function assembleChunks(entry, total) {
+    if (!entry || !Number.isInteger(total) || total < 1 || total > 10000 || entry.total !== total || entry.parts.length !== total) {
+      throw new Error("传输分段缺失或数量不一致，已停止处理不完整内容。");
+    }
+    const parts = Array.from({length: total}, (_, index) => entry.parts[index]);
+    if (parts.some(part => typeof part !== "string")) {
+      throw new Error("传输分段缺失，已停止处理不完整内容。");
+    }
+    return parts.join("");
+  }
+
   const mainPromptReassembly = new Map();
 
   function emitRequestComplete(payload) {
-    const fullReply = String(payload.reply || "");
+    const enrichedPayload = {
+      ...payload,
+      tab_url:
+        payload.tab_url ||
+        (typeof window !== "undefined" && window.location ? String(window.location.href || "") : ""),
+      tab_title:
+        payload.tab_title ||
+        (typeof document !== "undefined" ? String(document.title || "") : "")
+    };
+    const fullReply = String(enrichedPayload.reply || "");
     if (fullReply.length > REPLY_POSTMSG_CHUNK_THRESHOLD) {
       const total = Math.ceil(fullReply.length / REPLY_POSTMSG_CHUNK_SIZE);
       for (let i = 0; i < total; i += 1) {
         emitToIsolated({
           type: "reply_chunk",
-          request_id: payload.request_id,
+          request_id: enrichedPayload.request_id,
           chunk_index: i,
           total_chunks: total,
           data: fullReply.slice(i * REPLY_POSTMSG_CHUNK_SIZE, (i + 1) * REPLY_POSTMSG_CHUNK_SIZE)
         });
       }
       emitToIsolated({
-        ...payload,
+        ...enrichedPayload,
         reply: "",
         chunked: true,
         total_chunks: total
       });
       return;
     }
-    emitToIsolated(payload);
+    emitToIsolated(enrichedPayload);
   }
 
   async function executePromptJob({
     request_id: requestId,
     prompt,
+    attachments,
+    image_generation: imageGeneration,
+    video_generation: videoGeneration,
     callback_url: callbackUrl,
     target_model: targetModel,
     reset_chat: resetChat,
     timeout_ms: timeoutMs
   }) {
+    const mediaGenerationMode = Boolean(imageGeneration || videoGeneration);
     if (activeJob && !activeJob.cancelled) {
-      activeJob.cancelled = true;
+      stopJob(activeJob);
     }
 
-    let domEmittedLen = 0;
-    let usingNetworkStream = false;
     let resolveNetworkComplete;
     const networkCompletePromise = new Promise((resolve) => {
       resolveNetworkComplete = resolve;
@@ -2150,12 +3050,14 @@
     const job = {
       requestId,
       cancelled: false,
+      awaitingRpc: false,
+      primaryStreamToken: null,
+      activeStreams: new Set(),
       networkText: "",
       citations: [],
       networkDone: false,
       onNetworkDelta(delta) {
-        if (job.cancelled || !delta) return;
-        usingNetworkStream = true;
+        if (job.cancelled || job.completed || !delta) return;
         lastActivityAt = Date.now();
         emitToIsolated({
           type: "stream_chunk",
@@ -2169,6 +3071,11 @@
       }
     };
     activeJob = job;
+    let chatWasReset = false;
+    let promptSubmitted = false;
+    let filledInputInThisJob = false;
+    let composerEl = null;
+    let hadPreexistingAttachments = false;
 
     try {
       if (!String(prompt || "").trim()) {
@@ -2177,6 +3084,13 @@
 
       if (resetChat) {
         await triggerNewChatSession();
+        chatWasReset = true;
+      } else if (isPageStillGenerating()) {
+        const lingeringStop = findGenerationStopButton();
+        if (lingeringStop) lingeringStop.click();
+        for (let waitIdx = 0; waitIdx < 16 && isPageStillGenerating(); waitIdx += 1) {
+          await sleep(200);
+        }
       }
 
       // Wait for composer to mount before model switching (important right after New Chat!)
@@ -2188,26 +3102,7 @@
       if (targetModel) {
         await ensureWebModelSelected(targetModel);
       }
-
-      // Optional Replay path if explicitly selected
-      if (driverConfig.driverMode === "replay" && sharedState.lastCapturedRpc) {
-        try {
-          const replayReply = await tryDirectFetchReplay(prompt, job, timeoutMs || 180000);
-          emitRequestComplete({
-            type: "request_complete",
-            request_id: requestId,
-            reply: replayReply,
-            callback_url: callbackUrl || "",
-            citations: job.citations,
-            source: "fetch_replay",
-            captured_rpc: Boolean(sharedState.lastCapturedRpc),
-            active_model: readDetectedWebModel() || sharedState.lastSelectedModel
-          });
-          return;
-        } catch (replayErr) {
-          logDriver("warn", "Replay 回退至 DOM 混合驱动: " + replayErr.message);
-        }
-      }
+      assertJobActive(job);
 
       // Re-acquire input box AFTER model switch in case composer re-rendered
       let inputEl = null;
@@ -2223,25 +3118,80 @@
         );
       }
 
+      if (imageGeneration) await selectImageGenerationTool();
+      if (videoGeneration) await selectVideoGenerationTool();
+      const baselineImageSources = new Set(querySelectorAllDeep("img").map((img) => img.currentSrc || img.src).filter(Boolean));
+      const baselineMediaSources = new Set(querySelectorAllDeep("video, audio, source").map((m) => m.currentSrc || m.src).filter(Boolean));
+      const baselineDownloadLinks = new Set(querySelectorAllDeep('a[download], a[href^="blob:"], a[href^="data:"]').map((a) => a.href || a.getAttribute("href")).filter(Boolean));
       const baselineReplies = collectAssistantReplyTexts();
       const baselineCount = baselineReplies.length;
       const baselineLastText = baselineCount > 0 ? baselineReplies[baselineCount - 1] : "";
+      hadPreexistingAttachments = composerAttachmentControls().length > 0;
 
+      await attachFilesToComposer(attachments, () => {
+        lastActivityAt = Date.now();
+        emitToIsolated({ type: "request_progress", request_id: requestId, generating: true, submitted: false, tab_reset: chatWasReset, dom_len: 0, net_len: 0 });
+      });
+      assertJobActive(job);
+      for (const img of querySelectorAllDeep("img")) {
+        const s = img.currentSrc || img.src;
+        if (s) baselineImageSources.add(s);
+      }
+      for (const m of querySelectorAllDeep("video, audio, source")) {
+        const s = m.currentSrc || m.src;
+        if (s) baselineMediaSources.add(s);
+      }
+
+      const collectNewTurnArtifacts = async (allowBriefWait = false) => {
+        if (allowBriefWait) {
+          const hasPendingImg = querySelectorAllDeep("img").some(
+            (img) => !baselineImageSources.has(img.currentSrc || img.src) && !img.complete && isElementVisible(img)
+          );
+          if (hasPendingImg) await sleep(600);
+        }
+        const imgNodes = generatedImageNodes(baselineImageSources);
+        const fileCandidates = collectMediaAndDownloadCandidates(baselineMediaSources, baselineDownloadLinks);
+        const outImages = imgNodes.length > 0 ? await readGeneratedImages(imgNodes) : [];
+        const outFiles = fileCandidates.length > 0 ? await readGeneratedFiles(fileCandidates) : [];
+        return { outImages, outFiles };
+      };
+      inputEl = findComposerInput() || inputEl;
       await fillInputWithPrompt(inputEl, prompt);
+      filledInputInThisJob = true;
+      composerEl = inputEl;
+      assertJobActive(job);
+      job.awaitingRpc = true;
       const sendMethod = await submitComposerWithVerification(
         inputEl,
         prompt,
         job,
         baselineCount
       );
+      promptSubmitted = true;
+      emitToIsolated({
+        type: "request_progress",
+        request_id: requestId,
+        generating: true,
+        submitted: true,
+        tab_reset: chatWasReset,
+        dom_len: 0,
+        net_len: 0
+      });
+      if ((attachments || []).length) {
+        for (let attempt = 0; attempt < 12 && composerAttachmentControls().length; attempt += 1) await sleep(150);
+        if (composerAttachmentControls().length) throw new Error("提交后仍有附件留在输入框，文件未完整发送，已停止等待错误结果。");
+      }
       logDriver("info", `已提交问题 (${sendMethod}, len=${prompt.length})，等待响应流...`);
 
       const startedAt = Date.now();
+      let lastDiagnosticAt = startedAt;
+      const toolLabels = querySelectorAllDeep('button,[role="button"]').map(readButtonIconAndLabelText)
+        .filter((label) => /create images|create videos?|select tools|生成图片|创建图片|生成视频|创建视频/i.test(label)).map((label) => label.slice(0, 120));
+      logDriver("info", "当前工具状态: " + JSON.stringify(toolLabels));
       lastActivityAt = Date.now();
       const idleTimeoutMs = Math.max(Number(timeoutMs) || 600000, 180000);
       const hardCapMs = 45 * 60 * 1000;
       let latestDomCandidate = "";
-      let lastDomChangeAt = Date.now();
       let sawDomGrowth = false;
 
       while (
@@ -2249,12 +3199,16 @@
         Date.now() - lastActivityAt < idleTimeoutMs &&
         Date.now() - startedAt < hardCapMs
       ) {
+        assertJobActive(job);
         // Fast path: if passive network stream sniffer captured and completed the RPC!
-        if (driverConfig.driverMode !== "dom" && job.networkDone && job.networkText.trim()) {
+        if (!mediaGenerationMode && job.networkDone && job.networkText.trim()) {
+          const { outImages, outFiles } = await collectNewTurnArtifacts(true);
           emitRequestComplete({
             type: "request_complete",
             request_id: requestId,
             reply: job.networkText,
+            output_images: outImages,
+            output_files: outFiles,
             callback_url: callbackUrl || "",
             citations: job.citations,
             source: "network_stream",
@@ -2265,13 +3219,17 @@
         }
 
         // Wait a short tick or immediate network completion
-        await Promise.race([networkCompletePromise, sleep(220)]);
+        await (job.networkDone ? sleep(220) : Promise.race([networkCompletePromise, sleep(220)]));
+        assertJobActive(job);
 
-        if (driverConfig.driverMode !== "dom" && job.networkDone && job.networkText.trim()) {
+        if (!mediaGenerationMode && job.networkDone && job.networkText.trim()) {
+          const { outImages, outFiles } = await collectNewTurnArtifacts(true);
           emitRequestComplete({
             type: "request_complete",
             request_id: requestId,
             reply: job.networkText,
+            output_images: outImages,
+            output_files: outFiles,
             callback_url: callbackUrl || "",
             citations: job.citations,
             source: "network_stream",
@@ -2295,21 +3253,7 @@
 
         if (candidate && candidate !== latestDomCandidate) {
           sawDomGrowth = true;
-          lastDomChangeAt = Date.now();
           lastActivityAt = Date.now();
-          if (!usingNetworkStream && candidate.length > domEmittedLen) {
-            if (candidate.startsWith(latestDomCandidate)) {
-              const delta = candidate.slice(domEmittedLen);
-              if (delta) {
-                domEmittedLen = candidate.length;
-                emitToIsolated({
-                  type: "stream_chunk",
-                  request_id: requestId,
-                  delta
-                });
-              }
-            }
-          }
           latestDomCandidate = candidate;
         }
 
@@ -2330,56 +3274,88 @@
             net_len: job.networkText.length
           });
         }
-        const idleMs = Date.now() - lastDomChangeAt;
-
-        if (sawDomGrowth && latestDomCandidate && !generating && idleMs >= 1500) {
-          const bestReply =
-            usingNetworkStream && job.networkText.trim().length >= latestDomCandidate.length
-              ? job.networkText
-              : latestDomCandidate;
-          emitRequestComplete({
-            type: "request_complete",
-            request_id: requestId,
-            reply: bestReply,
-            callback_url: callbackUrl || "",
-            citations: job.citations,
-            source: usingNetworkStream ? "hybrid_network_dom" : "shadow_dom",
-            captured_rpc: Boolean(sharedState.lastCapturedRpc),
-            active_model: readDetectedWebModel() || sharedState.lastSelectedModel
-          });
-          return;
+        if (Date.now() - lastDiagnosticAt >= 45000) {
+          lastDiagnosticAt = Date.now();
+          logDriver("info", "回复进度: " + JSON.stringify({ generating, dom: latestDomCandidate.length,
+            network: job.networkText.length, blocks: currentReplies.length, baseline: baselineCount }));
         }
+        if (mediaGenerationMode && !generating && Date.now() - startedAt > 2000) {
+          const { outImages, outFiles } = await collectNewTurnArtifacts(false);
+          if (imageGeneration && outImages.length > 0) {
+            emitRequestComplete({
+              type: "request_complete",
+              request_id: requestId,
+              reply: job.networkText,
+              output_images: outImages,
+              output_files: outFiles,
+              callback_url: callbackUrl || "",
+              source: "image_generation",
+              active_model: readDetectedWebModel() || sharedState.lastSelectedModel
+            });
+            return;
+          }
+          if (videoGeneration && (outFiles.length > 0 || outImages.length > 0)) {
+            emitRequestComplete({
+              type: "request_complete",
+              request_id: requestId,
+              reply: job.networkText,
+              output_images: outImages,
+              output_files: outFiles,
+              callback_url: callbackUrl || "",
+              source: "video_generation",
+              active_model: readDetectedWebModel() || sharedState.lastSelectedModel
+            });
+            return;
+          }
+        }
+
+
       }
 
       if (job.cancelled) {
         return;
       }
 
-      const fallbackText = (job.networkText || latestDomCandidate || "").trim();
-      if (fallbackText) {
-        emitRequestComplete({
-          type: "request_complete",
-          request_id: requestId,
-          reply: fallbackText,
-          callback_url: callbackUrl || "",
-          citations: job.citations,
-          source: "partial_timeout_recovery",
-          captured_rpc: Boolean(sharedState.lastCapturedRpc),
-          active_model: readDetectedWebModel() || sharedState.lastSelectedModel
-        });
-        return;
+      if (imageGeneration) throw new Error("网页没有返回可下载的真实图片。");
+      if (videoGeneration) throw new Error("网页没有返回可下载的真实视频。");
+      if ((job.networkText || latestDomCandidate || "").trim()) {
+        throw new Error("网页回复在时限内未完成，已停止返回不完整结果，请重试。");
       }
 
       throw new Error("等待 Gemini Enterprise 页面回复超时，请确认页面未处于重登录或验证码状态。");
     } catch (err) {
+      if (!promptSubmitted && (job.submissionStarted || job.networkText.length > 0 || job.networkDone)) {
+        promptSubmitted = true;
+      }
       if (!job.cancelled) {
         emitToIsolated({
           type: "request_error",
           request_id: requestId,
+          submitted: promptSubmitted,
+          tab_reset: chatWasReset,
           error: err && err.message ? err.message : String(err)
         });
+        stopJob(job);
       }
     } finally {
+      if (!promptSubmitted && (job.submissionStarted || job.networkText.length > 0 || job.networkDone)) {
+        promptSubmitted = true;
+      }
+      if (!promptSubmitted) {
+        if (!hadPreexistingAttachments && (attachments || []).length > 0) {
+          for (const ctrl of composerAttachmentControls()) {
+            try {
+              ctrl.click();
+            } catch (_) {}
+          }
+        }
+        if (filledInputInThisJob && composerEl) {
+          try {
+            await fillInputWithPrompt(composerEl, "");
+          } catch (_) {}
+        }
+      }
+      job.completed = true;
       if (activeJob === job) {
         activeJob = null;
       }
@@ -2478,6 +3454,19 @@
       return;
     }
 
+    if (action === "attachment_chunk") {
+      const attKey = payload.att_key || payload.attachment_id || "";
+      if (!attKey) return;
+      let entry = mainAttachmentReassembly.get(attKey);
+      if (!entry) {
+        entry = { parts: [], total: payload.total_chunks || 0 };
+        mainAttachmentReassembly.set(attKey, entry);
+      }
+      entry.parts[payload.chunk_index] = payload.data || "";
+      if (payload.total_chunks) entry.total = payload.total_chunks;
+      return;
+    }
+
     if (action === "prompt_chunk") {
       let entry = mainPromptReassembly.get(payload.request_id);
       if (!entry) {
@@ -2495,9 +3484,12 @@
         const entry = mainPromptReassembly.get(payload.request_id);
         mainPromptReassembly.delete(payload.request_id);
         const total = payload.total_chunks || (entry ? entry.total : 0);
-        finalPrompt = entry
-          ? Array.from({ length: total }, (_, idx) => entry.parts[idx] || "").join("")
-          : "";
+        try {
+          finalPrompt = assembleChunks(entry, total);
+        } catch (error) {
+          emitToIsolated({type: "request_error", request_id: payload.request_id, error: error.message});
+          return;
+        }
       }
       void executePromptJob({ ...payload, prompt: finalPrompt, trustedPolicyReady: Boolean(trustedPolicy) });
       return;
@@ -2505,7 +3497,7 @@
 
     if (action === "cancel_request") {
       if (activeJob && (!payload.request_id || activeJob.requestId === payload.request_id)) {
-        activeJob.cancelled = true;
+        stopJob(activeJob);
       }
       return;
     }
@@ -2545,6 +3537,8 @@
     findComposerInput,
     findSendButton,
     fillInputWithPrompt,
+    attachImagesToComposer,
+    attachFilesToComposer,
     submitComposer,
     submitComposerWithVerification,
     isPageStillGenerating,
@@ -2559,10 +3553,11 @@
     diagnoseCurrentPage
   };
 
-  logDriver("info", `MAIN 页面混合驱动 v${DRIVER_VERSION} 已就绪`);
+  logDriver("info", `MAIN 原始响应驱动 v${DRIVER_VERSION} 已就绪`);
   emitToIsolated({
     type: "driver_ready",
     captured_rpc: Boolean(sharedState.lastCapturedRpc),
-    active_model: readDetectedWebModel() || sharedState.lastSelectedModel
+    active_model: readDetectedWebModel() || sharedState.lastSelectedModel,
+    driver_version: DRIVER_VERSION
   });
 })();

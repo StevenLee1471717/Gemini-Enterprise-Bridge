@@ -7,7 +7,10 @@ import re
 import time
 import uuid
 from typing import Any, Dict, List, Optional, Union
+
 from pydantic import BaseModel, Field
+
+from multimodal import NormalizedAttachment, extract_attachments_from_content
 
 try:
     from pydantic import ConfigDict
@@ -39,9 +42,37 @@ class ChatMessage(_FlexibleModel):
     tool_calls: Optional[List[Dict[str, Any]]] = None
     function_call: Optional[Dict[str, Any]] = None
     tool_call_id: Optional[str] = None
+    images: Optional[List[Any]] = None
+    files: Optional[List[Any]] = None
+    attachments: Optional[List[Any]] = None
+    audio: Optional[Dict[str, Any]] = None
 
     def text_content(self) -> str:
-        return extract_text_content(self.content)
+        base = extract_text_content(self.content)
+        if not (self.images or self.files or self.attachments or self.audio):
+            return base
+        from media_inputs import extract_part_marker, iter_message_multimodal_parts
+        extra_markers: List[str] = []
+        for part in iter_message_multimodal_parts(self):
+            marker = extract_part_marker(part)
+            if marker and marker not in base and marker not in extra_markers:
+                extra_markers.append(marker)
+        if not extra_markers:
+            return base
+        return "\n".join([p for p in [base, *extra_markers] if p])
+
+    def extract_attachments(self) -> List[NormalizedAttachment]:
+        extra_files: List[Any] = []
+        if isinstance(self.files, list):
+            extra_files.extend(self.files)
+        if isinstance(self.attachments, list):
+            extra_files.extend(self.attachments)
+        return extract_attachments_from_content(
+            self.content,
+            extra_images=self.images,
+            extra_files=extra_files or None,
+            extra_audio=self.audio if isinstance(self.audio, dict) else None,
+        )
 
     def normalized_tool_calls(self) -> List[Dict[str, Any]]:
         """Return normalized OpenAI tool_calls from `tool_calls`, legacy `function_call`, or `tool_use` blocks."""
@@ -108,7 +139,7 @@ class ChatMessage(_FlexibleModel):
 
 
 class ChatCompletionRequest(_FlexibleModel):
-    model: str = Field(default="gemini-enterprise-web")
+    model: str = Field(default="")
     messages: List[ChatMessage]
     stream: bool = False
     stream_options: Optional[StreamOptions] = None
@@ -147,6 +178,8 @@ class BridgeEventPayload(_FlexibleModel):
     delta: Optional[str] = None
     reply: Optional[str] = None
     error: Optional[str] = None
+    output_images: Optional[List[Dict[str, Any]]] = None
+    output_files: Optional[List[Dict[str, Any]]] = None
     citations: Optional[List[Dict[str, Any]]] = None
     source: Optional[str] = None
     tab_url: Optional[str] = None
@@ -167,9 +200,13 @@ class BridgeCallbackPayload(_FlexibleModel):
 
     client_id: Optional[str] = None
     tab_id: Optional[int] = None
+    tab_url: Optional[str] = None
+    tab_title: Optional[str] = None
     request_id: str
     reply: Optional[str] = None
     error: Optional[str] = None
+    output_images: Optional[List[Dict[str, Any]]] = None
+    output_files: Optional[List[Dict[str, Any]]] = None
     citations: Optional[List[Dict[str, Any]]] = None
     source: Optional[str] = "http_callback"
     active_model: Optional[str] = None
@@ -201,25 +238,33 @@ def extract_text_content(content: Optional[Union[str, List[Any]]]) -> str:
             elif part_type == "tool_result":
                 call_id = str(item.get("tool_use_id") or item.get("tool_call_id") or "")
                 inner = extract_text_content(item.get("content"))
+                if not inner and extract_attachments_from_content(item.get("content")):
+                    inner = "[Attached file(s) in tool result]"
                 header = f'[TOOL_RESULT call_id="{call_id}"]' if call_id else "[TOOL_RESULT]"
                 parts.append(f"{header}\n{inner}\n[/TOOL_RESULT]")
-            elif part_type == "image_url":
-                parts.append("[Image attachment omitted in text bridge]")
+            elif part_type in {
+                "image_url", "input_image", "image",
+                "file", "input_file", "document",
+                "input_audio", "audio_url", "audio",
+                "video_url", "input_video", "video",
+            }:
+                from media_inputs import extract_part_marker
+                marker = extract_part_marker(item)
+                if marker:
+                    parts.append(marker)
         return "\n".join(p for p in parts if p)
     return str(content)
 
 
-_CJK_RE = re.compile(r"[\u3400-\u9fff\uf900-\ufaff]")
-_WORD_RE = re.compile(r"[A-Za-z0-9_]+|[^\sA-Za-z0-9_\u3400-\u9fff\uf900-\ufaff]")
+_NON_ASCII_RE = re.compile(r"[^\x00-\x7f]")
 
 
 def estimate_tokens(text: str) -> int:
-    """Character-based token count approximation without JSON punctuation inflation."""
+    """Gemini CLI-style conservative estimate; not Google usage or billing."""
     if not text:
         return 0
-    cjk_count = len(_CJK_RE.findall(text))
-    non_cjk = _CJK_RE.sub("", text)
-    return max(1, int(cjk_count * 0.65 + len(non_cjk) / 4.2))
+    non_ascii = len(_NON_ASCII_RE.findall(text))
+    return max(1, int(non_ascii * 1.5 + (len(text) - non_ascii) / 4))
 
 
 def build_usage(prompt_text: str, completion_text: str) -> Dict[str, int]:
@@ -240,6 +285,7 @@ def build_chat_completion_response(
     created: Optional[int] = None,
     tool_calls: Optional[List[Dict[str, Any]]] = None,
     finish_reason: Optional[str] = None,
+    attachments: Optional[List[Dict[str, Any]]] = None,
 ) -> Dict[str, Any]:
     ts = created if created is not None else int(time.time())
     has_tools = bool(tool_calls)
@@ -251,6 +297,8 @@ def build_chat_completion_response(
     }
     if has_tools:
         message_obj["tool_calls"] = tool_calls
+    if attachments:
+        message_obj["attachments"] = attachments
 
     completion_for_usage = reply_text or ""
     if has_tools:
@@ -491,12 +539,17 @@ def _build_model_entry(
         "max_completion_tokens": DEFAULT_MAX_OUTPUT_TOKENS,
         "output_token_limit": DEFAULT_MAX_OUTPUT_TOKENS,
         "max_tokens": DEFAULT_CONTEXT_WINDOW_TOKENS,
+        "supports_vision": True,
+        "input_modalities": ["text", "image", "audio", "video", "file"],
+        "output_modalities": ["text", "image", "video"],
         "capabilities": {
             "chat": True,
             "tools": True,
             "function_calling": True,
             "streaming": True,
             "json_mode": True,
+            "vision": True,
+            "multimodal": True,
         },
         "limits": {
             "max_prompt_tokens": DEFAULT_CONTEXT_WINDOW_TOKENS,

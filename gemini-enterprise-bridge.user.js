@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Gemini Enterprise Web-to-API Bridge (CSP-Immune Edition)
 // @namespace    https://github.com/StevenLee1471717/Gemini-Enterprise-Bridge
-// @version      1.1.3
+// @version      1.4.1
 // @description  将已登录的 Google Cloud Vertex AI Search / Agentspace 企业网页桥接至本地 OpenAI API 网关（采用 GM_xmlhttpRequest 绕过页面严格 CSP）
 // @downloadURL  https://github.com/StevenLee1471717/Gemini-Enterprise-Bridge/releases/latest/download/gemini-enterprise-bridge.user.js
 // @updateURL    https://github.com/StevenLee1471717/Gemini-Enterprise-Bridge/releases/latest/download/gemini-enterprise-bridge.user.js
@@ -113,6 +113,34 @@
         },
         ontimeout() {
           reject(new Error("timeout"));
+        }
+      });
+    });
+  }
+
+  function gmFetchBinary(urlOrPath, timeout = 60000) {
+    const raw = String(urlOrPath || "").trim();
+    const fullUrl = /^https?:\/\//i.test(raw)
+      ? raw
+      : SERVER_BASE.replace(/\/+$/, "") + (raw.startsWith("/") ? raw : "/" + raw);
+    return new Promise((resolve, reject) => {
+      GM_xmlhttpRequest({
+        method: "GET",
+        url: fullUrl,
+        responseType: "arraybuffer",
+        timeout,
+        onload(resp) {
+          if (resp.status >= 200 && resp.status < 300 && resp.response) {
+            resolve(new Uint8Array(resp.response));
+          } else {
+            reject(new Error("HTTP " + resp.status));
+          }
+        },
+        onerror() {
+          reject(new Error("attachment_network_error"));
+        },
+        ontimeout() {
+          reject(new Error("attachment_timeout"));
         }
       });
     });
@@ -399,9 +427,145 @@
     } catch (_) {}
   }
 
+  async function uploadUserscriptAttachments(inputEl, rawAttachments, readBtnLabelFn) {
+    if (!Array.isArray(rawAttachments) || rawAttachments.length === 0) return;
+    const files = [];
+    let totalBytes = 0;
+    for (let i = 0; i < rawAttachments.length; i += 1) {
+      const att = rawAttachments[i] || {};
+      let bytes;
+      const rawUrlStr = typeof att.data_url === "string" ? att.data_url.trim() : "";
+      if (/^data:/i.test(rawUrlStr) && rawUrlStr.includes(",")) {
+        const commaIdx = rawUrlStr.indexOf(",");
+        const header = rawUrlStr.slice(5, commaIdx);
+        const body = rawUrlStr.slice(commaIdx + 1);
+        if (/;\s*base64/i.test(";" + header)) {
+          let clean = body.trim().replace(/-/g, "+").replace(/_/g, "/").replace(/[^A-Za-z0-9+/=]/g, "");
+          const rem = clean.replace(/=+$/, "").length % 4;
+          clean = clean.replace(/=+$/, "") + (rem === 2 ? "==" : rem === 3 ? "=" : "");
+          const bin = atob(clean);
+          bytes = new Uint8Array(bin.length);
+          for (let j = 0; j < bin.length; j += 1) bytes[j] = bin.charCodeAt(j) & 0xff;
+        } else {
+          let decoded = body;
+          try {
+            decoded = decodeURIComponent(body);
+          } catch (_) {}
+          if (typeof TextEncoder === "function") {
+            bytes = new TextEncoder().encode(decoded);
+          } else {
+            const utf8 = unescape(encodeURIComponent(decoded));
+            bytes = new Uint8Array(utf8.length);
+            for (let j = 0; j < utf8.length; j += 1) bytes[j] = utf8.charCodeAt(j);
+          }
+        }
+      } else {
+        const rawB64 = (!/^(?:https?|blob|file):/i.test(rawUrlStr) && rawUrlStr) || att.data_b64 || att.b64_json || att.file_data || att.data || "";
+        if (typeof rawB64 === "string" && rawB64.trim()) {
+          let clean = rawB64.trim().replace(/-/g, "+").replace(/_/g, "/").replace(/[^A-Za-z0-9+/=]/g, "");
+          const rem = clean.replace(/=+$/, "").length % 4;
+          clean = clean.replace(/=+$/, "") + (rem === 2 ? "==" : rem === 3 ? "=" : "");
+          const bin = atob(clean);
+          bytes = new Uint8Array(bin.length);
+          for (let j = 0; j < bin.length; j += 1) bytes[j] = bin.charCodeAt(j) & 0xff;
+        } else {
+          bytes = await gmFetchBinary(att.fetch_url || att.path || att.url);
+        }
+      }
+      totalBytes += bytes.byteLength;
+      const cleanMime = String(att.mime_type || "application/octet-stream").split(";")[0].split(",")[0].trim() || "application/octet-stream";
+      files.push(
+        new pageWin.File(
+          [bytes],
+          String(att.name || att.filename || `attachment-${i + 1}.bin`),
+          { type: cleanMime, lastModified: Date.now() }
+        )
+      );
+    }
+
+    const assignInputFiles = async (fileInput) => {
+      const batches = !fileInput.multiple && files.length > 1 ? files.map((f) => [f]) : [files];
+      for (let b = 0; b < batches.length; b += 1) {
+        const dt = new pageWin.DataTransfer();
+        batches[b].forEach((f) => dt.items.add(f));
+        const desc = Object.getOwnPropertyDescriptor(pageWin.HTMLInputElement.prototype, "files");
+        if (desc && desc.set) desc.set.call(fileInput, dt.files);
+        else fileInput.files = dt.files;
+        fileInput.dispatchEvent(new Event("input", { bubbles: true, composed: true }));
+        fileInput.dispatchEvent(new Event("change", { bubbles: true, composed: true }));
+        if (b + 1 < batches.length) await sleep(90);
+      }
+    };
+
+    let fileInputs = queryDeep('input[type="file"]').filter((el) => !el.disabled);
+    if (fileInputs.length > 0) {
+      await assignInputFiles(fileInputs[0]);
+    } else {
+      const attachBtns = queryDeep('button, md-icon-button, ucs-icon-button, [role="button"]').filter((b) => {
+        if (!visible(b) || b.disabled) return false;
+        const lbl = readBtnLabelFn(b);
+        if (/\b(send|submit|stop|mic|voice|add_comment|chat_add_on|new chat|model|argon|carbon|pro|flash|auto)\b|发送|停止|新建/.test(lbl)) return false;
+        return /\b(attach|attach_file|upload|upload_file|add_circle|paperclip|add)\b|[+＋]|上传|附件|添加/.test(lbl);
+      });
+      let captured = null;
+      if (attachBtns.length > 0) {
+        const origClick = pageWin.HTMLInputElement.prototype.click;
+        pageWin.HTMLInputElement.prototype.click = function (...args) {
+          if (this && String(this.type || "").toLowerCase() === "file") {
+            captured = this;
+            return undefined;
+          }
+          return origClick.apply(this, args);
+        };
+        try {
+          attachBtns[attachBtns.length - 1].click();
+          await sleep(120);
+          if (!captured) {
+            const menuItems = queryDeep('mat-menu-item, md-menu-item, md-list-item, ucs-menu-item, [role="menuitem"]').filter(visible);
+            const localItem = menuItems.find((m) => {
+              const t = (m.innerText || m.textContent || "").toLowerCase();
+              return !/drive|cloud|onedrive|sharepoint|云端/.test(t) && /upload|computer|local|file|上传|本地|电脑/.test(t);
+            });
+            if (localItem) {
+              localItem.click();
+              await sleep(120);
+            }
+          }
+          if (!captured) {
+            const afterInputs = queryDeep('input[type="file"]').filter((el) => !el.disabled);
+            if (afterInputs.length > 0) captured = afterInputs[0];
+          }
+        } finally {
+          pageWin.HTMLInputElement.prototype.click = origClick;
+        }
+      }
+      if (captured) {
+        await assignInputFiles(captured);
+      } else {
+        const dt = new pageWin.DataTransfer();
+        files.forEach((f) => dt.items.add(f));
+        try {
+          inputEl.dispatchEvent(new pageWin.ClipboardEvent("paste", { bubbles: true, composed: true, cancelable: true, clipboardData: dt }));
+        } catch (_) {}
+        try {
+          inputEl.dispatchEvent(new pageWin.DragEvent("drop", { bubbles: true, composed: true, cancelable: true, dataTransfer: dt }));
+        } catch (_) {}
+      }
+    }
+
+    await sleep(150);
+    const waitDeadline = Date.now() + Math.min(45000, Math.max(6000, Math.ceil(totalBytes / 2048)));
+    while (Date.now() < waitDeadline) {
+      const busy = queryDeep('md-circular-progress, md-linear-progress, mat-progress-spinner, [role="progressbar"], [aria-busy="true"]').filter(visible);
+      if (busy.length === 0) break;
+      await sleep(150);
+    }
+  }
+
   async function executePrompt(cmd) {
     const requestId = cmd.request_id;
     const prompt = cmd.prompt || "";
+    const attachments = Array.isArray(cmd.attachments) ? cmd.attachments : [];
     const job = { requestId, cancelled: false, networkText: "", networkDone: false };
     activeJob = job;
 
@@ -419,55 +583,11 @@
         throw new Error("未找到 Gemini Enterprise 输入框，请确认页面已登录并进入聊天页。");
       }
       const inputEl = inputs[0];
+
       const replySel =
         'ucs-summary, ucs-markdown, message-content, [data-message-author-role="model"], .markdown-body';
       const beforeNodes = queryLeafReplies(replySel);
       const beforeCount = beforeNodes.length;
-
-      inputEl.focus();
-      if (inputEl.tagName === "TEXTAREA") {
-        Object.getOwnPropertyDescriptor(HTMLTextAreaElement.prototype, "value").set.call(
-          inputEl,
-          prompt
-        );
-        inputEl.dispatchEvent(new InputEvent("input", { bubbles: true, composed: true }));
-      } else {
-        const isHidden = Boolean(document.hidden || document.visibilityState === "hidden");
-        const isLargePrompt = prompt.length > 3000;
-        let inserted = false;
-        if (!isHidden && !isLargePrompt) {
-          const sel = window.getSelection();
-          const range = document.createRange();
-          range.selectNodeContents(inputEl);
-          sel.removeAllRanges();
-          sel.addRange(range);
-          inserted = document.execCommand("insertText", false, prompt);
-        }
-        if (!inserted || !(inputEl.innerText || inputEl.textContent || "").trim()) {
-          // Trusted-Types-safe DOM injection (NEVER assign .innerHTML!)
-          if (typeof inputEl.replaceChildren === "function") {
-            inputEl.replaceChildren();
-          } else {
-            while (inputEl.firstChild) inputEl.removeChild(inputEl.firstChild);
-          }
-          const frag = document.createDocumentFragment();
-          const lines = prompt.split("\n");
-          const step = isLargePrompt || lines.length > 48 ? Math.max(64, Math.ceil(lines.length / 24)) : 1;
-          for (let idx = 0; idx < lines.length; idx += step) {
-            const p = document.createElement("p");
-            const txt = step === 1 ? lines[idx] : lines.slice(idx, idx + step).join("\n");
-            if (txt) p.textContent = txt;
-            else p.appendChild(document.createElement("br"));
-            frag.appendChild(p);
-          }
-          inputEl.appendChild(frag);
-          const evData = prompt.length > 4000 ? null : prompt;
-          inputEl.dispatchEvent(new InputEvent("beforeinput", { bubbles: true, composed: true, inputType: "insertText", data: evData }));
-          inputEl.dispatchEvent(new InputEvent("input", { bubbles: true, composed: true, inputType: "insertText", data: evData }));
-        }
-      }
-
-      await sleep(120);
 
       function readBtnLabel(b) {
         const parts = [b.getAttribute("aria-label") || "", b.getAttribute("title") || "", b.textContent || ""];
@@ -477,6 +597,56 @@
         return parts.join(" ").toLowerCase();
       }
 
+      if (attachments.length > 0) {
+        await uploadUserscriptAttachments(inputEl, attachments, readBtnLabel);
+      }
+
+      inputEl.focus();
+      if (prompt.trim().length > 0) {
+        if (inputEl.tagName === "TEXTAREA") {
+          Object.getOwnPropertyDescriptor(HTMLTextAreaElement.prototype, "value").set.call(
+            inputEl,
+            prompt
+          );
+          inputEl.dispatchEvent(new InputEvent("input", { bubbles: true, composed: true }));
+        } else {
+          const isHidden = Boolean(document.hidden || document.visibilityState === "hidden");
+          const isLargePrompt = prompt.length > 3000;
+          let inserted = false;
+          if (!isHidden && !isLargePrompt) {
+            const sel = window.getSelection();
+            const range = document.createRange();
+            range.selectNodeContents(inputEl);
+            sel.removeAllRanges();
+            sel.addRange(range);
+            inserted = document.execCommand("insertText", false, prompt);
+          }
+          if (!inserted || !(inputEl.innerText || inputEl.textContent || "").trim()) {
+            // Trusted-Types-safe DOM injection (NEVER assign .innerHTML!)
+            if (typeof inputEl.replaceChildren === "function") {
+              inputEl.replaceChildren();
+            } else {
+              while (inputEl.firstChild) inputEl.removeChild(inputEl.firstChild);
+            }
+            const frag = document.createDocumentFragment();
+            const lines = prompt.split("\n");
+            const step = isLargePrompt || lines.length > 48 ? Math.max(64, Math.ceil(lines.length / 24)) : 1;
+            for (let idx = 0; idx < lines.length; idx += step) {
+              const p = document.createElement("p");
+              const txt = step === 1 ? lines[idx] : lines.slice(idx, idx + step).join("\n");
+              if (txt) p.textContent = txt;
+              else p.appendChild(document.createElement("br"));
+              frag.appendChild(p);
+            }
+            inputEl.appendChild(frag);
+            const evData = prompt.length > 4000 ? null : prompt;
+            inputEl.dispatchEvent(new InputEvent("beforeinput", { bubbles: true, composed: true, inputType: "insertText", data: evData }));
+            inputEl.dispatchEvent(new InputEvent("input", { bubbles: true, composed: true, inputType: "insertText", data: evData }));
+          }
+        }
+      }
+
+      await sleep(120);
       const sendBtns = queryDeep('button, md-icon-button, md-filled-icon-button, ucs-icon-button, [role="button"]').filter((b) => {
         if (!visible(b) || b.disabled || b.getAttribute("aria-disabled") === "true") return false;
         const lbl = readBtnLabel(b);

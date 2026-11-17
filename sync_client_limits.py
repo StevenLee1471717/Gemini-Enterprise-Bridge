@@ -133,9 +133,15 @@ def sync_copilot_provider_limits(
         models_checked = 0
         candidates: List[Dict[str, Any]] = []
         for prov in matched_providers:
+            pm_cols = {
+                str(c["name"])
+                for c in conn.execute("PRAGMA table_info(provider_models)").fetchall()
+            }
+            has_vision_col = "supports_vision" in pm_cols
+            sel_vision = ", supports_vision" if has_vision_col else ""
             rows = conn.execute(
-                """
-                SELECT id, provider_id, model_id, display_name, max_prompt_tokens, max_output_tokens
+                f"""
+                SELECT id, provider_id, model_id, display_name, max_prompt_tokens, max_output_tokens{sel_vision}
                   FROM provider_models
                  WHERE provider_id = ?
                 """,
@@ -145,9 +151,11 @@ def sync_copilot_provider_limits(
             for m in rows:
                 cur_prompt = m["max_prompt_tokens"]
                 cur_output = m["max_output_tokens"]
+                cur_vision = int(m["supports_vision"] or 0) if has_vision_col else 1
                 needs_prompt = cur_prompt is None or int(cur_prompt) < max_prompt_tokens
                 needs_output = cur_output is None or int(cur_output) < max_output_tokens
-                if needs_prompt or needs_output:
+                needs_vision = has_vision_col and cur_vision == 0
+                if needs_prompt or needs_output or needs_vision:
                     candidates.append(
                         {
                             "id": str(m["id"]),
@@ -155,8 +163,10 @@ def sync_copilot_provider_limits(
                             "model_id": str(m["model_id"]),
                             "old_max_prompt_tokens": cur_prompt,
                             "old_max_output_tokens": cur_output,
+                            "old_supports_vision": cur_vision if has_vision_col else None,
                             "new_max_prompt_tokens": max_prompt_tokens,
                             "new_max_output_tokens": max_output_tokens,
+                            "new_supports_vision": 1 if has_vision_col else None,
                         }
                     )
 
@@ -170,30 +180,61 @@ def sync_copilot_provider_limits(
                 finally:
                     bck_conn.close()
 
+            pm_cols = {
+                str(c["name"])
+                for c in conn.execute("PRAGMA table_info(provider_models)").fetchall()
+            }
+            has_vision_col = "supports_vision" in pm_cols
             with conn:
                 for prov in matched_providers:
-                    conn.execute(
-                        """
-                        UPDATE provider_models
-                           SET max_prompt_tokens = ?,
-                               max_output_tokens = ?,
-                               updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
-                         WHERE provider_id = ?
-                           AND (
-                               max_prompt_tokens IS NULL
-                               OR max_prompt_tokens < ?
-                               OR max_output_tokens IS NULL
-                               OR max_output_tokens < ?
-                           )
-                        """,
-                        (
-                            max_prompt_tokens,
-                            max_output_tokens,
-                            prov["id"],
-                            max_prompt_tokens,
-                            max_output_tokens,
-                        ),
-                    )
+                    if has_vision_col:
+                        conn.execute(
+                            """
+                            UPDATE provider_models
+                               SET max_prompt_tokens = ?,
+                                   max_output_tokens = ?,
+                                   supports_vision = 1,
+                                   updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+                             WHERE provider_id = ?
+                               AND (
+                                   max_prompt_tokens IS NULL
+                                   OR max_prompt_tokens < ?
+                                   OR max_output_tokens IS NULL
+                                   OR max_output_tokens < ?
+                                   OR COALESCE(supports_vision, 0) = 0
+                               )
+                            """,
+                            (
+                                max_prompt_tokens,
+                                max_output_tokens,
+                                prov["id"],
+                                max_prompt_tokens,
+                                max_output_tokens,
+                            ),
+                        )
+                    else:
+                        conn.execute(
+                            """
+                            UPDATE provider_models
+                               SET max_prompt_tokens = ?,
+                                   max_output_tokens = ?,
+                                   updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+                             WHERE provider_id = ?
+                               AND (
+                                   max_prompt_tokens IS NULL
+                                   OR max_prompt_tokens < ?
+                                   OR max_output_tokens IS NULL
+                                   OR max_output_tokens < ?
+                               )
+                            """,
+                            (
+                                max_prompt_tokens,
+                                max_output_tokens,
+                                prov["id"],
+                                max_prompt_tokens,
+                                max_output_tokens,
+                            ),
+                        )
 
         return {
             "ok": True,

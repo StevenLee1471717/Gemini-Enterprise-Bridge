@@ -36,6 +36,10 @@ PROTECTED_USER_FILES = {
     ".env",
     "usage_stats.json",
     "usage_stats.json.tmp",
+    "usage_ledger.json",
+    "distribution.json",
+    "client_distribution.json",
+    "session_archive.sqlite3",
 }
 
 

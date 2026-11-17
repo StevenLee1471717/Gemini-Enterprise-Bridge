@@ -1,8 +1,8 @@
 # Chrome Web Store Listing & Permissions Reference
 
 **Extension Name:** Gemini Enterprise Web-to-API Bridge  
-**Current Version:** 1.1.3  
-**Last Updated:** 2026-11-12  
+**Current Version:** 1.4.1  
+**Last Updated:** 2026-11-17  
 **Distribution Target:** Local Developer Unpacked Extension / Private Enterprise Internal Distribution
 
 ---
@@ -51,6 +51,10 @@ Every permission in `manifest.json` is strictly scoped to local bridging:
 
 ## Version History
 
+- **1.4.1 (2026-11-17):** Fixed attachment upload format errors across all file, image, audio, and video attachments, added seamless compatibility during background extension updates, and preserved standalone file uploads sent without accompanying message text.
+- **1.4.0 (2026-11-16):** Integrated ahead fork enhancements (SQLite session archive & URL re-entry, Codex activity tracking, multi-client API distribution & tenant isolation, compaction auto-reset, UsageLedger, manual self-use tab toggle), upgraded direct web multimodal file/clipboard-paste upload & Copilot vision capability sync, and added runtime-configurable backend debug logging (`/api/logs` & `BRIDGE_LOG_LEVEL`).
+- **1.3.0 (2026-11-16):** Integrated OpenAI `/v1/responses` & `/v1/files` support, multimodal media generation/transcoding, decorated snapshot deduplication, and global worker concurrency & stream integrity hardening (`page-driver.js` `v2.6.5`).
+- **1.2.0 (2026-11-13):** Added end-to-end multimodal file and media support (images, video, audio, PDFs, Office documents, code/text, and binary attachments) with token-guarded local staging, multi-turn delta deduplication, and Trusted-Types-safe Shadow DOM composer upload.
 - **1.1.3 (2026-11-12):** Fixed CORS preflight errors when checking GitHub Releases by expanding `*.githubusercontent.com` CDN host coverage, preferring the local gateway / GitHub REST API before redirected release assets, and removing non-CORS-safelisted request headers.
 - **1.1.2 (2026-11-12):** Added full 1,048,576 input / 65,536 output token limit metadata across `/v1/models` and `GET /v1/models/{model_id}` plus automatic GitHub Copilot BYOK `provider_models` limit synchronization to prevent false 128k prompt budget caps.
 - **1.1.1 (2026-11-12):** Eliminated background WebSocket connection-refused and handshake warnings via lightweight gateway readiness checks, and improved back/forward cache keep-alive port cleanup during tab navigation.

@@ -277,6 +277,10 @@ sendBtn.addEventListener("click", () => {
   capturedSubmittedText = (prose.innerText || prose.textContent || "").trim();
   const replyBubble = new Elem("ucs-markdown", { text: inputSpec.simulatedReply });
   chatSr.appendChild(replyBubble);
+  const job=sandbox.__GEB_MAIN_STATE__.getActiveJob();
+  job.submissionStarted=true;
+  const encoded=new TextEncoder().encode(JSON.stringify([{groundedContent:{content:{text:inputSpec.simulatedReply}}}]));
+  void sandbox.__GEB_MAIN_STATE__.consumeStream(new ReadableStream({start(c){c.enqueue(encoded);c.close();}}),job);
 });
 
 const loc = {
@@ -295,6 +299,8 @@ const sandbox = {
   URL,
   Headers,
   TextDecoder,
+  TextEncoder,
+  ReadableStream,
   AbortController,
   MessageChannel,
   DataTransfer: MockDataTransfer,
@@ -460,7 +466,7 @@ def test_full_chain_client_server_extension_dom_integration(tmp_path: Path) -> N
 
                             # Simulate `background.js` resetting tab BEFORE injecting chunks into `page-driver.js`!
                             simulated_reply = (
-                                '[TOOL_CALL]{"name": "enterprise_tool_0", "arguments": {"query": "Q4 OKR", "limit": 5}}[/TOOL_CALL]'
+                                '```codex_tool_call\n{"name": "enterprise_tool_0", "arguments": {"query": "Q4 OKR", "limit": 5}}\n```\n'
                                 if step_idx == 0
                                 else "根据检索到的 Q4 OKR 数据，核心指标已全部达成。"
                             )

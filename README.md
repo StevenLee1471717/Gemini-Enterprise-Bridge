@@ -29,12 +29,13 @@ flowchart LR
 
 ---
 
-## v1.1.x 架构与核心能力速览
+## v1.2.x 架构与核心能力速览
 
-当前版本（`v1.1.3`）在本地 OpenAI 兼容网关基础上构建了完整的生产级多会话与自动化运维闭环：
+当前版本（`v1.2.0`）在本地 OpenAI 兼容网关基础上构建了完整的生产级多模态、多会话与自动化运维闭环：
 
 | 能力模块 | 核心实现与运行机制 |
 |---|---|
+| **全链路多模态文件与媒体支持 (`multimodal.py`)** | 原生兼容图片、视频、音频、PDF、Office 文档（`.docx`/`.xlsx`/`.pptx`）、代码与任意二进制文件（支持 Data URI、Base64、HTTP URL 与本地路径）；多轮对话按 `SHA-256` 增量去重免重复上传；通过令牌保护的 `/api/bridge/attachments/{id}` 与零 `.innerHTML` 三级 Shadow DOM 注入安全上传至网页输入框，同时支持官方 GCloud `inlineData`/`fileData` |
 | **1M 上下文窗口与客户端上限同步** | `/v1/models` 与 `/v1/models/{model_id}` 全量声明 **`1,048,576` 输入 / `65,536` 输出** Token 上限（覆盖 **Gemini 4 Carbon**、**4 Argon**、**3.1 Pro**、**3.8 Flash** 及 `@会话名` 别名）；启动时自动运行 `sync_client_limits.py` 同步修复本地 GitHub Copilot App (`~/.copilot/data.db`) BYOK 模型的 `128K` 默认回退限制 |
 | **上下文水位监控与官方 API 等价账本 (`6.8` 汇率)** | 实时计算各并行会话在 `1M` 窗口中的占用水位（历史消息 / 工具 Schema / 增量输入），并通过 `usage_stats.py` 按 Google 官方分段定价持久化累计输入/输出 Token 与等价节省费用（默认按 **`1 USD = 6.8 CNY`** 折算，可通过 `BRIDGE_USD_TO_CNY_RATE` 自定义，支持扩展弹窗、Web 控制台与 `/api/usage` 实时查看及重置） |
 | **多标签页真并行池 (`WorkerSlot` Pool)** | 每个已打开的 Gemini Enterprise 标签页作为独立并发工作槽位，支持多客户端同时流式请求、对话前缀自动粘性路由、`@会话名` 显式固定绑定，以及并发繁忙时后台静默新建标签页扩容（`BRIDGE_AUTO_SPAWN_TABS=true`） |
@@ -143,6 +144,15 @@ resp = client.chat.completions.create(
 print(resp.choices[0].message.tool_calls)
 ```
 
+### 2.5 全类型多模态文件与媒体直传（图片 / 视频 / 音频 / PDF / Office / 代码文档）
+
+原生兼容 OpenAI / Cursor / NextChat / Cherry Studio / Anthropic 风格的多模态消息结构（`image_url`、`input_audio`、`audio_url`、`video_url`、`file`、`input_file`、`document`、Data URL、Base64、HTTP(S) 链接、`gs://` URI 与本机文件路径）：
+
+- **全模态文件覆盖与魔数自动嗅探 (`multimodal.py`)**：原生支持图片（PNG/JPEG/WebP/GIF/SVG 等）、视频（MP4/WebM/MOV/AVI/MKV 等）、音频（WAV/MP3/OGG/FLAC/AAC/M4A 等）、文档（PDF、Word `.docx`、Excel `.xlsx`、PPT `.pptx`）以及 Markdown / JSON / CSV / 代码源文件，自动通过文件头魔数与 OOXML ZIP 结构识别真实 MIME 类型。
+- **本地受令牌保护的二进制暂存与分块中继 (`/api/bridge/attachments/{id}`)**：大体积音视频、高清图片与 PDF 无需塞入单帧 WebSocket JSON，由网关签发一次性受保护令牌暂存，MV3 Service Worker（或油猴 `GM_xmlhttpRequest`）拉取二进制流并分块重组为原生浏览器 `File` 对象，穿透多层 Shadow DOM 自动挂载至 Gemini Enterprise 输入框（优先 `<input type="file">`，支持拦截 `+` 附件菜单动态文件选择器及 `DataTransfer` 粘贴/拖拽兜底，全程零 `.innerHTML` 严格满足 `Trusted Types`）并等待上传进度完成后自动提交。
+- **多轮对话附件增量去重 (`smart_incremental_delta`)**：同一会话后续追问自动通过 SHA-256 指纹识别历史轮次已上传过的图片/文档，**仅上传当前轮新增附件**；新建或切换会话（`reset_chat=True`）时自动完整附带所需文件。
+- **官方 GCloud 模式同步适配 (`gcloud_provider.py`)**：Vertex AI Gemini 自动映射 `fileData`（`gs://`）、`inlineData`（图片/音频/视频/PDF）并对 Office/代码文本文件自动提取结构化正文；Discovery Engine `streamAssist` 自动内联文档与表格文本。
+
 ### 3. 多会话真并行工作池 + 后台自动扩容 (`WorkerSlot` Pool & Auto-Spawn)
 不再受限于全局单会话串行锁——支持在多个客户端窗口、多个 Copilot / Cursor / Cline 智能体会话中**同时并发调用** Gemini Enterprise：
 - **每标签页独立并发锁 (`WorkerSlot`)**：每个已打开的 `vertexaisearch.cloud.google.com` 标签页（包含不同 `/u/0/`、`/u/3/` 账号标签页或不同浏览器实例）均注册为独立并行工作槽位，多个会话可同时流式生成且互不阻塞。
@@ -210,7 +220,8 @@ I:\Projects\Gemini-Enterprise-Bridge\
 ├── sync_client_limits.py             # 自动同步 1M/65K Token 上限至本地 Copilot BYOK 数据库
 ├── server.py                         # FastAPI 主入口（支持 python server.py 直接运行）
 ├── config.py                         # 环境变量与 .env 配置加载
-├── schemas.py                        # OpenAI 兼容模型、工具参数与网页模型别名解析器
+├── multimodal.py                     # 多模态文件/音视频/图片/Office 文档归一化、嗅探与文本提取器
+├── schemas.py                        # OpenAI 兼容模型、多模态消息、工具参数与网页模型别名解析器
 ├── tool_calling.py                   # DOM 免疫工具调用协议、多级容错解析与 SSE 流式拦截器
 ├── context_builder.py                # 多轮对话与 Agentic Loop 智能增量上下文构建器 + 实时窗口水位监控
 ├── usage_stats.py                    # 官方 Google Gemini API 定价引擎与持久化用量等价账本
@@ -242,3 +253,25 @@ I:\Projects\Gemini-Enterprise-Bridge\
 2. **网页改版导致找不到输入框或回复容器**：
    - 在 Gemini Enterprise 页面点击扩展弹窗中的 **检测页面元素** 查看自动识别结果；
    - 若企业定制版更换了标签名，可在弹窗 **高级：自定义 Shadow DOM 选择器** 中填入对应的 CSS 选择器（驱动会自动穿透所有层级的 Shadow Root 查找该选择器），无需修改代码即可热更新。
+
+## Codex Responses 接入、多模态增强与稳定性加固
+
+### 1. OpenAI Responses API 与会话持久存储
+- **Responses 端点**：新增 `POST /v1/responses`（流式 SSE 与非流式）、`GET/DELETE /v1/responses/{id}`、`POST /v1/responses/input_tokens`、`POST /v1/responses/compact`，支持命名空间工具、自由格式 `apply_patch`、图片输入与内置生图调用。
+- **本地 SQLite 持久存储**：`previous_response_id` 与压缩检查点默认保存在 `.cache/response_store/responses.sqlite3`（权限 `0600`，单条上限 32 MB、总有效负载上限 512 MB；普通回复默认保留 24 小时，`bridge_compact_*` 压缩检查点跨重启保留；`store: false` 不落盘）。
+- **Codex 配置同步**：内置 `codex-models.json`（含 `input_modalities: ["text", "image"]`、1,048,576 上下文窗口与 524,288 整理门槛，参考 Google Gemini CLI 50% 策略，非 Google 官方公开的网页端固定压缩阈值）与 `configure_codex_context.py`（默认仅预览，加 `--apply --backup-dir <备份目录>` 后更新本地 Gemini 条目，不修改其他模型供应商）。
+
+### 2. 多模态文件存取、自动转码与媒体生成
+- **文件与媒体接口**：新增 `POST/GET /v1/files`、`GET /v1/files/{id}`、`GET /v1/files/{id}/content`、`DELETE /v1/files/{id}`、`POST /v1/images/generations`、`POST /v1/images/edits`、`GET /v1/images/files/{filename}`、`POST /v1/videos/generations`、`POST /v1/audio/transcriptions`、`POST /v1/audio/translations`，并提供零外部依赖的 stdio MCP 工具 `imagegen_mcp.py`（`generate_image`、`generate_video`、`analyze_media`）。
+- **本机自动兼容转换**：针对网页输入框限制，当本机存在 `sips` / `afconvert` / `textutil` / `ffmpeg` 时，自动将 `HEIC/HEIF/TIFF/BMP/ICO/AVIF/JP2` 转为 `PNG`、`WAV/AIFF/FLAC/OGG/OPUS/AAC/WEBM/AMR` 转为 `M4A`、`MOV/WEBM/MKV/AVI/MPEG/3GP/FLV` 转为 `MP4`、`RTF` 转为 `DOCX`；超过 1 MB 的附件自动走本地暂存拉取与分片传输。
+- **已知边界**：网页内部文档卡片（如网页内生成的 PDF/Word 预览卡）无公开下载流，亦不提供原生 TTS 语音合成导出；非原生格式转换依赖宿主机对应系统工具或 `ffmpeg`。
+
+### 3. 流式工具完整性与多标签页并发加固
+- **工具与思考草稿防护**：状态机解析 `[TOOL_CALL]...[/TOOL_CALL]`（忽略参数字符串字面量内的同名标记），拦截中英文明确内部思考草稿标题（如 `Thinking Process:`、`思考过程：`）及未闭合工具块并触发单次修复；剥离网页 `[[section:...]]` 与 `[[suggested_questions]]` 装饰块后再做末尾 `summaryText` 快照去重（`page-driver.js` `v2.6.5`）。
+- **全局并发信号量与保活**：`BrowserBridgeHub` 强制执行 `max_parallel_tabs` 全局信号量硬上限，取消/异常时自动停止页面生成并清理槽位增量历史，长耗时工具与媒体生成全程发送 SSE `: keepalive`。
+
+### 4. 会话归档重入、多客户端租户隔离、网页直传粘贴与动态调试日志 (v1.4.1)
+- **SQLite 会话归档与 URL 重入 (`context_builder.py` / `codex_activity.py`)**：LRU 淘汰或重启后自动从 `.cache/session_archive.sqlite3` 匹配历史对话并导航回对应的 Gemini `/r/session/<id>` 页面继续增量续聊；压缩完成后自动回收过期的旧压缩标签页。
+- **多客户端分发与租户隔离 (`distribution.py`)**：支持在本地控制台生成独立 `sk-geb-*` 客户端密钥、并发/RPM/日配额及主机预留槽位（`BRIDGE_HOST_RESERVED_SLOTS`），跨租户严格隔离上下文、文件缓存与会话池。
+- **网页原生多模态直传 + 剪贴板粘贴兜底 (`page-driver.js` `v2.8.6` & `sync_client_limits.py`)**：拦截原生文件选择框点击避免弹出系统窗口，优先向 `<input type="file">` 直接注入 `File`，若页面无显式文件框或未响应则自动通过 `ClipboardEvent("paste")` / `DragEvent("drop")` 直接复制粘贴至 Vertex AI 输入框；启动时自动将本地 Copilot BYOK 数据库的 `supports_vision` 同步为 `1`。
+- **后端结构化日志与运行时动态调级 (`logging_utils.py`)**：支持 `BRIDGE_LOG_LEVEL`（`TRACE|DEBUG|INFO|WARNING|ERROR`）、`BRIDGE_DEBUG=true`、`BRIDGE_LOG_FILE`（UTF-8 滚动日志文件）与 `BRIDGE_LOG_PAYLOADS`；可通过本机管理端点 `GET /api/logs` 查看服务端与浏览器实时日志，或调用 `POST /api/logs/level`（如 `{"level": "DEBUG", "log_payloads": true}`）免重启切换调试级别。

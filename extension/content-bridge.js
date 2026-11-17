@@ -14,12 +14,252 @@
   const pendingRpcCalls = new Map();
   const msgQueue = [];
   let mainReady = false;
+  let mainDriverVersion = "";
   let keepalivePort = null;
   let portRetryAttempts = 0;
   let portRetryTimer = null;
   let hiddenKeepaliveTimer = null;
-  let pageInBfcache = false;
   let disposed = false;
+  let indicatorUi = null;
+
+  function initTakeoverIndicator() {
+    if (
+      disposed ||
+      typeof document === "undefined" ||
+      typeof document.createElement !== "function"
+    ) {
+      return null;
+    }
+    const mountRoot = document.documentElement || document.body;
+    if (!mountRoot || typeof mountRoot.appendChild !== "function") {
+      return null;
+    }
+    try {
+      const oldHost = document.getElementById("geb-takeover-indicator-host");
+      if (oldHost && typeof oldHost.remove === "function") {
+        oldHost.remove();
+      }
+    } catch (_) {}
+
+    const host = document.createElement("div");
+    host.id = "geb-takeover-indicator-host";
+    host.setAttribute("data-geb-ui", "1");
+    host.style.cssText =
+      "position:fixed;right:18px;bottom:18px;z-index:2147483640;pointer-events:none;margin:0;padding:0;border:0;background:transparent;";
+
+    if (typeof host.attachShadow !== "function") {
+      return null;
+    }
+    // Closed ShadowRoot keeps page-driver.js Shadow DOM traversal 100% blind to our UI!
+    const shadow = host.attachShadow({ mode: "closed" });
+    const style = document.createElement("style");
+    style.textContent = `
+      :host { all: initial; }
+      .pill {
+        pointer-events: auto;
+        display: inline-flex;
+        align-items: center;
+        gap: 7px;
+        padding: 5px 11px;
+        border-radius: 999px;
+        font-family: -apple-system, BlinkMacSystemFont, "PingFang SC", "SF Pro Text", "Segoe UI", system-ui, sans-serif;
+        font-size: 12px;
+        font-weight: 600;
+        line-height: 1.2;
+        color: #0f172a;
+        background: rgba(255, 255, 255, 0.94);
+        border: 1px solid rgba(16, 185, 129, 0.36);
+        box-shadow: 0 8px 24px -6px rgba(15, 23, 42, 0.14), 0 2px 6px rgba(15, 23, 42, 0.05);
+        backdrop-filter: blur(12px);
+        -webkit-backdrop-filter: blur(12px);
+        user-select: none;
+        transition: all 0.18s ease;
+      }
+      .pill:hover {
+        box-shadow: 0 10px 28px -6px rgba(15, 23, 42, 0.2), 0 2px 8px rgba(15, 23, 42, 0.07);
+      }
+      .dot {
+        width: 8px;
+        height: 8px;
+        border-radius: 50%;
+        background: #10b981;
+        box-shadow: 0 0 0 3px rgba(16, 185, 129, 0.18);
+        flex-shrink: 0;
+      }
+      @keyframes gebPulse {
+        0%, 100% { transform: scale(1); opacity: 1; }
+        50% { transform: scale(1.32); opacity: 0.55; }
+      }
+      .pill.working {
+        background: rgba(239, 246, 255, 0.96);
+        border-color: rgba(37, 99, 235, 0.45);
+        color: #1e3a8a;
+      }
+      .pill.working .dot {
+        background: #2563eb;
+        box-shadow: 0 0 0 3px rgba(37, 99, 235, 0.2);
+        animation: gebPulse 1.3s ease-in-out infinite;
+      }
+      .pill.manual {
+        background: rgba(255, 251, 235, 0.96);
+        border-color: rgba(217, 119, 6, 0.42);
+        color: #92400e;
+      }
+      .pill.manual .dot {
+        background: #f59e0b;
+        box-shadow: 0 0 0 3px rgba(245, 158, 11, 0.2);
+      }
+      .pill.overflow, .pill.paused {
+        background: rgba(248, 250, 252, 0.95);
+        border-color: rgba(148, 163, 184, 0.48);
+        color: #475569;
+      }
+      .pill.overflow .dot, .pill.paused .dot {
+        background: #94a3b8;
+        box-shadow: none;
+      }
+      .pill.disconnected {
+        background: rgba(255, 241, 242, 0.95);
+        border-color: rgba(244, 63, 94, 0.36);
+        color: #9f1239;
+      }
+      .pill.disconnected .dot {
+        background: #f43f5e;
+        box-shadow: 0 0 0 3px rgba(244, 63, 94, 0.16);
+      }
+      .sep {
+        width: 1px;
+        height: 11px;
+        background: rgba(148, 163, 184, 0.35);
+      }
+      .act {
+        border: 0;
+        background: transparent;
+        padding: 1px 4px;
+        border-radius: 5px;
+        font: inherit;
+        font-size: 11px;
+        font-weight: 650;
+        color: #2563eb;
+        cursor: pointer;
+        transition: background 0.15s ease;
+      }
+      .act:hover {
+        background: rgba(37, 99, 235, 0.1);
+      }
+      .pill.manual .act {
+        color: #b45309;
+      }
+      .pill.manual .act:hover {
+        background: rgba(217, 119, 6, 0.12);
+      }
+    `;
+
+    const pill = document.createElement("div");
+    pill.className = "pill";
+    const dot = document.createElement("span");
+    dot.className = "dot";
+    const label = document.createElement("span");
+    label.textContent = "Bridge 检测中...";
+    const sep = document.createElement("span");
+    sep.className = "sep";
+    const actionBtn = document.createElement("button");
+    actionBtn.type = "button";
+    actionBtn.className = "act";
+    actionBtn.textContent = "设为自用";
+
+    actionBtn.addEventListener("click", (ev) => {
+      ev.preventDefault();
+      ev.stopPropagation();
+      if (disposed || !chrome.runtime?.id) return;
+      actionBtn.disabled = true;
+      void (async () => {
+        try {
+          const res = await chrome.runtime.sendMessage({ type: "GEB_TOGGLE_TAB_MANUAL" });
+          if (res && res.ok && res.state) {
+            renderTakeoverState(res.state);
+          }
+        } catch (_) {
+        } finally {
+          actionBtn.disabled = false;
+        }
+      })();
+    });
+
+    pill.appendChild(dot);
+    pill.appendChild(label);
+    pill.appendChild(sep);
+    pill.appendChild(actionBtn);
+    shadow.appendChild(style);
+    shadow.appendChild(pill);
+    mountRoot.appendChild(host);
+
+    return { host, pill, label, sep, actionBtn };
+  }
+
+  function renderTakeoverState(state) {
+    if (!indicatorUi) {
+      indicatorUi = initTakeoverIndicator();
+    }
+    if (!indicatorUi || !state) return;
+    const mode = state.mode || "managed";
+    const seatTag = state.seatIndex ? ` · #${state.seatIndex}` : "";
+    indicatorUi.pill.className = `pill ${mode}`;
+
+    if (mode === "manual") {
+      indicatorUi.label.textContent = "手动自用 · 免接管";
+      indicatorUi.actionBtn.textContent = "恢复接管";
+      indicatorUi.sep.hidden = false;
+      indicatorUi.actionBtn.hidden = false;
+      indicatorUi.pill.title = "当前页面与会话已锁定为你个人手动使用，Bridge 不会接管或清空此页";
+    } else if (mode === "working") {
+      indicatorUi.label.textContent = `Bridge 工作中${seatTag}`;
+      indicatorUi.actionBtn.textContent = "设为自用";
+      indicatorUi.sep.hidden = false;
+      indicatorUi.actionBtn.hidden = false;
+      indicatorUi.pill.title = "Bridge 正在此标签页执行任务；点击“设为自用”可将该页移出接管池";
+    } else if (mode === "overflow") {
+      indicatorUi.label.textContent = `超出上限 (${state.maxTabs || 10}页) · 未接管`;
+      indicatorUi.actionBtn.textContent = "锁定自用";
+      indicatorUi.sep.hidden = false;
+      indicatorUi.actionBtn.hidden = false;
+      indicatorUi.pill.title = "当前已接管页面数已达上限，此页面暂不接入 Bridge";
+    } else if (mode === "paused") {
+      indicatorUi.label.textContent = "Bridge 已暂停 · 未接管";
+      indicatorUi.sep.hidden = true;
+      indicatorUi.actionBtn.hidden = true;
+      indicatorUi.pill.title = "右上角插件总开关已暂停";
+    } else if (mode === "disconnected") {
+      indicatorUi.label.textContent = `待连本地服务${seatTag}`;
+      indicatorUi.actionBtn.textContent = "设为自用";
+      indicatorUi.sep.hidden = false;
+      indicatorUi.actionBtn.hidden = false;
+      indicatorUi.pill.title = "已纳入接管池，正在等待本机 8000 服务连接";
+    } else {
+      indicatorUi.label.textContent = `Bridge 已接管${seatTag}`;
+      indicatorUi.actionBtn.textContent = "设为自用";
+      indicatorUi.sep.hidden = false;
+      indicatorUi.actionBtn.hidden = false;
+      indicatorUi.pill.title = "此页面已接入 Bridge 自动工作池；如需自己聊天可点“设为自用”";
+    }
+  }
+
+  async function refreshMyTakeoverState() {
+    if (
+      disposed ||
+      !chrome.runtime?.id ||
+      typeof document === "undefined" ||
+      typeof document.createElement !== "function"
+    ) {
+      return;
+    }
+    try {
+      const res = await chrome.runtime.sendMessage({ type: "GEB_GET_MY_TAKEOVER_STATE" });
+      if (res && res.ok && res.state) {
+        renderTakeoverState(res.state);
+      }
+    } catch (_) {}
+  }
 
   // Guarded Trusted Types policy for ISOLATED world
   try {
@@ -27,6 +267,17 @@
       window.trustedTypes.createPolicy("geb-bridge-isolated", { createHTML: (s) => String(s || "") });
     }
   } catch (_) {}
+
+  function assembleChunks(entry, total) {
+    if (!entry || !Number.isInteger(total) || total < 1 || total > 10000 || entry.total !== total || entry.parts.length !== total) {
+      throw new Error("传输分段缺失或数量不一致，已停止处理不完整内容。");
+    }
+    const parts = Array.from({length: total}, (_, index) => entry.parts[index]);
+    if (parts.some(part => typeof part !== "string")) {
+      throw new Error("传输分段缺失，已停止处理不完整内容。");
+    }
+    return parts.join("");
+  }
 
   class ReassemblyBuffer {
     constructor() {
@@ -41,12 +292,14 @@
       entry.parts[chunkIndex] = String(data || "");
       if (totalChunks) entry.total = totalChunks;
     }
+    has(requestId) {
+      return Boolean(requestId) && this._store.has(requestId);
+    }
     assemble(requestId, expectedTotal = 0) {
       const entry = this._store.get(requestId);
       this._store.delete(requestId);
-      if (!entry) return "";
-      const total = expectedTotal || entry.total || entry.parts.length;
-      return Array.from({ length: total }, (_, idx) => entry.parts[idx] || "").join("");
+      const total = expectedTotal || (entry ? entry.total : 0);
+      return assembleChunks(entry, total);
     }
     clear() {
       this._store.clear();
@@ -55,6 +308,19 @@
 
   const promptReassembly = new ReassemblyBuffer();
   const replyReassembly = new ReassemblyBuffer();
+  const attachmentReassembly = new ReassemblyBuffer();
+
+  function normalizeAttachmentDataUrl(rawPayload, mimeType) {
+    const raw = String(rawPayload || "").trim();
+    if (!raw) return "";
+    if (/^data:/i.test(raw)) return raw;
+    const cleanMime =
+      String(mimeType || "application/octet-stream")
+        .split(";")[0]
+        .split(",")[0]
+        .trim() || "application/octet-stream";
+    return `data:${cleanMime};base64,${raw.replace(/\s+/g, "")}`;
+  }
 
   function unwrapInlineToolChunks(text) {
     if (!text || !text.includes("[TOOL_CHUNK:")) return text;
@@ -62,43 +328,98 @@
   }
 
   function dispatchPromptToMain(message) {
-    if (message.driver_config) {
-      postToMain("configure", message.driver_config);
-    }
-    const rawPrompt = message.chunked
-      ? promptReassembly.assemble(message.request_id, message.total_chunks)
-      : String(message.prompt || "");
-    const fullPrompt = unwrapInlineToolChunks(rawPrompt);
+    try {
+      if (message.driver_config) {
+        postToMain("configure", message.driver_config);
+      }
+      const rawPrompt = message.chunked
+        ? promptReassembly.assemble(message.request_id, message.total_chunks)
+        : String(message.prompt || "");
+      const fullPrompt = unwrapInlineToolChunks(rawPrompt);
 
-    if (fullPrompt.length > MAIN_POSTMSG_CHUNK_SIZE) {
-      const total = Math.ceil(fullPrompt.length / MAIN_POSTMSG_CHUNK_SIZE);
-      for (let i = 0; i < total; i += 1) {
-        postToMain("prompt_chunk", {
+      const hydratedAttachments = (message.attachments || []).map((att) => {
+        if (!att || typeof att !== "object") return att;
+        const legacyId = att.id || att.attachment_id || "";
+        const candidateKeys = [
+          att.chunked_att_key,
+          legacyId && message.request_id ? `${message.request_id}:${legacyId}` : "",
+          legacyId
+        ].filter(Boolean);
+        const matchedKey = candidateKeys.find((k) => attachmentReassembly.has(k));
+        if (matchedKey || att.chunked_att_key) {
+          const keyToAssemble = matchedKey || att.chunked_att_key;
+          const rawReassembled = attachmentReassembly.assemble(keyToAssemble, att.total_chunks);
+          const dataUrl = normalizeAttachmentDataUrl(rawReassembled, att.mime_type);
+          const copy = { ...att, data_url: dataUrl };
+          delete copy.chunked_att_key;
+          delete copy.total_chunks;
+          return copy;
+        }
+        const inlineRaw = att.data_url || att.data_b64 || att.b64_json || att.file_data || att.data || "";
+        if (inlineRaw) {
+          return { ...att, data_url: normalizeAttachmentDataUrl(inlineRaw, att.mime_type) };
+        }
+        return att;
+      });
+
+      const mainAttachments = hydratedAttachments.map((att, idx) => {
+        const dUrl = String((att && att.data_url) || "");
+        if (dUrl.length > 131072) {
+          const attKey = `${message.request_id}:att:${idx}`;
+          const aTotal = Math.ceil(dUrl.length / 131072);
+          for (let i = 0; i < aTotal; i += 1) {
+            postToMain("attachment_chunk", {
+              att_key: attKey,
+              chunk_index: i,
+              total_chunks: aTotal,
+              data: dUrl.slice(i * 131072, (i + 1) * 131072)
+            });
+          }
+          return { ...att, data_url: "", chunked_att_key: attKey, total_chunks: aTotal };
+        }
+        return att;
+      });
+
+      if (fullPrompt.length > MAIN_POSTMSG_CHUNK_SIZE) {
+        const total = Math.ceil(fullPrompt.length / MAIN_POSTMSG_CHUNK_SIZE);
+        for (let i = 0; i < total; i += 1) {
+          postToMain("prompt_chunk", {
+            request_id: message.request_id,
+            chunk_index: i,
+            total_chunks: total,
+            data: fullPrompt.slice(i * MAIN_POSTMSG_CHUNK_SIZE, (i + 1) * MAIN_POSTMSG_CHUNK_SIZE)
+          });
+        }
+        postToMain("execute_prompt", {
           request_id: message.request_id,
-          chunk_index: i,
+          prompt: "",
+          chunked: true,
           total_chunks: total,
-          data: fullPrompt.slice(i * MAIN_POSTMSG_CHUNK_SIZE, (i + 1) * MAIN_POSTMSG_CHUNK_SIZE)
+          callback_url: message.callback_url || "",
+          attachments: mainAttachments,
+          image_generation: Boolean(message.image_generation),
+          video_generation: Boolean(message.video_generation),
+          target_model: message.target_model || null,
+          reset_chat: Boolean(message.reset_chat),
+          timeout_ms: message.timeout_ms || 600000
+        });
+      } else {
+        postToMain("execute_prompt", {
+          request_id: message.request_id,
+          prompt: fullPrompt,
+          callback_url: message.callback_url || "",
+          attachments: mainAttachments,
+          image_generation: Boolean(message.image_generation),
+          video_generation: Boolean(message.video_generation),
+          target_model: message.target_model || null,
+          reset_chat: Boolean(message.reset_chat),
+          timeout_ms: message.timeout_ms || 600000
         });
       }
-      postToMain("execute_prompt", {
-        request_id: message.request_id,
-        prompt: "",
-        chunked: true,
-        total_chunks: total,
-        callback_url: message.callback_url || "",
-        target_model: message.target_model || null,
-        reset_chat: Boolean(message.reset_chat),
-        timeout_ms: message.timeout_ms || 600000
-      });
-    } else {
-      postToMain("execute_prompt", {
-        request_id: message.request_id,
-        prompt: fullPrompt,
-        callback_url: message.callback_url || "",
-        target_model: message.target_model || null,
-        reset_chat: Boolean(message.reset_chat),
-        timeout_ms: message.timeout_ms || 600000
-      });
+    } catch (error) {
+      void chrome.runtime.sendMessage({type: "GEB_DRIVER_EVENT", payload: {
+        type: "request_error", request_id: message.request_id, submitted: false, tab_reset: false, error: error.message
+      }}).catch(() => {});
     }
   }
 
@@ -123,26 +444,8 @@
     }
   }
 
-  function disconnectKeepalivePort() {
-    if (hiddenKeepaliveTimer !== null) {
-      clearInterval(hiddenKeepaliveTimer);
-      hiddenKeepaliveTimer = null;
-    }
-    if (portRetryTimer !== null) {
-      clearTimeout(portRetryTimer);
-      portRetryTimer = null;
-    }
-    if (keepalivePort) {
-      const closingPort = keepalivePort;
-      keepalivePort = null;
-      try {
-        closingPort.disconnect();
-      } catch (_) {}
-    }
-  }
-
   function schedulePortReconnect() {
-    if (disposed || pageInBfcache || !chrome.runtime?.id || portRetryTimer !== null) return;
+    if (disposed || !chrome.runtime?.id || portRetryTimer !== null) return;
     const attempt = portRetryAttempts;
     portRetryAttempts = Math.min(attempt + 1, 6);
     const delayMs = Math.min(500 * Math.pow(2, attempt), 10000);
@@ -153,30 +456,25 @@
   }
 
   function ensureKeepalivePort() {
-    if (disposed || pageInBfcache || !chrome.runtime?.id || keepalivePort) return;
+    if (disposed || !chrome.runtime?.id || keepalivePort) return;
     try {
-      const port = chrome.runtime.connect({ name: "geb-keepalive" });
-      keepalivePort = port;
+      keepalivePort = chrome.runtime.connect({ name: "geb-keepalive" });
       portRetryAttempts = 0;
       if (portRetryTimer !== null) {
         clearTimeout(portRetryTimer);
         portRetryTimer = null;
       }
-      port.onDisconnect.addListener(() => {
-        // Always touch chrome.runtime.lastError so bfcache / navigation disconnects never log Unchecked runtime.lastError
-        void chrome.runtime?.lastError;
-        if (keepalivePort === port) {
-          keepalivePort = null;
-        }
-        if (!disposed && !pageInBfcache && chrome.runtime?.id) {
+      keepalivePort.onDisconnect.addListener(() => {
+        // Page navigation closes this port normally; consume Chrome's diagnostic.
+        void chrome.runtime.lastError;
+        keepalivePort = null;
+        if (!disposed && chrome.runtime?.id) {
           schedulePortReconnect();
         }
       });
     } catch (_) {
       keepalivePort = null;
-      if (!pageInBfcache) {
-        schedulePortReconnect();
-      }
+      schedulePortReconnect();
     }
   }
 
@@ -302,6 +600,9 @@
 
       if (data.payload.type === "driver_ready") {
         mainReady = true;
+        if (typeof data.payload.driver_version === "string" && data.payload.driver_version) {
+          mainDriverVersion = data.payload.driver_version;
+        }
         flushQueuedPrompts();
       }
 
@@ -317,16 +618,50 @@
 
       let outgoingPayload = data.payload;
       if (outgoingPayload.type === "request_complete" && outgoingPayload.chunked) {
-        const mergedReply = replyReassembly.assemble(
-          outgoingPayload.request_id,
-          outgoingPayload.total_chunks
-        );
-        outgoingPayload = { ...outgoingPayload, reply: mergedReply, chunked: false };
+        try {
+          const mergedReply = replyReassembly.assemble(outgoingPayload.request_id, outgoingPayload.total_chunks);
+          outgoingPayload = { ...outgoingPayload, reply: mergedReply, chunked: false };
+        } catch (error) {
+          outgoingPayload = {type: "request_error", request_id: outgoingPayload.request_id, error: error.message};
+        }
       }
 
       void (async () => {
         try {
           // Chunk large replies (>24KB) across chrome.runtime.sendMessage to SW for HTTP callback upload
+          const hasLargeMedia = ((outgoingPayload.output_images || []).length > 0) || ((outgoingPayload.output_files || []).length > 0);
+          if (outgoingPayload.type === "request_complete" && hasLargeMedia) {
+            const fullJson = JSON.stringify(outgoingPayload);
+            if (fullJson.length > 196608) {
+              const sliceLen = 196608;
+              const totalJsonChunks = Math.ceil(fullJson.length / sliceLen);
+              const streamKey = outgoingPayload.request_id + ":json";
+              for (let i = 0; i < totalJsonChunks; i += 1) {
+                await chrome.runtime.sendMessage({
+                  type: "GEB_DRIVER_EVENT",
+                  payload: {
+                    type: "sw_reply_chunk",
+                    request_id: outgoingPayload.request_id,
+                    stream_key: streamKey,
+                    chunk_index: i,
+                    total_chunks: totalJsonChunks,
+                    data: fullJson.slice(i * sliceLen, (i + 1) * sliceLen)
+                  }
+                });
+              }
+              await chrome.runtime.sendMessage({
+                type: "GEB_DRIVER_EVENT",
+                payload: {
+                  type: "request_complete",
+                  request_id: outgoingPayload.request_id,
+                  stream_key: streamKey,
+                  json_envelope_chunked: true,
+                  total_chunks: totalJsonChunks
+                }
+              });
+              return;
+            }
+          }
           const fullReplyStr = String(outgoingPayload.reply || "");
           if (outgoingPayload.type === "request_complete" && fullReplyStr.length > 24576) {
             const swSliceSize = 24576;
@@ -364,32 +699,28 @@
     }
   }
 
-  function onPageHide() {
-    pageInBfcache = true;
-    disconnectKeepalivePort();
-  }
-
-  function onPageShow(event) {
-    pageInBfcache = false;
-    if (!disposed && event && event.persisted) {
-      updateVisibilityKeepalive();
-    }
-  }
-
   window.addEventListener("message", onWindowMessage);
-  window.addEventListener("pagehide", onPageHide);
-  window.addEventListener("pageshow", onPageShow);
   document.addEventListener("visibilitychange", updateVisibilityKeepalive);
 
   chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
     if (disposed) return false;
-
     (async () => {
       const msgType = message && message.type ? message.type : "";
 
-      if (msgType === "GEB_PREPARE_UNLOAD") {
-        pageInBfcache = true;
-        disconnectKeepalivePort();
+      if (msgType === "GEB_ATTACHMENT_CHUNK") {
+        const chunkKey =
+          message.att_key ||
+          (message.request_id && message.attachment_id
+            ? `${message.request_id}:${message.attachment_id}`
+            : message.attachment_id || "");
+        if (chunkKey) {
+          attachmentReassembly.addChunk(
+            chunkKey,
+            message.chunk_index,
+            message.total_chunks,
+            message.data
+          );
+        }
         sendResponse({ ok: true });
         return;
       }
@@ -419,10 +750,19 @@
       }
 
       if (msgType === "GEB_GET_VISIBILITY") {
+        if (!mainDriverVersion) {
+          try {
+            const diag = await callMainAsync("diagnose", {}, 600);
+            if (diag && typeof diag.driverVersion === "string" && diag.driverVersion) {
+              mainDriverVersion = diag.driverVersion;
+            }
+          } catch (_) {}
+        }
         sendResponse({
           ok: true,
           hidden: Boolean(document.hidden || document.visibilityState === "hidden"),
-          visibilityState: document.visibilityState || "visible"
+          visibilityState: document.visibilityState || "visible",
+          driverVersion: mainDriverVersion || undefined
         });
         return;
       }
@@ -467,6 +807,14 @@
         return;
       }
 
+      if (msgType === "GEB_TAB_TAKEOVER_STATE") {
+        if (message.state) {
+          renderTakeoverState(message.state);
+        }
+        sendResponse({ ok: true });
+        return;
+      }
+
       sendResponse({ ok: true });
     })();
     return true;
@@ -483,6 +831,14 @@
         changes.customReplySelector
       ) {
         void syncDriverConfigFromStorage();
+      }
+      if (
+        changes.enabled ||
+        changes.maxParallelTabs ||
+        changes.manualTabIds ||
+        changes.manualSessionKeys
+      ) {
+        void refreshMyTakeoverState();
       }
     }
   });
@@ -504,12 +860,29 @@
 
   globalThis.__GEB_ISOLATED_CLEANUP__ = () => {
     disposed = true;
+    if (indicatorUi && indicatorUi.host && typeof indicatorUi.host.remove === "function") {
+      try {
+        indicatorUi.host.remove();
+      } catch (_) {}
+      indicatorUi = null;
+    }
     window.removeEventListener("message", onWindowMessage);
-    window.removeEventListener("pagehide", onPageHide);
-    window.removeEventListener("pageshow", onPageShow);
     document.removeEventListener("visibilitychange", updateVisibilityKeepalive);
     clearInterval(heartbeatTimer);
-    disconnectKeepalivePort();
+    if (hiddenKeepaliveTimer !== null) {
+      clearInterval(hiddenKeepaliveTimer);
+      hiddenKeepaliveTimer = null;
+    }
+    if (portRetryTimer !== null) {
+      clearTimeout(portRetryTimer);
+      portRetryTimer = null;
+    }
+    if (keepalivePort) {
+      try {
+        keepalivePort.disconnect();
+      } catch (_) {}
+      keepalivePort = null;
+    }
     for (const [, p] of pendingRpcCalls) {
       clearTimeout(p.timer);
     }
@@ -517,13 +890,16 @@
   };
 
   // Probe MAIN driver readiness immediately & sync config + visibility state
-  void (async () => {
-    try {
-      await callMainAsync("diagnose", {}, 1500);
+  callMainAsync("diagnose", {}, 1500)
+    .then((diag) => {
       mainReady = true;
+      if (diag && typeof diag.driverVersion === "string" && diag.driverVersion) {
+        mainDriverVersion = diag.driverVersion;
+      }
       flushQueuedPrompts();
-    } catch (_) {}
-  })();
+    })
+    .catch(() => {});
   void syncDriverConfigFromStorage();
   updateVisibilityKeepalive();
+  void refreshMyTakeoverState();
 })();

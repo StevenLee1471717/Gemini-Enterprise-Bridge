@@ -1,0 +1,248 @@
+"""Unit and end-to-end API tests for the local independent UsageLedger & context monitor."""
+
+from __future__ import annotations
+
+import base64
+import json
+from pathlib import Path
+
+import pytest
+from fastapi.testclient import TestClient
+
+from config import BridgeSettings
+from server import create_app
+from usage_ledger import UsageLedger, estimate_attachment_input_tokens, get_model_pricing
+
+# Minimal valid 1x1 PNG and tiny MP4/WAV bytes for multimodal E2E tests
+_TINY_PNG_B64 = (
+    "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg=="
+)
+_TINY_WAV_BYTES = (
+    b"RIFF$\x00\x00\x00WAVEfmt \x10\x00\x00\x00\x01\x00\x01\x00"
+    b"D\xac\x00\x00\x88X\x01\x00\x02\x00\x10\x00data\x00\x00\x00\x00"
+)
+_TINY_MP4_B64 = base64.b64encode(
+    b"\x00\x00\x00\x18ftypmp42\x00\x00\x00\x00mp42isom\x00\x00\x00\x08mdat"
+).decode("ascii")
+
+
+def test_ledger_time_windows_and_persistence(tmp_path: Path) -> None:
+    ledger_path = tmp_path / "usage_ledger.json"
+    ledger = UsageLedger(storage_path=ledger_path, usd_to_cny_rate=7.0)
+
+    # Older day (outside 7d, inside 30d): 1M input on Argon -> $2.00
+    ledger.record_request(
+        requested_model="gemini-4-argon",
+        prompt_tokens=1_000_000,
+        completion_tokens=0,
+        as_of_date="2026-10-25",
+    )
+    # Yesterday: 1M input, 0.1M output on Carbon -> $2.00 + $1.00 = $3.00
+    ledger.record_request(
+        requested_model="gemini-4-carbon",
+        prompt_tokens=1_000_000,
+        completion_tokens=100_000,
+        as_of_date="2026-11-12",
+    )
+    # Day 2 (today): incremental continuation, 500k total prompt (400k cached, 100k delta), 50k output
+    # Uncached = 0.5 * $2 + 0.05 * $10 = $1.50; Cached = 0.4 * $0.10 + 0.1 * $2 + 0.05 * $10 = $0.74
+    ledger.record_request(
+        requested_model="gemini-4-carbon",
+        prompt_tokens=500_000,
+        completion_tokens=50_000,
+        strategy="smart_incremental_delta",
+        cached_tokens=400_000,
+        delta_prompt_tokens=100_000,
+        as_of_date="2026-11-13",
+    )
+
+    snap = ledger.snapshot(as_of_date="2026-11-13")
+    assert snap["all_time"]["requests"] == 3
+    assert snap["all_time"]["equivalent_cost_usd"] == pytest.approx(6.50)
+    assert snap["all_time"]["cached_equivalent_cost_usd"] == pytest.approx(5.74)
+    assert snap["all_time"]["saved_cost_usd"] == pytest.approx(0.76)
+    assert snap["today"]["requests"] == 1
+    assert snap["today"]["equivalent_cost_usd"] == pytest.approx(1.50)
+    assert snap["yesterday"]["requests"] == 1
+    assert snap["yesterday"]["equivalent_cost_usd"] == pytest.approx(3.00)
+    assert snap["last_7d"]["requests"] == 2
+    assert snap["last_7d"]["equivalent_cost_usd"] == pytest.approx(4.50)
+    assert set(snap["periods"]["7d"]["by_model"].keys()) == {"gemini-4-carbon"}
+    assert snap["last_30d"]["requests"] == 3
+    assert snap["last_30d"]["equivalent_cost_usd"] == pytest.approx(6.50)
+    assert set(snap["periods"]["30d"]["by_model"].keys()) == {"gemini-4-carbon", "gemini-4-argon"}
+    assert snap["daily"]["2026-11-12"]["summary"]["equivalent_cost_usd"] == pytest.approx(3.00)
+    assert snap["current_session"]["requests"] == 3
+
+    # Reload from disk and verify atomic persistence matches
+    reloaded = UsageLedger(storage_path=ledger_path, usd_to_cny_rate=7.0)
+    re_snap = reloaded.snapshot(as_of_date="2026-11-13")
+    assert re_snap["all_time"]["requests"] == 3
+    assert re_snap["all_time"]["equivalent_cost_usd"] == pytest.approx(6.50)
+    assert re_snap["current_session"]["requests"] == 0
+    assert not hasattr(reloaded, "reset")
+
+
+def test_price_overrides_and_attachment_size_bytes() -> None:
+    rate = get_model_pricing(
+        "gemini-4-carbon",
+        overrides={"gemini-4-carbon": {"input_per_1m": 3.5, "cached_input_per_1m": 0.35, "output_per_1m": 14.0}},
+    )
+    assert rate.input_per_1m == 3.5
+    assert rate.cached_input_per_1m == 0.35
+    assert rate.output_per_1m == 14.0
+
+    # Verify collect_attachments' `size_bytes` key is honored
+    toks = estimate_attachment_input_tokens([
+        {"category": "image", "size_bytes": 1024},
+        {"category": "document", "size_bytes": 360_000},
+    ])
+    assert toks == 258 + (360_000 // 1200)
+
+
+def test_end_to_end_api_ledger_covers_all_task_types(tmp_path: Path) -> None:
+    ledger_file = tmp_path / "e2e_ledger.json"
+    settings = BridgeSettings(
+        auto_export_extension=False,
+        default_model="gemini-4-carbon",
+        api_key="",
+        generated_dir=str(tmp_path / "gen"),
+        response_store_dir=str(tmp_path / "resp_store"),
+        usage_ledger_path=str(ledger_file),
+        usd_to_cny_rate=6.8,
+    )
+    app = create_app(settings)
+    hub = app.state.hub
+
+    with TestClient(app) as client:
+        # Register a mock HTTP-polling browser worker tab
+        reg = client.post(
+            "/api/bridge/register",
+            json={
+                "client_id": "mock-ext",
+                "tab_id": 701,
+                "tab_url": "https://vertexaisearch.cloud.google.com/u/0/home",
+                "tab_title": "Gemini Enterprise",
+                "driver_mode": "auto",
+                "active_model": "4-carbon",
+            },
+        )
+        assert reg.status_code == 200
+
+        orig_stream = hub.dispatch_stream_on_slot
+
+        async def fake_stream_on_slot(*, slot, prompt, output_images=None, output_files=None, image_generation=False, video_generation=False, **kwargs):
+            if image_generation:
+                if output_images is not None:
+                    output_images.append({"data_url": "data:image/png;base64," + _TINY_PNG_B64, "mime_type": "image/png"})
+                yield "Generated image."
+                return
+            if video_generation:
+                if output_files is not None:
+                    output_files.append({"data_url": "data:video/mp4;base64," + _TINY_MP4_B64, "mime_type": "video/mp4", "name": "demo.mp4"})
+                yield "Generated video."
+                return
+            yield "Reply OK for ledger test."
+
+        hub.dispatch_stream_on_slot = fake_stream_on_slot
+        try:
+            # 1) Chat turn 1 + turn 2 (incremental delta)
+            r1 = client.post(
+                "/v1/chat/completions",
+                headers={"X-Session-Id": "sess-a"},
+                json={"messages": [{"role": "user", "content": "Hello world turn one with context."}]},
+            )
+            assert r1.status_code == 200
+            a1 = r1.json()["choices"][0]["message"]["content"]
+
+            r2 = client.post(
+                "/v1/chat/completions",
+                headers={"X-Session-Id": "sess-a"},
+                json={
+                    "messages": [
+                        {"role": "user", "content": "Hello world turn one with context."},
+                        {"role": "assistant", "content": a1},
+                        {"role": "user", "content": "Short follow-up?"},
+                    ]
+                },
+            )
+            assert r2.status_code == 200
+
+            mid_ctx = client.get("/api/status").json()["context_monitor"]
+            assert mid_ctx["primary"]["turn_count"] == 4
+            assert mid_ctx["primary"]["total_context_tokens"] > 0
+            assert mid_ctx["primary"]["compact_threshold_tokens"] == 300_000
+            assert mid_ctx["primary"]["remaining_to_compact_tokens"] == max(
+                0, 300_000 - mid_ctx["primary"]["total_context_tokens"]
+            )
+
+            # 2) Codex /v1/responses (streaming)
+            with client.stream(
+                "POST",
+                "/v1/responses",
+                json={"input": "Run Codex task check", "stream": True},
+            ) as rs:
+                assert rs.status_code == 200
+                body_txt = "".join(rs.iter_text())
+                assert "response.completed" in body_txt
+
+            # 3) Compaction (/v1/responses/compact)
+            rc = client.post(
+                "/v1/responses/compact",
+                json={"input": [{"role": "user", "content": "Long conversation to compact"}]},
+            )
+            assert rc.status_code == 200
+
+            # 4) Image generation & Image edit
+            ri = client.post("/v1/images/generations", json={"prompt": "Draw a cat"})
+            assert ri.status_code == 200
+            re_img = client.post(
+                "/v1/images/edits",
+                json={"prompt": "Add a hat", "images": ["data:image/png;base64," + _TINY_PNG_B64]},
+            )
+            assert re_img.status_code == 200
+
+            # 5) Video generation
+            rv = client.post("/v1/videos/generations", json={"prompt": "Ocean waves"})
+            assert rv.status_code == 200
+
+            # 6) Audio transcription
+            ra = client.post(
+                "/v1/audio/transcriptions",
+                files={"file": ("sample.wav", _TINY_WAV_BYTES, "audio/wav")},
+            )
+            assert ra.status_code == 200
+
+            # Verify /api/usage and /api/status
+            u_res = client.get("/api/usage")
+            assert u_res.status_code == 200
+            u_data = u_res.json()["usage"]
+            ctx_mon = u_res.json()["context_monitor"]
+
+            assert u_data["all_time"]["requests"] == 8
+            assert u_data["all_time"]["cached_tokens"] > 0
+            assert u_data["all_time"]["images_generated"] == 2
+            assert u_data["all_time"]["videos_generated"] == 1
+            assert u_data["all_time"]["audio_requests"] == 1
+            assert u_data["all_time"]["compactions"] == 1
+            assert u_data["by_task"]["chat"]["requests"] == 2
+            assert u_data["by_task"]["responses"]["requests"] == 1
+            assert u_data["by_task"]["compaction"]["requests"] == 1
+            assert u_data["by_task"]["image_gen"]["requests"] == 1
+            assert u_data["by_task"]["image_edit"]["requests"] == 1
+            assert u_data["by_task"]["video_gen"]["requests"] == 1
+            assert u_data["by_task"]["audio"]["requests"] == 1
+            assert u_data["periods"]["today"]["summary"]["requests"] == 8
+            assert u_data["periods"]["today"]["by_task"]["compaction"]["requests"] == 1
+            assert ctx_mon["primary"]["turn_count"] == 0
+
+            # Verify reset endpoint & UI controls are permanently removed
+            rst = client.post("/api/usage/reset", json={"scope": "today"})
+            assert rst.status_code in (404, 405)
+            dash_html = client.get("/").text
+            assert "resetLedgerBtn" not in dash_html
+            assert "524.3K" not in dash_html
+            assert "300.0K" in dash_html
+            assert "periodTabs" in dash_html
+        finally:
+            hub.dispatch_stream_on_slot = orig_stream

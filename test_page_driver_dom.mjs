@@ -442,8 +442,9 @@ newChatBtn.addEventListener("click", () => {
 
 // Execute page-driver.js inside VM sandbox
 let rawFetchCalls = 0;
-const baseFetch = async () => {
+const baseFetch = async (url) => {
   rawFetchCalls += 1;
+  if (String(url).startsWith("data:")) return fetch(url);
   return { ok: true, body: null };
 };
 
@@ -457,6 +458,10 @@ const sandbox = {
   Headers,
   TextDecoder,
   AbortController,
+  File,
+  DataTransfer: class {
+    constructor() { this.files = []; this.items = { add: (file) => this.files.push(file) }; }
+  },
   MessageChannel,
   Event: MockEvent,
   MouseEvent: MockEvent,
@@ -494,6 +499,32 @@ assert.equal(rawFetchCalls, 1, "Hot-reloading page-driver.js must not double-wra
 
 const api = sandbox.__GEB_MAIN_API__;
 assert.ok(api, "__GEB_MAIN_API__ must be exposed");
+
+// DOM is diagnostic input only; it must not manufacture executable tool frames.
+const typedReply = new MockElement('ucs-markdown');
+const typedPre = new MockElement('pre');
+const typedCode = new MockElement('code', {className:'language-codex_tool_call',text:JSON.stringify({name:'exec_command',arguments:{cmd:'printf "```` quoted"'}})});
+typedPre.appendChild(typedCode);typedReply.appendChild(typedPre);chatShadow.appendChild(typedReply);
+const typedText = api.collectAssistantReplyTexts().find(t=>t.includes('quoted'));
+assert.ok(typedText.includes('printf'), 'DOM diagnostics retain visible content');
+assert.ok(!typedText.includes('codex_tool_call'), 'DOM diagnostics never manufacture a tool frame');
+assert.equal(typedText,typedCode.textContent,'DOM diagnostics must not add synthetic fence text');
+typedReply.remove();
+console.log('PASS: DOM diagnostics do not manufacture client tool boundaries');
+
+// Actual Enterprise response markup lives below two Shadow DOM hosts.
+const realReply = new MockElement('ucs-response-markdown');
+const realReplyShadow = realReply.attachShadow();
+const fastMarkdown = new MockElement('ucs-fast-markdown');
+const fastShadow = fastMarkdown.attachShadow();
+const markdownDocument = new MockElement('div',{className:'markdown-document'});
+const codeBlock = new MockElement('ucs-code-block',{attrs:{language:'codex_tool_call'}});
+const codeBlockPre = new MockElement('pre');
+codeBlockPre.appendChild(new MockElement('code',{className:'language-codex_tool_call',text:JSON.stringify({name:'exec_command',arguments:{cmd:'cat seed.txt'}})}));
+codeBlock.appendChild(codeBlockPre);markdownDocument.appendChild(codeBlock);fastShadow.appendChild(markdownDocument);realReplyShadow.appendChild(fastMarkdown);chatShadow.appendChild(realReply);
+assert.ok(api.collectAssistantReplyTexts().some(t=>t.includes('cat seed.txt')));
+realReply.remove();
+console.log('PASS: real Enterprise nested response markup preserves client calls');
 
 // Test 1: Initial diagnosis detects "Auto" model pill & New Chat button & 2 existing reply bubbles
 const diag0 = api.diagnoseCurrentPage();
@@ -624,6 +655,16 @@ sandbox.window.postMessage = (msg) => {
   }
 };
 
+async function finishNetworkReply(text) {
+  const job = sandbox.__GEB_MAIN_STATE__.getActiveJob();
+  job.submissionStarted = true;
+  const stream = new ReadableStream({start(controller) {
+    controller.enqueue(new TextEncoder().encode(JSON.stringify([{groundedContent:{content:{text}}}])));
+    controller.close();
+  }});
+  await sandbox.__GEB_MAIN_STATE__.consumeStream(stream, job);
+}
+
 // Simulate both short background replies AND 140KB+ large tool-call replies without TrustedHTML errors!
 let nextSimulatedReplyOverride = "";
 sendBtn.addEventListener("click", () => {
@@ -632,6 +673,7 @@ sendBtn.addEventListener("click", () => {
   nextSimulatedReplyOverride = "";
   const replyNode = new MockElement("ucs-markdown", { text: replyBody });
   chatShadow.appendChild(replyNode);
+  void finishNetworkReply(replyNode.innerText);
 });
 
 const bgStart = Date.now();
@@ -659,7 +701,7 @@ const largePrompt = Array.from({ length: 1900 }, (_, i) => `// line ${i}\n${larg
 assert.ok(largePrompt.length > 130000, "Large prompt must exceed 130KB");
 
 const largeCodeArg = "X".repeat(138000);
-const expectedLargeReply = `[TOOL_CALL]{"name": "write_file", "arguments": {"path": "big.ts", "content": "${largeCodeArg}"}}[/TOOL_CALL]`;
+const expectedLargeReply = `\`\`\`codex_tool_call\n{"name": "write_file", "arguments": {"path": "big.ts", "content": "${largeCodeArg}"}}\n\`\`\``;
 nextSimulatedReplyOverride = expectedLargeReply;
 
 const chunkLen = 32768;
@@ -756,6 +798,7 @@ sendBtn._listeners.set("click", [
     proseMirror._text = "";
     const replyNode = new MockElement("ucs-markdown", { text: `Self-healed reply: ${submittedText}` });
     chatShadow.appendChild(replyNode);
+  void finishNetworkReply(replyNode.innerText);
   }
 ]);
 
@@ -775,5 +818,269 @@ assert.ok(healedEv, "Must complete prompt after background tab self-heal");
 assert.equal(healedEv.reply, "Self-healed reply: Prompt needing background tab self-heal");
 sendBtn._listeners.set("click", savedSendListeners);
 
+// Match the current landing-page composer name and its deeper editor nesting.
+searchBox.tagName = "UCS-SEARCH-BAR";
+pmHost.remove();
+let editorParent = searchShadow;
+for (let i = 0; i < 8; i += 1) {
+  const wrapper = new MockElement("div");
+  editorParent.appendChild(wrapper);
+  editorParent = wrapper;
+}
+editorParent.appendChild(pmHost);
+
+// Real upload completion can show only an image preview and a Remove file button, without a filename.
+const fileInput = new MockElement("input", { attrs: { type: "file" } });
+searchShadow.appendChild(fileInput);
+let changedFiles = null;
+fileInput.addEventListener("change", () => {
+  changedFiles = fileInput.files;
+  const remove = new MockElement("button", { attrs: { "aria-label": "Remove file" } });
+  remove.style.opacity = "0"; // Actual page reveals this control only on hover.
+  searchShadow.appendChild(remove);
+});
+await api.attachImagesToComposer([{ data_url: "data:image/png;base64,iVBORw0KGgo=", name: "never-visible.png", mime_type: "image/png" }]);
+assert.equal(changedFiles.length, 1);
+assert.equal(changedFiles[0].name, "never-visible.png");
+assert.equal(changedFiles[0].type, "image/png");
+// Remove the mock composer attachment after its completed upload.
+for (const button of searchShadow.querySelectorAll('button')) {
+  if (button.getAttribute("aria-label") === "Remove file") button.remove();
+}
+// Seven real attachments can contain eight nested chip wrappers. They must not
+// satisfy an eight-file upload before the final remove control appears.
+let finalAttachmentArrived = false;
+fileInput._listeners.set("change", [() => {
+  for (let i = 0; i < 7; i += 1) {
+    const wrapper = new MockElement("ucs-file-chip");
+    wrapper.appendChild(new MockElement("mat-chip"));
+    wrapper.appendChild(new MockElement("button", {attrs: {"aria-label": "Remove file"}}));
+    searchShadow.appendChild(wrapper);
+  }
+  // An unrelated old conversation button must not count as a composer attachment.
+  const oldRemove = new MockElement("button", {attrs: {"aria-label": "Remove file"}});
+  chatShadow.appendChild(oldRemove);
+  setTimeout(() => {
+    finalAttachmentArrived = true;
+    searchShadow.appendChild(new MockElement("button", {attrs: {"aria-label": "Remove file"}}));
+    oldRemove.remove();
+  }, 2200);
+}]);
+await api.attachFilesToComposer(Array.from({length:8}, (_, i) => ({data_url: "data:image/png;base64,iVBORw0KGgo=", name: `image-${i}.png`, mime_type: "image/png"})));
+assert.ok(finalAttachmentArrived, "nested chips or old conversation controls must not masquerade as complete uploads");
+await assert.rejects(api.attachFilesToComposer([]), /残留/);
+for (const el of searchShadow.querySelectorAll('ucs-file-chip, button')) {
+  if (el.tagName.toLowerCase() === "ucs-file-chip" || el.getAttribute("aria-label") === "Remove file") el.remove();
+}
+
+searchBox.tagName = "UCS-SEARCH-BOX";
+pmHost.remove();
+searchShadow.appendChild(pmHost);
+
+// A cancelled job must never submit, even when the Send button is available.
+let unexpectedSends = 0;
+sendBtn._listeners.set("click", [() => { unexpectedSends += 1; }]);
+await assert.rejects(api.submitComposerWithVerification(proseMirror, "cancelled", {cancelled: true, networkText: ""}), /取消/);
+assert.equal(unexpectedSends, 0);
+
+// The request can be sent before any reply or DOM acknowledgement arrives.
+let submittedOnce = 0;
+const slowJob = {cancelled:false, networkText:"", networkDone:false};
+sendBtn._listeners.set("click", [() => { submittedOnce += 1; slowJob.submissionStarted = true; }]);
+await api.submitComposerWithVerification(proseMirror, "slow network headers", slowJob, api.collectAssistantReplyTexts().length);
+assert.equal(submittedOnce, 1, "an in-flight network request must prevent fallback resubmissions");
+
+// An interrupted network stream must not become a successful DOM fallback.
+let stopClicks = 0;
+const stopBtn = new MockElement("button", {attrs: {"aria-label": "Stop generating"}});
+stopBtn.addEventListener("click", () => { stopClicks += 1; stopBtn.parentNode.removeChild(stopBtn); });
+sendBtn._listeners.set("click", [() => {
+  const job = sandbox.__GEB_MAIN_STATE__.getActiveJob();
+  job.networkText = "partial answer";
+  job.networkError = "simulated dropped stream";
+  chatShadow.appendChild(new MockElement("ucs-markdown", {text: "partial answer"}));
+  chatShadow.appendChild(stopBtn);
+}]);
+await api.executePromptJob({request_id: "req-network-failure", prompt: "must fail", reset_chat: false});
+assert.ok(emittedEvents.some(e => e.type === "request_error" && e.request_id === "req-network-failure" && /dropped/.test(e.error)));
+assert.ok(!emittedEvents.some(e => e.type === "request_complete" && e.request_id === "req-network-failure"));
+assert.equal(stopClicks, 1, "an error must stop the actual page generation");
+
+// Cancel while the page is generating: click Stop and emit no completion.
+sendBtn._listeners.set("click", [() => {
+  chatShadow.appendChild(stopBtn);
+  doc.dispatchEvent(Object.assign(new MockEvent("message"), {
+    source: vmWindow, origin: mockLocation.origin,
+    data: {channel:"GEB_ISOLATED_TO_MAIN", action:"cancel_request", payload:{request_id:"req-cancel-generation"}}
+  }));
+}]);
+await api.executePromptJob({request_id: "req-cancel-generation", prompt: "cancel after submit", reset_chat: false});
+assert.equal(stopClicks, 2);
+assert.ok(!emittedEvents.some(e => e.type === "request_complete" && e.request_id === "req-cancel-generation"));
+sendBtn._listeners.set("click", savedSendListeners);
+
+// A rendered code block has an artificial closing fence before its JSON finishes growing.
+const growthListeners = (sendBtn._listeners.get('click') || []).slice();
+const growthPayload = JSON.stringify({name:'exec_command',arguments:{cmd:'printf DOM_GROWTH_OK'}});
+sendBtn._listeners.set('click',[()=>{
+  const bubble = new MockElement('ucs-markdown');
+  bubble.appendChild(new MockElement('p',{text:'正在读取。'}));
+  const pre = new MockElement('pre');
+  const code = new MockElement('code',{className:'language-codex_tool_call',text:growthPayload.slice(0,40)});
+  pre.appendChild(code);bubble.appendChild(pre);chatShadow.appendChild(bubble);chatShadow.appendChild(stopBtn);
+  realSetTimeout(()=>{code._text = growthPayload.slice(0,52);},420);
+  realSetTimeout(()=>{code._text = growthPayload;void finishNetworkReply('```codex_tool_call\n'+growthPayload+'\n```');stopBtn.remove();},900);
+}]);
+await api.executePromptJob({request_id:'req-dom-tool-growth',prompt:'DOM growth test',reset_chat:false});
+const growthEvents = emittedEvents.filter(e=>e.request_id==='req-dom-tool-growth');
+const growthStream = growthEvents.filter(e=>e.type==='stream_chunk').map(e=>e.delta).join('');
+const growthComplete = growthEvents.find(e=>e.type==='request_complete');
+assert.ok(growthComplete,'the rendered tool call must complete');
+assert.ok(growthComplete.reply.startsWith(growthStream),'DOM tool growth must keep a stable streamed prefix');
+assert.equal(growthStream,'```codex_tool_call\n'+growthPayload+'\n```','only complete original network payload reaches transport');
+assert.ok(growthComplete.reply.includes('DOM_GROWTH_OK'));
+sendBtn._listeners.set('click',growthListeners);
+console.log('PASS: growing DOM tool blocks retain a stable prefix');
+
+// Render order cannot select the source; original response is always authoritative.
+for (const source of ['network','dom']) {
+  const listenersBefore = (sendBtn._listeners.get('click') || []).slice();
+  const id = 'req-source-lock-'+source;
+  sendBtn._listeners.set('click',[()=>{
+    const job = sandbox.__GEB_MAIN_STATE__.getActiveJob();
+    const reply = new MockElement('ucs-markdown',{text:source==='network'?'DOM rendering is longer than the network text':'DOM first stable text'});
+    chatShadow.appendChild(reply);
+    if (source==='network') {
+      job.networkText='NETWORK_RAW';job.onNetworkDelta('NETWORK_RAW');
+      realSetTimeout(()=>{job.networkDone=true;job.onNetworkDone();},2300);
+    } else {
+      chatShadow.appendChild(stopBtn);
+      realSetTimeout(()=>{job.networkText='DIFFERENT_NETWORK_TEXT';job.onNetworkDelta(job.networkText);job.networkDone=true;job.onNetworkDone();stopBtn.remove();},900);
+    }
+  }]);
+  await api.executePromptJob({request_id:id,prompt:'transport lock test',reset_chat:false});
+  const events = emittedEvents.filter(e=>e.request_id===id);
+  const streamed=events.filter(e=>e.type==='stream_chunk').map(e=>e.delta).join('');
+  const completed=events.find(e=>e.type==='request_complete');
+  assert.ok(completed,'locked source must complete');
+  assert.ok(completed.reply.startsWith(streamed),'reply source cannot switch after streaming');
+  assert.equal(completed.reply,source==='network'?'NETWORK_RAW':'DIFFERENT_NETWORK_TEXT');
+  sendBtn._listeners.set('click',listenersBefore);
+}
+console.log('PASS: original response remains authoritative when DOM appears earlier');
+
+// Missing input chunks must fail before entering anything in the composer.
+for (const [action, payload] of [
+  ["prompt_chunk", {request_id:"req-missing-chunk", chunk_index:0, total_chunks:2, data:"only half"}],
+  ["execute_prompt", {request_id:"req-missing-chunk", chunked:true, total_chunks:2}]
+]) doc.dispatchEvent(Object.assign(new MockEvent("message"), {
+  source:vmWindow, origin:mockLocation.origin, data:{channel:"GEB_ISOLATED_TO_MAIN", action, payload}
+}));
+await new Promise(r => realSetTimeout(r, 30));
+assert.ok(emittedEvents.some(e => e.type === "request_error" && e.request_id === "req-missing-chunk" && /分段/.test(e.error)));
+
 console.log("ALL_SHADOW_DOM_DRIVER_TESTS_PASSED");
+
+{
+ const saved=(sendBtn._listeners.get('click')||[]).slice();
+ sendBtn._listeners.set('click',[()=>{
+  const reply=new MockElement('ucs-markdown',{text:'正在读取文件。未完成的排版'});
+  chatShadow.appendChild(reply);chatShadow.appendChild(stopBtn);
+  realSetTimeout(()=>{reply._text='正在读取文件。\n\n最终排版';void finishNetworkReply(reply._text);stopBtn.remove();},900);
+ }]);
+ await api.executePromptJob({request_id:'req-dom-rewrite-regression',prompt:'rewrite test',reset_chat:false});
+ const events=emittedEvents.filter(e=>e.request_id==='req-dom-rewrite-regression');
+ const streamed=events.filter(e=>e.type==='stream_chunk').map(e=>e.delta).join('');
+ const result=events.find(e=>e.type==='request_complete');
+ assert.equal(streamed,'正在读取文件。\n\n最终排版');
+ assert.equal(result.reply,streamed);
+ assert.equal(result.source,'network_stream');
+ sendBtn._listeners.set('click',saved);
+ console.log('PASS: rewritten DOM never reaches client stream or completion');
+}
+// A terminal callback cannot emit after the job has already completed.
+{
+ let finishedJob;
+ const saved=(sendBtn._listeners.get('click')||[]).slice();
+ sendBtn._listeners.set('click',[()=>{finishedJob=sandbox.__GEB_MAIN_STATE__.getActiveJob();void finishNetworkReply('terminal');}]);
+ await api.executePromptJob({request_id:'req-late-delta',prompt:'late callback test',reset_chat:false});
+ const count=emittedEvents.length;
+ sandbox.__GEB_MAIN_STATE__.parsePacket({groundedContent:{content:{text:'stale data'}}},finishedJob);
+ finishedJob.onNetworkDelta('stale data');
+ assert.equal(emittedEvents.length,count);
+ assert.equal(finishedJob.networkText,'terminal');
+ sendBtn._listeners.set('click',saved);
+ console.log('PASS: completed response rejects late callbacks');
+}
+
+
+{
+ const saved=(sendBtn._listeners.get('click')||[]).slice();
+ const id='req-missing-original-response';
+ sendBtn._listeners.set('click',[()=>{
+  const job=sandbox.__GEB_MAIN_STATE__.getActiveJob();
+  chatShadow.appendChild(new MockElement('ucs-markdown',{text:'A complete-looking page must not become a response'}));
+  realSetTimeout(()=>{job.networkError='original response unavailable';},1900);
+ }]);
+ await api.executePromptJob({request_id:id,prompt:'no original response test',reset_chat:false});
+ const events=emittedEvents.filter(e=>e.request_id===id);
+ assert.ok(events.some(e=>e.type==='request_error' && /unavailable/.test(e.error)));
+ assert.ok(!events.some(e=>e.type==='stream_chunk' || e.type==='request_complete'));
+ sendBtn._listeners.set('click',saved);
+ console.log('PASS: a missing original response never becomes DOM success');
+}
+
+// Direct clipboard paste fallback when no <input type="file"> exists on the page
+{
+ fileInput.remove();
+ let pastedFiles = [];
+ const onPaste = (ev) => {
+  const dt = ev.clipboardData || ev.dataTransfer;
+  if (dt && dt.files) {
+   pastedFiles = Array.from(dt.files);
+   const remBtn = new MockElement('button', { attrs: { 'aria-label': 'Remove file' } });
+   searchShadow.appendChild(remBtn);
+  }
+ };
+ proseMirror.addEventListener('paste', onPaste);
+ await api.attachFilesToComposer([{ data_url: 'data:image/png;base64,iVBORw0KGgo=', name: 'clipboard-pasted.png', mime_type: 'image/png' }]);
+ assert.equal(pastedFiles.length, 1);
+ assert.equal(pastedFiles[0].name, 'clipboard-pasted.png');
+ for (const b of searchShadow.querySelectorAll('button')) {
+  if (b.getAttribute('aria-label') === 'Remove file') b.remove();
+ }
+ searchShadow.appendChild(fileInput);
+ console.log('PASS: clipboard paste fallback attaches files directly when file input is absent');
+}
+
+// Flexible attachment payload formats: empty-MIME data URL, plain text data URL, and raw base64
+{
+ let uploaded = [];
+ fileInput._listeners.set('change', [() => {
+  uploaded = Array.from(fileInput.files || []);
+  for (let i = 0; i < uploaded.length; i += 1) {
+   searchShadow.appendChild(new MockElement('button', { attrs: { 'aria-label': 'Remove file' } }));
+  }
+ }]);
+ await api.attachFilesToComposer([
+  { data_url: 'data:;base64,SGVsbG8=', name: 'empty-mime.txt', mime_type: 'text/plain; charset=utf-8' },
+  { data_url: 'data:text/plain;charset=utf-8,Hello%20World', name: 'plain-url.txt', mime_type: 'text/plain' },
+  { data_url: 'iVBORw0KGgo=', filename: 'raw-b64.png', mime_type: 'image/png' }
+ ]);
+ assert.equal(uploaded.length, 3);
+ assert.equal(uploaded[0].name, 'empty-mime.txt');
+ assert.equal(uploaded[0].type, 'text/plain');
+ assert.equal(uploaded[1].name, 'plain-url.txt');
+ assert.equal(uploaded[2].name, 'raw-b64.png');
+ assert.equal(uploaded[2].type, 'image/png');
+ for (const b of searchShadow.querySelectorAll('button')) {
+  if (b.getAttribute('aria-label') === 'Remove file') b.remove();
+ }
+ await assert.rejects(
+  () => api.attachFilesToComposer([{ data_url: '', name: 'empty.bin', mime_type: 'application/octet-stream' }]),
+  /附件内容格式无效/
+ );
+ console.log('PASS: flexible attachment formats accepted and empty payloads rejected cleanly');
+}
+
 process.exit(0);

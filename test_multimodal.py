@@ -15,7 +15,8 @@ import pytest
 from config import BridgeSettings
 from extension_exporter import render_spark_icon_png
 from imagegen_mcp import handle as mcp_handle
-from media_inputs import FileStore, InvalidAttachmentError, resolve_mime_and_name
+import media_inputs
+from media_inputs import FileStore, InvalidAttachmentError, _find_binary, resolve_mime_and_name
 from server import create_app
 from test_responses import browser, packets
 
@@ -178,11 +179,16 @@ def test_v1_files_multipart_and_json_crud(tmp_path: Path) -> None:
         assert client.get(f"/v1/files/{fid}").status_code == 404
 
 
+def _has_audio_transcoder() -> bool:
+    return bool(_find_binary("ffmpeg") or _find_binary("afconvert", ("/usr/bin/afconvert",)))
+
+
 def test_responses_and_chat_multimodal_parts_and_large_staging(tmp_path: Path) -> None:
     pdf_raw = _make_pdf_bytes("DOC-42")
     wav_raw = _make_wav_bytes()
     mp4_raw = _make_mp4_bytes(tmp_path)
     big_csv = ("col1,col2\n" + ("alpha,1234567890\n" * 95000)).encode("utf-8")  # > 1.5 MB -> staged via fetch_url!
+    expected_audio_mime = "audio/mp4" if _has_audio_transcoder() else "audio/wav"
 
     with browser(["Read PDF, audio, video, and large CSV."], generated_dir=str(tmp_path)) as (client, commands):
         up_csv = client.post("/v1/files", json={
@@ -207,7 +213,7 @@ def test_responses_and_chat_multimodal_parts_and_large_staging(tmp_path: Path) -
         assert len(atts) == 4
         by_cat = {a["category"]: a for a in atts if a["name"] != "huge.csv"}
         assert by_cat["document"]["name"] == "brief.pdf"
-        assert by_cat["audio"]["mime_type"] == "audio/mp4"  # normalized from WAV!
+        assert by_cat["audio"]["mime_type"] == expected_audio_mime
         assert by_cat["video"]["mime_type"] == "video/mp4"
 
         huge_att = next(a for a in atts if a["name"] == "huge.csv")
@@ -224,6 +230,7 @@ def test_multimodal_outputs_image_edits_video_gen_and_audio_transcription(tmp_pa
     mp4_url = "data:video/mp4;base64," + base64.b64encode(mp4_raw).decode()
     pdf_raw = _make_pdf_bytes("OUT-PDF")
     pdf_url = "data:application/pdf;base64," + base64.b64encode(pdf_raw).decode()
+    expected_voice_name = "voice.m4a" if _has_audio_transcoder() else "voice.wav"
 
     replies = [
         {"type": "request_complete", "reply": "", "output_images": [{"data_url": png_url}]},
@@ -252,7 +259,7 @@ def test_multimodal_outputs_image_edits_video_gen_and_audio_transcription(tmp_pa
         dl_path = "/v1/files/" + vdata["file_id"] + "/content"
         assert client.get(dl_path).content == mp4_raw
 
-        # 3. /v1/audio/transcriptions (multipart WAV -> auto-converted M4A)
+        # 3. /v1/audio/transcriptions (multipart WAV -> auto-converted M4A when transcoder available)
         tr = client.post(
             "/v1/audio/transcriptions",
             files={"file": ("voice.wav", _make_wav_bytes(), "audio/wav")},
@@ -260,7 +267,7 @@ def test_multimodal_outputs_image_edits_video_gen_and_audio_transcription(tmp_pa
         )
         assert tr.status_code == 200
         assert tr.json()["text"] == "The verification code is 7492."
-        assert commands[2]["attachments"][0]["name"] == "voice.m4a"
+        assert commands[2]["attachments"][0]["name"] == expected_voice_name
 
         # 4. Streaming /v1/responses with generated downloadable PDF attachment
         evts = packets(client.post("/v1/responses", json={"input": "Export report", "stream": True}).text)
@@ -330,3 +337,17 @@ def test_same_semver_outdated_driver_version_triggers_extension_reload() -> None
         assert reply.get("_emit_extension_reload") == APP_VERSION
 
     asyncio.run(_check())
+
+
+def test_wav_fallback_when_no_audio_transcoder_installed(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    monkeypatch.setattr(media_inputs, "_find_binary", lambda *a, **kw: None)
+    monkeypatch.setattr("test_multimodal._find_binary", lambda *a, **kw: None)
+    monkeypatch.setattr("test_multimodal._find_tool", lambda *a, **kw: None)
+
+    r_dir = tmp_path / "responses"
+    r_dir.mkdir()
+    test_responses_and_chat_multimodal_parts_and_large_staging(r_dir)
+
+    m_dir = tmp_path / "outputs"
+    m_dir.mkdir()
+    test_multimodal_outputs_image_edits_video_gen_and_audio_transcription(m_dir)

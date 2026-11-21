@@ -1,6 +1,7 @@
 """Reproductions for the second gateway reliability audit."""
 import asyncio
 import json
+import os
 import time
 
 import pytest
@@ -62,9 +63,11 @@ def test_compaction_survives_reopen_and_normal_response_expiry(tmp_path):
     reopened = ResponseStore(directory=tmp_path)
     with pytest.raises(ResponsesError):
         reopened.get('bridge_compact_test')
-    import os
-    expected_mode = 0o666 if os.name == 'nt' else 0o600
-    assert (tmp_path / 'responses.sqlite3').stat().st_mode & 0o777 == expected_mode
+    db_mode = (tmp_path / 'responses.sqlite3').stat().st_mode & 0o777
+    if os.name == 'nt':
+        assert (db_mode & 0o600) == 0o600
+    else:
+        assert db_mode == 0o600
     reopened.close()
 
 

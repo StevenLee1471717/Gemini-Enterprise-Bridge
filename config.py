@@ -2,27 +2,41 @@
 
 from __future__ import annotations
 
+import io
 import os
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import List
 
+from schemas import DEFAULT_MODEL_ID, normalize_default_model
 from version import DEFAULT_GITHUB_REPO
+
+
+def _read_dotenv_text(dotenv_path: Path) -> str:
+    """Decode .env resiliently across UTF-8, UTF-8 with BOM (Notepad/PS5.1), and GBK/GB18030."""
+    raw_bytes = dotenv_path.read_bytes()
+    for enc in ("utf-8-sig", "gb18030"):
+        try:
+            return raw_bytes.decode(enc)
+        except UnicodeDecodeError:
+            continue
+    return raw_bytes.decode("utf-8", errors="replace").lstrip("\ufeff")
 
 
 def _load_dotenv_file(dotenv_path: Path) -> None:
     """Load key=value pairs from .env without failing if python-dotenv is absent."""
     if not dotenv_path.is_file():
         return
+    text = _read_dotenv_text(dotenv_path)
     try:
         from dotenv import load_dotenv  # type: ignore
 
-        load_dotenv(dotenv_path=dotenv_path, override=False)
+        load_dotenv(stream=io.StringIO(text), override=False)
         return
     except ImportError:
         pass
 
-    for raw_line in dotenv_path.read_text(encoding="utf-8").splitlines():
+    for raw_line in text.splitlines():
         line = raw_line.strip()
         if not line or line.startswith("#") or "=" not in line:
             continue
@@ -69,11 +83,11 @@ class BridgeSettings:
     api_key: str = ""
     backend_mode: str = "browser"  # browser | auto | gcloud
     context_mode: str = "smart"  # smart | last_message | transcript
-    default_model: str = "gemini-enterprise-web"
+    default_model: str = DEFAULT_MODEL_ID
     request_timeout_seconds: float = 600.0
     queue_timeout_seconds: float = 300.0
     auto_reset_new_chat: bool = True
-    max_parallel_tabs: int = 6
+    max_parallel_tabs: int = 10
     auto_spawn_tabs: bool = True
     session_affinity_ttl_seconds: float = 300.0
     include_citations: bool = True
@@ -86,6 +100,7 @@ class BridgeSettings:
     usage_ledger_path: str = ""
     session_archive_path: str = ""
     distribution_path: str = ""
+    tunnel_state_path: str = ""
     host_reserved_slots: int = 2
     usd_to_cny_rate: float = 6.8
     price_overrides_json: str = ""
@@ -105,6 +120,9 @@ class BridgeSettings:
     gcp_engine_id: str = ""
     gcp_collection_id: str = "default_collection"
     gcloud_binary: str = "gcloud"
+
+    def __post_init__(self) -> None:
+        self.default_model = normalize_default_model(self.default_model, DEFAULT_MODEL_ID)
 
     @classmethod
     def from_env(cls, base_dir: Path | None = None) -> "BridgeSettings":
@@ -128,12 +146,14 @@ class BridgeSettings:
             api_key=os.getenv("BRIDGE_API_KEY", "").strip(),
             backend_mode=backend_mode,
             context_mode=context_mode,
-            default_model=os.getenv("BRIDGE_DEFAULT_MODEL", "gemini-enterprise-web").strip()
-            or "gemini-enterprise-web",
+            default_model=normalize_default_model(
+                os.getenv("BRIDGE_DEFAULT_MODEL", DEFAULT_MODEL_ID),
+                DEFAULT_MODEL_ID,
+            ),
             request_timeout_seconds=_env_float("BRIDGE_REQUEST_TIMEOUT", 600.0),
             queue_timeout_seconds=_env_float("BRIDGE_QUEUE_TIMEOUT", 300.0),
             auto_reset_new_chat=_env_bool("BRIDGE_AUTO_RESET_NEW_CHAT", True),
-            max_parallel_tabs=max(1, _env_int("BRIDGE_MAX_PARALLEL_TABS", 6)),
+            max_parallel_tabs=max(1, min(200, _env_int("BRIDGE_MAX_PARALLEL_TABS", 10))),
             auto_spawn_tabs=_env_bool("BRIDGE_AUTO_SPAWN_TABS", True),
             session_affinity_ttl_seconds=max(
                 0.0, _env_float("BRIDGE_SESSION_AFFINITY_TTL", 300.0)
@@ -157,6 +177,9 @@ class BridgeSettings:
             ).strip(),
             distribution_path=os.getenv(
                 "BRIDGE_DISTRIBUTION_PATH", str(root / ".cache" / "distribution.json")
+            ).strip(),
+            tunnel_state_path=os.getenv(
+                "BRIDGE_TUNNEL_STATE_PATH", ""
             ).strip(),
             host_reserved_slots=max(0, _env_int("BRIDGE_HOST_RESERVED_SLOTS", 2)),
             usd_to_cny_rate=_env_float("BRIDGE_USD_TO_CNY_RATE", 6.8),

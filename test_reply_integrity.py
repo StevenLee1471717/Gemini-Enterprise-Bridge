@@ -136,27 +136,27 @@ def test_local_file_and_app_paths_become_clickable_markdown_links_across_chunks(
     folder_only = tmp_path
     raw = (
         '**你可以直接双击体验的位置**\n'
-        '- 双击启动器：`/Users/ericwang/Documents/ChatGPT/roguelike/tps-edition/outputs/余烬圣所 · 第三人称版.app`\n'
-        '- 或直接打开网页版：`/Users/ericwang/Documents/ChatGPT/roguelike/tps-edition/outputs/sanctum-of-ash-tps.html`\n'
-        '- 代码位置：`/Users/ericwang/Documents/ChatGPT/gemini bridge/work/Gemini-Enterprise-Bridge/schemas.py:229`\n'
-        f'- 目录保留：`{folder_only}` 与接口 `/api/status` 及命令 `python3 /Users/ericwang/run.py`\n'
-        '- 已有链接保持：[说明](</Users/ericwang/Documents/ChatGPT/gemini bridge/README.md>) 与 [`标签`](/Users/ericwang/a.py)\n'
+        '- 双击启动器：`/Users/alice/Documents/Projects/roguelike/tps-edition/outputs/余烬圣所 · 第三人称版.app`\n'
+        '- 或直接打开网页版：`/Users/alice/Documents/Projects/roguelike/tps-edition/outputs/sanctum-of-ash-tps.html`\n'
+        '- 代码位置：`/Users/alice/Documents/Projects/gemini bridge/work/Gemini-Enterprise-Bridge/schemas.py:229`\n'
+        f'- 目录保留：`{folder_only}` 与接口 `/api/status` 及命令 `python3 /Users/alice/run.py`\n'
+        '- 已有链接保持：[说明](</Users/alice/Documents/Projects/gemini bridge/README.md>) 与 [`标签`](/Users/alice/a.py)\n'
         '```sh\n'
-        'open "/Users/ericwang/Documents/ChatGPT/roguelike/tps-edition/outputs/sanctum-of-ash-tps.html"\n'
-        'p=`/Users/ericwang/Documents/ChatGPT/roguelike/tps-edition/outputs/sanctum-of-ash-tps.html`\n'
+        'open "/Users/alice/Documents/Projects/roguelike/tps-edition/outputs/sanctum-of-ash-tps.html"\n'
+        'p=`/Users/alice/Documents/Projects/roguelike/tps-edition/outputs/sanctum-of-ash-tps.html`\n'
         '```\n'
-        + call(cmd='ls "/Users/ericwang/Documents/ChatGPT/roguelike/tps-edition/outputs/sanctum-of-ash-tps.html"')
+        + call(cmd='ls "/Users/alice/Documents/Projects/roguelike/tps-edition/outputs/sanctum-of-ash-tps.html"')
     )
     expected_prose = (
         '**你可以直接双击体验的位置**\n'
-        '- 双击启动器：[余烬圣所 · 第三人称版.app](</Users/ericwang/Documents/ChatGPT/roguelike/tps-edition/outputs/余烬圣所 · 第三人称版.app>)\n'
-        '- 或直接打开网页版：[sanctum-of-ash-tps.html](/Users/ericwang/Documents/ChatGPT/roguelike/tps-edition/outputs/sanctum-of-ash-tps.html)\n'
-        '- 代码位置：[schemas.py:229](</Users/ericwang/Documents/ChatGPT/gemini bridge/work/Gemini-Enterprise-Bridge/schemas.py:229>)\n'
-        f'- 目录保留：`{folder_only}` 与接口 `/api/status` 及命令 `python3 /Users/ericwang/run.py`\n'
-        '- 已有链接保持：[说明](</Users/ericwang/Documents/ChatGPT/gemini bridge/README.md>) 与 [`标签`](/Users/ericwang/a.py)\n'
+        '- 双击启动器：[余烬圣所 · 第三人称版.app](</Users/alice/Documents/Projects/roguelike/tps-edition/outputs/余烬圣所 · 第三人称版.app>)\n'
+        '- 或直接打开网页版：[sanctum-of-ash-tps.html](/Users/alice/Documents/Projects/roguelike/tps-edition/outputs/sanctum-of-ash-tps.html)\n'
+        '- 代码位置：[schemas.py:229](</Users/alice/Documents/Projects/gemini bridge/work/Gemini-Enterprise-Bridge/schemas.py:229>)\n'
+        f'- 目录保留：`{folder_only}` 与接口 `/api/status` 及命令 `python3 /Users/alice/run.py`\n'
+        '- 已有链接保持：[说明](</Users/alice/Documents/Projects/gemini bridge/README.md>) 与 [`标签`](/Users/alice/a.py)\n'
         '```sh\n'
-        'open "/Users/ericwang/Documents/ChatGPT/roguelike/tps-edition/outputs/sanctum-of-ash-tps.html"\n'
-        'p=`/Users/ericwang/Documents/ChatGPT/roguelike/tps-edition/outputs/sanctum-of-ash-tps.html`\n'
+        'open "/Users/alice/Documents/Projects/roguelike/tps-edition/outputs/sanctum-of-ash-tps.html"\n'
+        'p=`/Users/alice/Documents/Projects/roguelike/tps-edition/outputs/sanctum-of-ash-tps.html`\n'
         '```'
     )
 

@@ -179,10 +179,16 @@ def test_parallel_safe_read_pipelines_and_multi_object_fence():
         parse_assistant_output(call('git status') + call('git checkout main'), tools())
     instructions = build_tool_system_instructions(tools())
     assert 'RFC 8259' in instructions and 'Markdown backslash escaping' in instructions
-    assert 'Default to ONE codex_tool_call code block per turn.' in instructions
+    assert 'Batch independent read-only inspections in the same turn' in instructions
+    assert 'Disjoint file edits' in instructions
+    assert 'strictly ONE per turn' in instructions
     reminder = build_tool_delta_reminder(tools(), has_tool_results=True)
-    assert 'emit one fenced codex_tool_call JSON block' in reminder
-    assert 'block(s)' not in reminder
+    assert 'batch independent read-only lookups or disjoint file patches' in reminder
+    assert 'emit one block for non-read commands/tests' in reminder
+    serial_instructions = build_tool_system_instructions(tools(), parallel_tool_calls=False)
+    assert 'Emit at most ONE codex_tool_call code block in this turn' in serial_instructions
+    serial_reminder = build_tool_delta_reminder(tools(), has_tool_results=True, parallel_tool_calls=False)
+    assert 'emit one fenced codex_tool_call JSON block' in serial_reminder
 
 
 def test_real_world_read_queries_coordinator_tools_and_disjoint_patches():
@@ -191,6 +197,9 @@ def test_real_world_read_queries_coordinator_tools_and_disjoint_patches():
         {'type': 'function', 'function': {'name': 'functions.apply_patch', 'parameters': {'type': 'object'}}},
         {'type': 'function', 'function': {'name': 'functions.view_image', 'parameters': {'type': 'object'}}},
         {'type': 'function', 'function': {'name': 'functions.update_plan', 'parameters': {'type': 'object'}}},
+        {'type': 'function', 'function': {'name': 'functions.shell_command', 'parameters': {'type': 'object'}}},
+        {'type': 'function', 'function': {'name': 'mcp__codegraph.codegraph_search', 'parameters': {'type': 'object'}}},
+        {'type': 'function', 'function': {'name': 'mcp__github.search_code', 'parameters': {'type': 'object'}}},
     ]
 
     def fence_call(name, args):
@@ -202,8 +211,11 @@ def test_real_world_read_queries_coordinator_tools_and_disjoint_patches():
         + fence_call('functions.exec_command', {'cmd': "sed -n '/function init/,+40p' work/src/main.js"})
         + fence_call('functions.exec_command', {'cmd': "awk 'NR>=100 && NR<=200' work/src/main.js"})
         + fence_call('functions.exec_command', {'cmd': 'node -v && npm -v && node --check work/src/main.js && codegraph explore "main.js" && git branch --show-current && git remote -v >/dev/null'})
+        + fence_call('functions.shell_command', {'command': 'git worktree list --porcelain && git stash list'})
+        + fence_call('mcp__codegraph.codegraph_search', {'query': 'ToolStreamProcessor'})
+        + fence_call('mcp__github.search_code', {'query': 'codex_tool_call repo:o/r'})
     )
-    assert len(parse_assistant_output(rich_reads, multi_tools).tool_calls) == 4
+    assert len(parse_assistant_output(rich_reads, multi_tools).tool_calls) == 7
 
     # Unsafe variants of those commands must still be rejected in multi-call batches
     for unsafe_cmd in [
@@ -212,10 +224,17 @@ def test_real_world_read_queries_coordinator_tools_and_disjoint_patches():
         'sort -o out.txt a.txt',
         'echo "`id`"',
         'git branch new-feature',
+        'git worktree add ../wt main',
+        'git stash push -m wip',
         'node -e "console.log(1)"',
     ]:
         with pytest.raises(ToolProtocolError):
             parse_assistant_output(call('cat a.txt') + call(unsafe_cmd), multi_tools)
+    with pytest.raises(ToolProtocolError):
+        parse_assistant_output(
+            call('cat a.txt') + fence_call('functions.shell_command', {'command': 'pytest -q'}),
+            multi_tools,
+        )
 
     # 2. Coordinator / UI tools alongside a single workspace command or patch
     img_plus_ocr = (
@@ -297,3 +316,78 @@ def test_real_world_read_queries_coordinator_tools_and_disjoint_patches():
         assert r2.status_code == 200
         assert not commands[-1]['reset_chat']
         assert '[Conversation History]' not in commands[-1]['prompt']
+
+
+def test_system_diagnostic_reads_conflict_reason_and_turn1_retry_notice():
+    from agent_policy import CODING_WORKFLOW
+
+    diag_reads = (
+        call('ls -la "$HOME/Library/LaunchAgents" && cat $HOME/.codex/config.toml ${CODEX_HOME}/settings.json')
+        + call("launchctl list | grep -E 'gemini|router' && launchctl print gui/501/local.gemini-enterprise-bridge")
+        + call('plutil -p ~/Library/LaunchAgents/local.gemini-enterprise-bridge.plist && plutil -lint -s foo.plist')
+        + call('defaults read com.apple.finder && sysctl -n hw.ncpu && scutil --dns && scutil --nc list && pmset -g assertions && vm_stat && dig example.com')
+    )
+    assert len(parse_assistant_output(diag_reads, tools()).tool_calls) == 4
+
+    for unsafe_cmd in [
+        'launchctl kickstart -k gui/501/local.gemini-enterprise-bridge',
+        "plutil -replace ProgramArguments -json '[]' foo.plist",
+        'defaults write com.apple.finder AppleShowAllFiles -bool true',
+        'sysctl -w net.inet.ip.forwarding=1',
+        'scutil --nc start VPN',
+        'pmset -a displaysleep 0',
+        'ls -la "$(whoami)"',
+        'ls -la "${HOME:-/tmp}"',
+        '"$HOME/bin/ls" -la',
+    ]:
+        with pytest.raises(ToolProtocolError):
+            parse_assistant_output(call('cat README.md') + call(unsafe_cmd), tools())
+
+    with pytest.raises(ToolProtocolError) as exc_info:
+        parse_assistant_output(
+            call("sed -n '1,20p' README.md") + call("python3 -c 'print(1)'"),
+            tools(),
+        )
+    err_text = str(exc_info.value)
+    assert '文件修改或命令执行必须等待真实结果后再检查' in err_text
+    assert "exec_command('python3 -c" in err_text
+
+    instructions = build_tool_system_instructions(tools())
+    reminder = build_tool_delta_reminder(tools(), has_tool_results=True)
+    assert 'never pair python/node/curl/scripts alongside' in instructions
+    assert 'never mix python/node scripts, curl' in reminder
+    assert 'Never mix python/node one-liners, curl' in CODING_WORKFLOW
+
+    resp_tools = [{'type': 'function', 'name': 'exec_command', 'parameters': {'type': 'object'}}]
+    mixed_turn1 = (
+        '```codex_tool_call\n'
+        + json.dumps({'name': 'exec_command', 'arguments': {'cmd': "sed -n '1,20p' README.md"}})
+        + '\n```\n```codex_tool_call\n'
+        + json.dumps({'name': 'exec_command', 'arguments': {'cmd': "python3 -c 'print(1)'"}})
+        + '\n```\n'
+    )
+    single_ok = (
+        '```codex_tool_call\n'
+        + json.dumps({'name': 'exec_command', 'arguments': {'cmd': "python3 -c 'print(1)'"}})
+        + '\n```\n'
+    )
+    with browser([mixed_turn1, 'unrelated ok', mixed_turn1, single_ok]) as (client, commands):
+        fail1 = client.post('/v1/responses', json={'input': 'Restart gateway', 'tools': resp_tools, 'stream': True})
+        assert packets(fail1.text)[-1]['type'] == 'response.failed'
+        # Unrelated request must NOT inherit a stale Retry Notice from a different Turn-1 prompt
+        other = client.post('/v1/responses', json={'input': 'Different task entirely', 'tools': resp_tools})
+        assert other.status_code == 200
+        assert 'Retry Notice' not in commands[-1]['prompt']
+
+        # Multi-message Turn-1 request (e.g. @thread reference + user request) gets exact Retry Notice on retry
+        multi_input = [
+            {'role': 'user', 'content': '## Referenced chats with Codex'},
+            {'role': 'user', 'content': 'Restart gateway and check status'},
+        ]
+        fail2 = client.post('/v1/responses', json={'input': multi_input, 'tools': resp_tools, 'stream': True})
+        assert packets(fail2.text)[-1]['type'] == 'response.failed'
+        retry2 = client.post('/v1/responses', json={'input': multi_input, 'tools': resp_tools})
+        assert retry2.status_code == 200
+        assert commands[-1]['reset_chat'] is True
+        assert '[Retry Notice — Previous Reply Had a Format Error; Please Rewrite]' in commands[-1]['prompt']
+        assert "exec_command('python3 -c" in commands[-1]['prompt']

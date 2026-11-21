@@ -58,7 +58,7 @@ Your answer is rendered in the Codex Desktop app using GitHub-flavored Markdown:
 
 - Always include a blank line after any heading and a blank line before any list, table, or fenced code block so CommonMark renders cleanly.
 - Use fenced code blocks with language info strings for multi-line snippets, and inline code backticks for commands, symbols, identifiers, environment variables, or config keys (never for local file paths).
-- Use Markdown tables for mappings or comparisons, and concise Mermaid diagrams when a small visual flow genuinely clarifies architecture or state transitions; skip decorative visuals for simple facts or small edits.
+- Use Markdown tables for mappings or comparisons, concise Mermaid diagrams when a small static flow clarifies architecture or state transitions, interactive visuals when exploring how systems behave across scenarios, and standalone artifacts via standard plotting tools for exportable or scientific figures; skip decorative visuals for simple facts or small edits.
 {CLICKABLE_FILE_LINKS_RULE}
 
 # Editing, parallel worktrees, shell, and testing discipline
@@ -72,9 +72,18 @@ Your answer is rendered in the Codex Desktop app using GitHub-flavored Markdown:
 - Quote shell commands safely: backticks and `$()` execute inside double quotes, and `JSON.stringify()` is not shell escaping. Avoid noisy `echo "===="` separators, blocking sleeps over 60 seconds, or repurposing `$HOME` or `$CODEX_HOME`. For multiline `gh` PR or issue bodies, write to a temporary file and pass `--body-file`.
 - Run targeted, meaningful checks appropriate to your change; do not write trivial mirror tests for tiny low-impact edits or repeat broad test suites without new changes.
 
-# Local skills
+# Multi-agent coordination
 
-- When `## Skills` lists local `SKILL.md` entries and the user names a skill (`$SkillName` or plain text) or the task clearly benefits from one, expand any root alias (such as `r0`) from the skill roots and read that `SKILL.md` from the local filesystem, resolving relative resource paths against its directory. User instructions always take precedence over skill guidelines."""
+- When `multi_agent_v1.spawn_agent` (or `spawn_agent`) is available, you act as the primary coordinator leading a team of equally capable sub-agents that share your tools and workspace (unless your initial prompt already scopes you to a bounded sub-agent task).
+- After a quick initial orientation when needed, proactively decompose substantial, multi-part, multi-module, or multi-angle work—such as non-overlapping code or documentation slices, main implementation plus sidecar docs/assets/verification, or independent codebase/system investigations—and spawn sub-agents in parallel in the same turn rather than executing every slice sequentially yourself.
+- Give each sub-agent a self-contained objective, explicit scope boundaries (disjoint write sets when editing files), and concrete acceptance criteria; omit `model` so sub-agents inherit your current model unless the user explicitly asks for another model.
+- Continue non-overlapping local work while sub-agents run, use `multi_agent_v1.send_input` to steer or continue an existing sub-agent that already holds relevant context, call `multi_agent_v1.wait_agent` with a generous timeout only when blocked on their output, and call `multi_agent_v1.close_agent` once a sub-agent's work is integrated so concurrency slots are freed promptly.
+- Review, integrate, and verify sub-agent changes before delivering the final answer; you own the final result.
+
+# Local skills, plugins, and apps
+
+- When `## Skills` lists local `SKILL.md` entries and the user names a skill (`$SkillName` or plain text) or the task clearly benefits from one, expand any root alias (such as `r0`) from the skill roots and read that `SKILL.md` from the local filesystem, resolving relative resource paths against its directory. User instructions always take precedence over skill guidelines; if an explicit rule in a `SKILL.md` requires confirmation, name and link that `SKILL.md` rather than inferring unstated blocks.
+- Plugins bundle skills (`plugin_name:` prefix), MCP tools (`mcp__server.tool` / `mcp__server__tool`), and app connectors (`[$app-name](app://...)`). Use their underlying skills and callable tools directly without calling `list_mcp_resources` unnecessarily for app connectors."""
 
 _LEGACY_FILE_REFS_RE = re.compile(
     r"(?m)^- File References:[^\n]*(?:\n[ \t]+\*[^\n]*)*\n[ \t]+\* Use inline code to make file paths clickable\.[^\n]*(?:\n[ \t]+\*[^\n]*)*"
@@ -114,6 +123,7 @@ CODING_WORKFLOW = """[Coding workflow]
 Follow the user's and tool's complete instructions. Tools run on the client; their results are real evidence.
 For file work, locate the relevant paths/symbols first, then read bounded, line-numbered ranges (usually 100-200 lines).
 Use rg --files / rg -n and git diff --stat before opening large files or diffs. A full read of a known small file is fine.
+Batch independent searches, symbol lookups, bounded file reads, disjoint file patches, and parallel sub-agent calls in the same turn instead of splitting them across single-call turns; keep stateful commands, builds/tests, and dependent edits sequential. Never mix python/node one-liners, curl, shell loops/$(...), or file edits with other workspace read/exec calls in the same turn—emit a single codex_tool_call block whenever running a script, curl, or mutation.
 Do not concatenate several large files or dumps into one shell result. Request a suitable output budget using the tool's documented parameter; never invent parameters.
 A truncation warning means omitted content has NOT been read. Fetch only the missing relevant range, using a larger budget for an unavoidable long line; do not rerun the same bulk dump.
 Reuse file content already obtained unless it changed or a specific missing detail matters. Repeated reads without a new question do not advance the task.
@@ -144,12 +154,39 @@ _TRUNCATION = re.compile(
     r"IMPORTANT: The file content has been truncated|output (?:has been |was )?truncated",
     re.IGNORECASE,
 )
-_READ_COMMAND = re.compile(r"^(?:cat|sed|head|tail|rg|wc)\b|^git\s+(?:diff|show|log|status)\b")
+_READ_COMMAND = re.compile(
+    r"^(?:(?:[^\s\\/]+[\\/])?(?:cat|sed|head|tail|rg|wc|type|dir|findstr|get-content|gc|get-childitem|gci|select-string|sls)(?:\.(?:exe|cmd|bat))?)\b"
+    r"|^git(?:\.exe)?\s+(?:diff|show|log|status)\b",
+    re.IGNORECASE,
+)
 
 
 def has_coding_tools(tools) -> bool:
     names = {(t.get('function') or {}).get('name', '').rsplit('.', 1)[-1] for t in tools or []}
-    return bool(names & {'exec_command', 'shell', 'shell_command', 'run_shell_command', 'read_file', 'apply_patch', 'view_image'})
+    return bool(
+        names
+        & {
+            'exec_command',
+            'shell',
+            'shell_command',
+            'run_shell_command',
+            'read_file',
+            'apply_patch',
+            'view_image',
+            # GitHub Copilot CLI / App / VS Code Chat coding tools
+            'view',
+            'edit',
+            'create',
+            'grep',
+            'glob',
+            'powershell',
+            'bash',
+            'run_in_terminal',
+            'replace_string_in_file',
+            'multi_replace_string_in_file',
+            'create_file',
+        }
+    )
 
 
 def has_tool_history(messages) -> bool:
@@ -180,7 +217,7 @@ def reading_diagnostics(messages) -> dict:
             if not isinstance(arguments, dict):
                 continue
             command = str(arguments.get('cmd', arguments.get('command', ''))).strip()
-            if name in {'read_file', 'read_text_file'} or _READ_COMMAND.search(command):
+            if name in {'read_file', 'read_text_file', 'view', 'grep', 'glob', 'grep_search', 'file_search', 'list_dir'} or _READ_COMMAND.search(command):
                 reads[(function['name'], json.dumps(arguments, sort_keys=True))] += 1
     return {
         'tool_results': len(results),
@@ -203,10 +240,14 @@ def deduplicate_tool_text(text: str, call_id: str, seen: dict) -> str:
     """Reference exact repeated large text; keep the first complete result in history."""
     if len(text) < 4096 or not call_id:
         return text
-    header, delimiter, body = text.partition("\nOutput:\n")
+    m_delim = re.search(r"\r?\nOutput:\r?\n", text)
+    if m_delim:
+        header, delimiter, body = text[: m_delim.start()], m_delim.group(0), text[m_delim.end() :]
+    else:
+        header, delimiter, body = text, "", ""
     # Codex wraps stdout in volatile chunk/timing metadata. Preserve each new header.
     content = body if delimiter and header.startswith("Chunk ID:") else text
-    status = re.search(r"Process exited with code [^\n]+", header)
+    status = re.search(r"Process exited with code [^\r\n]+", header)
     digest = hashlib.sha256(((status.group() if status else "") + "\n" + content).encode()).hexdigest()
     previous_id = seen.get(digest)
     if previous_id and previous_id != call_id:

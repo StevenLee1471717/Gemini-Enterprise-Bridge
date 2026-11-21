@@ -507,8 +507,8 @@ select:focus {
 
 .seg-group {
   display: grid;
-  grid-template-columns: repeat(5, 1fr);
-  gap: 5px;
+  grid-template-columns: repeat(4, 1fr);
+  gap: 4px;
   background: #eef2f9;
   padding: 3px;
   border-radius: 10px;
@@ -523,6 +523,7 @@ select:focus {
   font: inherit;
   font-size: 11.5px;
   font-weight: 600;
+  white-space: nowrap;
   cursor: pointer;
   transition: all 0.15s ease;
 }
@@ -535,6 +536,38 @@ select:focus {
   background: #ffffff;
   color: var(--primary);
   box-shadow: 0 2px 6px rgba(15, 23, 42, 0.08);
+}
+
+.custom-cap-row {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  margin-top: 7px;
+}
+.custom-cap-row[hidden] {
+  display: none !important;
+}
+.custom-cap-row input {
+  flex: 1;
+  min-width: 0;
+  height: 30px;
+  padding: 0 10px;
+  border-radius: 8px;
+  border: 1px solid var(--border);
+  background: #ffffff;
+  color: var(--text);
+  font: inherit;
+  font-size: 12px;
+  outline: none;
+}
+.custom-cap-row input:focus {
+  border-color: var(--primary);
+  box-shadow: 0 0 0 2px rgba(37, 99, 235, 0.14);
+}
+.custom-cap-apply {
+  flex-shrink: 0;
+  height: 30px;
+  padding: 0 14px;
 }
 
 .drawer {

@@ -6,17 +6,23 @@ import binascii
 from email.parser import BytesParser
 from email.policy import HTTP as EMAIL_HTTP_POLICY
 import hashlib
+import html
+import io
 import json
 import mimetypes
 from pathlib import Path
 import re
 import shutil
+import struct
 import subprocess
 import tempfile
 import time
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 import uuid
+import zipfile
+import zlib
 
+from platform_compat import IS_WINDOWS, find_executable, subprocess_hidden_kwargs
 from schemas import ChatMessage
 
 MAX_IMAGE_BYTES = 20 * 1024 * 1024
@@ -208,11 +214,11 @@ MIME_ALIASES: Dict[str, str] = {
 
 _SAFE_NAME_RE = re.compile(r"[^A-Za-z0-9._\-\u4e00-\u9fff]+")
 _LOCAL_FILE_URL_RE = re.compile(
-    r"^(?:https?://(?:127\.0\.0\.1|localhost)(?::\d+)?)?/v1/files/(file_[a-f0-9]{24,40})(?:/content)?$",
+    r"^(?:https?://[^/\s]+)?/v1/files/(file_[a-f0-9]{24,40})(?:/content)?$",
     re.IGNORECASE,
 )
 _LOCAL_IMAGE_URL_RE = re.compile(
-    r"^(?:https?://(?:127\.0\.0\.1|localhost)(?::\d+)?)?/v1/images/files/([a-f0-9]{32}\.[a-z0-9]+)$",
+    r"^(?:https?://[^/\s]+)?/v1/images/files/([a-f0-9]{32}\.[a-z0-9]+)$",
     re.IGNORECASE,
 )
 
@@ -421,24 +427,91 @@ import logging
 
 logger = logging.getLogger("gemini_bridge.multimodal")
 
-_FFMPEG_EXTRA_PATHS = (
-    "/opt/homebrew/bin/ffmpeg",
-    "/usr/local/bin/ffmpeg",
+_POSIX_FFMPEG_PATHS = ("/opt/homebrew/bin/ffmpeg", "/usr/local/bin/ffmpeg", "/usr/bin/ffmpeg")
+_WINDOWS_FFMPEG_PATHS = (
+    r"%LOCALAPPDATA%\Microsoft\WinGet\Links\ffmpeg.exe",
+    r"%USERPROFILE%\scoop\shims\ffmpeg.exe",
+    r"%ProgramData%\chocolatey\bin\ffmpeg.exe",
+    r"%ProgramFiles%\ffmpeg\bin\ffmpeg.exe",
     r"F:\Programs\ffmpeg\bin\ffmpeg.exe",
     r"C:\ffmpeg\bin\ffmpeg.exe",
-    r"C:\Program Files\ffmpeg\bin\ffmpeg.exe",
 )
 
 
 def _find_binary(name: str, extra_paths: Sequence[str] = ()) -> Optional[str]:
-    found = shutil.which(name)
-    if found:
-        return found
-    search_list = (*extra_paths, *(_FFMPEG_EXTRA_PATHS if name == "ffmpeg" else ()))
-    for candidate in search_list:
-        if Path(candidate).is_file():
-            return candidate
-    return None
+    win_extra = _WINDOWS_FFMPEG_PATHS if name == "ffmpeg" else ()
+    return find_executable(name, posix_candidates=extra_paths, windows_candidates=win_extra)
+
+
+def _encode_rgba_png(width: int, height: int, rgba_rows: bytes) -> bytes:
+    def _chunk(ctype: bytes, data: bytes) -> bytes:
+        crc = zlib.crc32(ctype + data) & 0xFFFFFFFF
+        return struct.pack(">I", len(data)) + ctype + data + struct.pack(">I", crc)
+
+    ihdr = struct.pack(">IIBBBBB", width, height, 8, 6, 0, 0, 0)
+    compressed = zlib.compress(rgba_rows, level=6)
+    return b"\x89PNG\r\n\x1a\n" + _chunk(b"IHDR", ihdr) + _chunk(b"IDAT", compressed) + _chunk(b"IEND", b"")
+
+
+def _decode_bmp_or_ico_to_png_stdlib(mime: str, raw: bytes) -> Optional[bytes]:
+    """Zero-dependency fallback converting uncompressed 24/32-bit BMP or PNG-backed ICO to PNG."""
+    if mime in {"image/x-icon", "image/vnd.microsoft.icon"} and len(raw) >= 22:
+        idx = raw.find(b"\x89PNG\r\n\x1a\n")
+        if idx >= 0:
+            end = raw.find(b"IEND", idx)
+            if end >= 0 and end + 8 <= len(raw):
+                return raw[idx : end + 8]
+    if not raw.startswith(b"BM") or len(raw) < 54:
+        return None
+    try:
+        pixel_offset = struct.unpack_from("<I", raw, 10)[0]
+        dib_size = struct.unpack_from("<I", raw, 14)[0]
+        if dib_size < 40:
+            return None
+        width, height_signed, planes, bpp, compression = struct.unpack_from("<iiHHII", raw, 18)[:5]
+        if planes != 1 or bpp not in {24, 32} or compression not in {0, 3}:
+            return None
+        top_down = height_signed < 0
+        height = abs(height_signed)
+        if width <= 0 or height <= 0 or width > 8192 or height > 8192:
+            return None
+        bytes_per_px = bpp // 8
+        stride = ((width * bytes_per_px + 3) // 4) * 4
+        if pixel_offset + stride * height > len(raw):
+            return None
+        out = bytearray()
+        row_indices = range(height) if top_down else range(height - 1, -1, -1)
+        for r_idx in row_indices:
+            out.append(0)
+            row_start = pixel_offset + r_idx * stride
+            for x in range(width):
+                px_off = row_start + x * bytes_per_px
+                b_val, g_val, r_val = raw[px_off], raw[px_off + 1], raw[px_off + 2]
+                a_val = raw[px_off + 3] if bytes_per_px == 4 else 255
+                out.extend((r_val, g_val, b_val, a_val))
+        return _encode_rgba_png(width, height, bytes(out))
+    except Exception:
+        return None
+
+
+def _convert_image_via_pillow(raw: bytes) -> Optional[bytes]:
+    try:
+        try:
+            import pillow_heif  # type: ignore
+
+            pillow_heif.register_heif_opener()
+        except Exception:
+            pass
+        from PIL import Image  # type: ignore
+
+        with Image.open(io.BytesIO(raw)) as im:
+            converted = im.convert("RGBA" if "A" in im.getbands() or im.mode == "P" else "RGB")
+            out = io.BytesIO()
+            converted.save(out, format="PNG")
+            data = out.getvalue()
+            return data if data.startswith(b"\x89PNG\r\n\x1a\n") else None
+    except Exception:
+        return None
 
 
 def _rtf_bytes_to_minimal_docx(raw: bytes) -> Optional[bytes]:
@@ -497,8 +570,12 @@ def _convert_image_to_png_if_needed(mime: str, raw: bytes, filename: str) -> Tup
         return mime, raw, filename
     ext = SUPPORTED_MIME_SPECS[mime][1]
     stem = Path(filename).stem or "image"
+    pil_png = _convert_image_via_pillow(raw)
+    if pil_png:
+        return "image/png", pil_png, f"{stem}.png"
+
     sips = _find_binary("sips", ("/usr/bin/sips",))
-    ffmpeg = _find_binary("ffmpeg", ("/opt/homebrew/bin/ffmpeg", "/usr/local/bin/ffmpeg"))
+    ffmpeg = _find_binary("ffmpeg", _POSIX_FFMPEG_PATHS)
     with tempfile.TemporaryDirectory() as tmpdir:
         src_p = Path(tmpdir) / f"input.{ext}"
         dst_p = Path(tmpdir) / "output.png"
@@ -508,6 +585,7 @@ def _convert_image_to_png_if_needed(mime: str, raw: bytes, filename: str) -> Tup
                 [sips, "-s", "format", "png", str(src_p), "--out", str(dst_p)],
                 capture_output=True,
                 timeout=25,
+                **subprocess_hidden_kwargs(),
             )
             if proc.returncode == 0 and dst_p.is_file() and dst_p.stat().st_size > 0:
                 return "image/png", dst_p.read_bytes(), f"{stem}.png"
@@ -516,10 +594,75 @@ def _convert_image_to_png_if_needed(mime: str, raw: bytes, filename: str) -> Tup
                 [ffmpeg, "-y", "-i", str(src_p), "-frames:v", "1", str(dst_p)],
                 capture_output=True,
                 timeout=25,
+                **subprocess_hidden_kwargs(),
             )
             if proc.returncode == 0 and dst_p.is_file() and dst_p.stat().st_size > 0:
                 return "image/png", dst_p.read_bytes(), f"{stem}.png"
+        if IS_WINDOWS:
+            ps_bin = shutil.which("powershell") or shutil.which("pwsh")
+            if ps_bin:
+                ps_cmd = (
+                    "Add-Type -AssemblyName System.Drawing; "
+                    "$img = [System.Drawing.Image]::FromFile($args[0]); "
+                    "try { $img.Save($args[1], [System.Drawing.Imaging.ImageFormat]::Png) } "
+                    "finally { $img.Dispose() }"
+                )
+                proc = subprocess.run(
+                    [ps_bin, "-NoProfile", "-NonInteractive", "-Command", ps_cmd, str(src_p), str(dst_p)],
+                    capture_output=True,
+                    timeout=25,
+                    **subprocess_hidden_kwargs(),
+                )
+                if proc.returncode == 0 and dst_p.is_file() and dst_p.stat().st_size > 0:
+                    return "image/png", dst_p.read_bytes(), f"{stem}.png"
+
+    stdlib_png = _decode_bmp_or_ico_to_png_stdlib(mime, raw)
+    if stdlib_png:
+        return "image/png", stdlib_png, f"{stem}.png"
     return mime, raw, filename
+
+
+def _windows_mediatranscoder_convert(src_p: Path, dst_p: Path, *, audio_only: bool, timeout: int = 45) -> bool:
+    """Use built-in Windows 10/11 WinRT MediaTranscoder when ffmpeg is not installed."""
+    if not IS_WINDOWS:
+        return False
+    ps_bin = shutil.which("powershell")
+    if not ps_bin:
+        return False
+    profile_expr = (
+        "[Windows.Media.MediaProperties.MediaEncodingProfile]::CreateM4a([Windows.Media.MediaProperties.AudioEncodingQuality]::Auto)"
+        if audio_only
+        else "[Windows.Media.MediaProperties.MediaEncodingProfile]::CreateMp4([Windows.Media.MediaProperties.VideoEncodingQuality]::HD720p)"
+    )
+    ps_script = (
+        "$ErrorActionPreference = 'Stop'; "
+        "Add-Type -AssemblyName System.Runtime.WindowsRuntime; "
+        "$null = [Windows.Storage.StorageFile, Windows.Storage, ContentType=WindowsRuntime]; "
+        "$null = [Windows.Media.MediaProperties.MediaEncodingProfile, Windows.Media, ContentType=WindowsRuntime]; "
+        "$null = [Windows.Media.Transcoding.MediaTranscoder, Windows.Media, ContentType=WindowsRuntime]; "
+        "$asTaskGeneric = ([System.WindowsRuntimeSystemExtensions].GetMethods() | Where-Object { $_.Name -eq 'AsTask' -and $_.GetParameters().Count -eq 1 -and $_.GetParameters()[0].ParameterType.Name -eq 'IAsyncOperation`1' })[0]; "
+        "function AwaitOp($op, [Type]$t) { $m = $asTaskGeneric.MakeGenericMethod($t); $tk = $m.Invoke($null, @($op)); $tk.Wait(); return $tk.Result }; "
+        "$asTaskAction = ([System.WindowsRuntimeSystemExtensions].GetMethods() | Where-Object { $_.Name -eq 'AsTask' -and $_.GetParameters().Count -eq 1 -and $_.GetParameters()[0].ParameterType.Name -eq 'IAsyncActionWithProgress`1' })[0]; "
+        "$src = AwaitOp ([Windows.Storage.StorageFile]::GetFileFromPathAsync($args[0])) ([Windows.Storage.StorageFile]); "
+        "$folder = AwaitOp ([Windows.Storage.StorageFolder]::GetFolderFromPathAsync($args[1])) ([Windows.Storage.StorageFolder]); "
+        "$dst = AwaitOp ($folder.CreateFileAsync($args[2], [Windows.Storage.CreationCollisionOption]::ReplaceExisting)) ([Windows.Storage.StorageFile]); "
+        f"$prof = {profile_expr}; "
+        "$tc = New-Object Windows.Media.Transcoding.MediaTranscoder; "
+        "$prep = AwaitOp ($tc.PrepareFileTranscodeAsync($src, $dst, $prof)) ([Windows.Media.Transcoding.PrepareTranscodeResult]); "
+        "if (-not $prep.CanTranscode) { exit 2 }; "
+        "$act = $asTaskAction.MakeGenericMethod([Double]).Invoke($null, @($prep.TranscodeAsync())); "
+        "$act.Wait()"
+    )
+    try:
+        proc = subprocess.run(
+            [ps_bin, "-NoProfile", "-NonInteractive", "-Command", ps_script, str(src_p), str(dst_p.parent), dst_p.name],
+            capture_output=True,
+            timeout=timeout,
+            **subprocess_hidden_kwargs(),
+        )
+        return proc.returncode == 0 and dst_p.is_file() and dst_p.stat().st_size > 0
+    except Exception:
+        return False
 
 
 def _normalize_audio_for_web(mime: str, raw: bytes, filename: str) -> Tuple[str, bytes, str]:
@@ -530,7 +673,7 @@ def _normalize_audio_for_web(mime: str, raw: bytes, filename: str) -> Tuple[str,
     ext = SUPPORTED_MIME_SPECS.get(mime, ("audio", "wav"))[1]
     stem = Path(filename).stem or "audio"
     afconvert = _find_binary("afconvert", ("/usr/bin/afconvert",))
-    ffmpeg = _find_binary("ffmpeg", ("/opt/homebrew/bin/ffmpeg", "/usr/local/bin/ffmpeg"))
+    ffmpeg = _find_binary("ffmpeg", _POSIX_FFMPEG_PATHS)
     with tempfile.TemporaryDirectory() as tmpdir:
         src_p = Path(tmpdir) / f"input.{ext}"
         dst_p = Path(tmpdir) / "output.m4a"
@@ -540,6 +683,7 @@ def _normalize_audio_for_web(mime: str, raw: bytes, filename: str) -> Tuple[str,
                 [afconvert, "-f", "m4af", "-d", "aac", str(src_p), str(dst_p)],
                 capture_output=True,
                 timeout=30,
+                **subprocess_hidden_kwargs(),
             )
             if proc.returncode == 0 and dst_p.is_file() and dst_p.stat().st_size > 0:
                 return "audio/mp4", dst_p.read_bytes(), f"{stem}.m4a"
@@ -548,9 +692,12 @@ def _normalize_audio_for_web(mime: str, raw: bytes, filename: str) -> Tuple[str,
                 [ffmpeg, "-y", "-i", str(src_p), "-vn", "-c:a", "aac", "-b:a", "128k", str(dst_p)],
                 capture_output=True,
                 timeout=45,
+                **subprocess_hidden_kwargs(),
             )
             if proc.returncode == 0 and dst_p.is_file() and dst_p.stat().st_size > 0:
                 return "audio/mp4", dst_p.read_bytes(), f"{stem}.m4a"
+        if _windows_mediatranscoder_convert(src_p, dst_p, audio_only=True, timeout=45):
+            return "audio/mp4", dst_p.read_bytes(), f"{stem}.m4a"
     return mime, raw, filename
 
 
@@ -558,8 +705,8 @@ def _normalize_video_for_web(mime: str, raw: bytes, filename: str) -> Tuple[str,
     """Convert MOV/WebM/MKV/AVI/MPEG/3GP/FLV to H.264+AAC MP4 so Gemini Enterprise decodes frames & audio."""
     if mime == "video/mp4":
         return mime, raw, filename
-    ffmpeg = _find_binary("ffmpeg", ("/opt/homebrew/bin/ffmpeg", "/usr/local/bin/ffmpeg"))
-    if not ffmpeg:
+    ffmpeg = _find_binary("ffmpeg", _POSIX_FFMPEG_PATHS)
+    if not ffmpeg and not IS_WINDOWS:
         return mime, raw, filename
     ext = SUPPORTED_MIME_SPECS.get(mime, ("video", "mov"))[1]
     stem = Path(filename).stem or "video"
@@ -567,51 +714,221 @@ def _normalize_video_for_web(mime: str, raw: bytes, filename: str) -> Tuple[str,
         src_p = Path(tmpdir) / f"input.{ext}"
         dst_p = Path(tmpdir) / "output.mp4"
         src_p.write_bytes(raw)
-        proc = subprocess.run(
-            [
-                ffmpeg, "-y", "-i", str(src_p),
-                "-c:v", "libx264", "-preset", "veryfast", "-pix_fmt", "yuv420p",
-                "-c:a", "aac", "-movflags", "+faststart", str(dst_p),
-            ],
-            capture_output=True,
-            timeout=90,
-        )
-        if proc.returncode == 0 and dst_p.is_file() and dst_p.stat().st_size > 0:
+        if ffmpeg:
+            proc = subprocess.run(
+                [
+                    ffmpeg, "-y", "-i", str(src_p),
+                    "-c:v", "libx264", "-preset", "veryfast", "-pix_fmt", "yuv420p",
+                    "-c:a", "aac", "-movflags", "+faststart", str(dst_p),
+                ],
+                capture_output=True,
+                timeout=90,
+                **subprocess_hidden_kwargs(),
+            )
+            if proc.returncode == 0 and dst_p.is_file() and dst_p.stat().st_size > 0:
+                return "video/mp4", dst_p.read_bytes(), f"{stem}.mp4"
+        if _windows_mediatranscoder_convert(src_p, dst_p, audio_only=False, timeout=90):
             return "video/mp4", dst_p.read_bytes(), f"{stem}.mp4"
     return mime, raw, filename
 
 
+def _extract_rtf_paragraphs(raw: bytes) -> List[str]:
+    """Extract readable plain-text paragraphs from RTF bytes (supporting ANSI/CP936/CP1252 & \\uN)."""
+    cpg_match = re.search(rb"\\ansicpg(\d+)", raw[:512])
+    codepage = f"cp{cpg_match.group(1).decode('ascii')}" if cpg_match else "cp1252"
+    try:
+        b"test".decode(codepage)
+    except LookupError:
+        codepage = "gb18030"
+
+    text = raw.decode("latin1")
+    skip_destinations = {
+        "fonttbl", "colortbl", "stylesheet", "info", "pict", "object",
+        "header", "footer", "footnote", "fldinst", "themedata", "colorschememapping",
+    }
+    stack: list[tuple[int, bool]] = []
+    uc_skip = 1
+    skip_cur = False
+    out_chars: list[str] = []
+    hex_buf = bytearray()
+
+    def flush_hex() -> None:
+        if not hex_buf:
+            return
+        for enc in (codepage, "utf-8", "gb18030", "cp1252"):
+            try:
+                out_chars.append(hex_buf.decode(enc))
+                hex_buf.clear()
+                return
+            except UnicodeDecodeError:
+                continue
+        out_chars.append(hex_buf.decode("utf-8", errors="replace"))
+        hex_buf.clear()
+
+    i, n = 0, len(text)
+    while i < n:
+        ch = text[i]
+        if ch == "{":
+            flush_hex()
+            stack.append((uc_skip, skip_cur))
+            i += 1
+            if i + 1 < n and text[i : i + 2] == "\\*":
+                skip_cur = True
+                i += 2
+            continue
+        if ch == "}":
+            flush_hex()
+            if stack:
+                uc_skip, skip_cur = stack.pop()
+            i += 1
+            continue
+        if ch == "\\":
+            i += 1
+            if i >= n:
+                break
+            nxt = text[i]
+            if nxt in "\\{}":
+                flush_hex()
+                if not skip_cur:
+                    out_chars.append(nxt)
+                i += 1
+                continue
+            if nxt == "'" and i + 2 < n:
+                hx = text[i + 1 : i + 3]
+                if re.fullmatch(r"[0-9a-fA-F]{2}", hx):
+                    if not skip_cur:
+                        hex_buf.append(int(hx, 16))
+                    i += 3
+                    continue
+            flush_hex()
+            if nxt in "\r\n":
+                if not skip_cur:
+                    out_chars.append("\n")
+                i += 1
+                continue
+            if nxt == "~":
+                if not skip_cur:
+                    out_chars.append("\u00a0")
+                i += 1
+                continue
+            if nxt in "-_":
+                if not skip_cur:
+                    out_chars.append("-")
+                i += 1
+                continue
+            m_ctrl = re.match(r"([a-zA-Z]+)(-?\d+)?(?![a-zA-Z0-9])( ?)", text[i:])
+            if m_ctrl:
+                word, num_str, _sp = m_ctrl.group(1), m_ctrl.group(2), m_ctrl.group(3)
+                i += m_ctrl.end()
+                if word in skip_destinations:
+                    skip_cur = True
+                elif word == "uc" and num_str is not None:
+                    uc_skip = max(0, int(num_str))
+                elif word == "u" and num_str is not None:
+                    code_pt = int(num_str)
+                    if code_pt < 0:
+                        code_pt += 65536
+                    if not skip_cur and 0 <= code_pt <= 0x10FFFF:
+                        out_chars.append(chr(code_pt))
+                    for _ in range(uc_skip):
+                        if i < n and text[i : i + 2] == "\\'" and i + 3 < n:
+                            i += 4
+                        elif i < n and text[i] not in "{}":
+                            i += 1
+                elif not skip_cur:
+                    if word in {"par", "line", "row", "sect", "page"}:
+                        out_chars.append("\n")
+                    elif word in {"tab", "cell"}:
+                        out_chars.append("\t")
+                continue
+            i += 1
+            continue
+        if ch in "\r\n":
+            i += 1
+            continue
+        flush_hex()
+        if not skip_cur:
+            out_chars.append(ch.encode("latin1").decode(codepage, errors="replace"))
+        i += 1
+
+    flush_hex()
+    joined = "".join(out_chars)
+    paras = [ln.strip("\r") for ln in joined.split("\n")]
+    cleaned = [re.sub(r"[\x00-\x08\x0b\x0c\x0e-\x1f]", "", p) for p in paras]
+    non_empty = [p for p in cleaned if p.strip()]
+    return non_empty or [""]
+
+
+def _convert_rtf_bytes_to_docx(raw: bytes) -> bytes:
+    """Build a standards-compliant OpenXML .docx from RTF bytes in pure Python."""
+    paragraphs = _extract_rtf_paragraphs(raw)
+    p_nodes = "".join(
+        f'<w:p><w:r><w:t xml:space="preserve">{html.escape(p)}</w:t></w:r></w:p>'
+        for p in paragraphs
+    )
+    doc_xml = (
+        '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+        '<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">'
+        f"<w:body>{p_nodes}</w:body></w:document>"
+    )
+    content_types_xml = (
+        '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+        '<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">'
+        '<Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/>'
+        '<Default Extension="xml" ContentType="application/xml"/>'
+        '<Override PartName="/word/document.xml" '
+        'ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.document.main+xml"/>'
+        "</Types>"
+    )
+    rels_xml = (
+        '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+        '<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">'
+        '<Relationship Id="rId1" '
+        'Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" '
+        'Target="word/document.xml"/>'
+        "</Relationships>"
+    )
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
+        zf.writestr("[Content_Types].xml", content_types_xml)
+        zf.writestr("_rels/.rels", rels_xml)
+        zf.writestr("word/document.xml", doc_xml)
+    return buf.getvalue()
+
+
 def _normalize_document_for_web(mime: str, raw: bytes, filename: str) -> Tuple[str, bytes, str]:
-    """Convert RTF to DOCX via macOS textutil or cross-platform stdlib OOXML builder."""
+    """Convert RTF to DOCX via textutil (macOS) or built-in OpenXML writer (Windows/Linux)."""
     if mime not in {"application/rtf", "text/rtf"}:
         return mime, raw, filename
     stem = Path(filename).stem or "document"
     textutil = _find_binary("textutil", ("/usr/bin/textutil",))
-    if not textutil:
-        fallback_docx = _rtf_bytes_to_minimal_docx(raw)
-        if fallback_docx:
+    if textutil:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            src_p = Path(tmpdir) / "input.rtf"
+            dst_p = Path(tmpdir) / "output.docx"
+            src_p.write_bytes(raw)
+            proc = subprocess.run(
+                [textutil, "-convert", "docx", str(src_p), "-output", str(dst_p)],
+                capture_output=True,
+                timeout=20,
+                **subprocess_hidden_kwargs(),
+            )
+            if proc.returncode == 0 and dst_p.is_file() and dst_p.stat().st_size > 0:
+                return (
+                    "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+                    dst_p.read_bytes(),
+                    f"{stem}.docx",
+                )
+    try:
+        docx_bytes = _convert_rtf_bytes_to_docx(raw)
+        if docx_bytes.startswith(b"PK\x03\x04"):
             return (
                 "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
-                fallback_docx,
+                docx_bytes,
                 f"{stem}.docx",
             )
-        return mime, raw, filename
-    stem = Path(filename).stem or "document"
-    with tempfile.TemporaryDirectory() as tmpdir:
-        src_p = Path(tmpdir) / "input.rtf"
-        dst_p = Path(tmpdir) / "output.docx"
-        src_p.write_bytes(raw)
-        proc = subprocess.run(
-            [textutil, "-convert", "docx", str(src_p), "-output", str(dst_p)],
-            capture_output=True,
-            timeout=20,
-        )
-        if proc.returncode == 0 and dst_p.is_file() and dst_p.stat().st_size > 0:
-            return (
-                "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
-                dst_p.read_bytes(),
-                f"{stem}.docx",
-            )
+    except Exception:
+        pass
     return mime, raw, filename
 
 
@@ -779,6 +1096,34 @@ class FileStore:
     def _valid_id(self, file_id: str) -> bool:
         return bool(re.fullmatch(r"file_[a-f0-9]{32}", file_id or ""))
 
+    def _resolve_blob_path(self, file_id: str, meta: Dict[str, Any]) -> Optional[Path]:
+        """Resolve stored blob safely inside `files_dir`, surviving directory/drive moves."""
+        root_resolved = self.files_dir.resolve()
+        safe_fname = Path(str(meta.get("filename") or "")).name
+        candidates: list[Path] = []
+        if safe_fname:
+            candidates.append(self.files_dir / file_id / safe_fname)
+        raw_p = str(meta.get("path") or "").strip()
+        if raw_p:
+            candidates.append(Path(raw_p))
+        for cand in candidates:
+            try:
+                resolved = cand.resolve()
+                if resolved.is_relative_to(root_resolved) and resolved.is_file():
+                    return resolved
+            except OSError:
+                continue
+        blob_dir = self.files_dir / file_id
+        if blob_dir.is_dir():
+            for child in blob_dir.iterdir():
+                try:
+                    resolved = child.resolve()
+                    if resolved.is_relative_to(root_resolved) and resolved.is_file():
+                        return resolved
+                except OSError:
+                    continue
+        return None
+
     def save(
         self,
         raw: bytes,
@@ -829,8 +1174,10 @@ class FileStore:
         meta = json.loads(mp.read_text(encoding="utf-8"))
         if tenant_id is not None and (meta.get("tenant_id") or "host") != tenant_id:
             raise FileNotFoundError(f"文件不存在：{file_id}")
-        if not Path(meta.get("path", "")).is_file():
+        resolved_blob = self._resolve_blob_path(file_id, meta)
+        if resolved_blob is None:
             raise FileNotFoundError(f"文件数据已丢失：{file_id}")
+        meta["path"] = str(resolved_blob)
         return meta
 
     def read_bytes(self, file_id: str, tenant_id: Optional[str] = None) -> Tuple[Dict[str, Any], bytes]:
@@ -844,7 +1191,8 @@ class FileStore:
                 meta = json.loads(mp.read_text(encoding="utf-8"))
                 if tenant_id is not None and (meta.get("tenant_id") or "host") != tenant_id:
                     continue
-                if not Path(meta.get("path", "")).is_file():
+                fid = str(meta.get("id") or mp.stem)
+                if self._resolve_blob_path(fid, meta) is None:
                     continue
                 if purpose and meta.get("purpose") != purpose:
                     continue
@@ -995,6 +1343,18 @@ def _resolve_reference_or_bytes(
                 img_path = image_output_dir / m_img.group(1)
                 if not img_path.is_file():
                     raise InvalidAttachmentError(f"本地图片不存在：{m_img.group(1)}", error_code=err_code)
+                if tenant_id is not None:
+                    eff_req_tenant = (tenant_id or "host").strip() or "host"
+                    owner_meta_path = image_output_dir / ".img_owners" / f"{m_img.group(1)}.json"
+                    owner_tenant = "host"
+                    if owner_meta_path.is_file():
+                        try:
+                            owner_obj = json.loads(owner_meta_path.read_text(encoding="utf-8"))
+                            owner_tenant = str(owner_obj.get("tenant_id") or "host").strip() or "host"
+                        except Exception:
+                            owner_tenant = "host"
+                    if owner_tenant != eff_req_tenant:
+                        raise InvalidAttachmentError(f"本地图片不存在或无权访问：{m_img.group(1)}", error_code=err_code)
                 raw = img_path.read_bytes()
                 mime, cat, norm_raw, safe_name = resolve_mime_and_name(
                     raw, declared_mime=declared_mime, filename=img_path.name, expected_category=expected_category

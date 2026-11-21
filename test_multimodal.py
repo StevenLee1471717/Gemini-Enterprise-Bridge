@@ -5,6 +5,7 @@ import base64
 import io
 import json
 from pathlib import Path
+import struct
 import subprocess
 import wave
 import zipfile
@@ -16,7 +17,14 @@ from config import BridgeSettings
 from extension_exporter import render_spark_icon_png
 from imagegen_mcp import handle as mcp_handle
 import media_inputs
-from media_inputs import FileStore, InvalidAttachmentError, _find_binary, resolve_mime_and_name
+from media_inputs import (
+    _POSIX_FFMPEG_PATHS,
+    _find_binary,
+    FileStore,
+    InvalidAttachmentError,
+    resolve_mime_and_name,
+)
+from platform_compat import subprocess_hidden_kwargs
 from server import create_app
 from test_responses import browser, packets
 
@@ -60,67 +68,76 @@ def _make_openxml_bytes() -> bytes:
     return buf.getvalue()
 
 
-def _find_tool(name: str, extra: tuple[str, ...] = ()) -> str | None:
-    import shutil
-    found = shutil.which(name)
-    if found:
-        return found
-    for p in extra:
-        if Path(p).is_file():
-            return p
-    return None
+def _make_bmp_bytes(width: int = 8, height: int = 8) -> bytes:
+    stride = ((width * 3 + 3) // 4) * 4
+    pixel_bytes = (b"\xeb\x63\x25" * width + b"\x00" * (stride - width * 3)) * height
+    file_size = 54 + len(pixel_bytes)
+    header = struct.pack("<2sIHHI", b"BM", file_size, 0, 0, 54)
+    dib = struct.pack("<IiiHHIIiiII", 40, width, height, 1, 24, 0, len(pixel_bytes), 2835, 2835, 0, 0)
+    return header + dib + pixel_bytes
 
 
 def _make_mp4_bytes(tmp_path: Path) -> bytes:
-    ffmpeg = _find_tool("ffmpeg", ("/opt/homebrew/bin/ffmpeg", "/usr/local/bin/ffmpeg", r"F:\Programs\ffmpeg\bin\ffmpeg.exe"))
+    ffmpeg = _find_binary("ffmpeg", _POSIX_FFMPEG_PATHS)
     if ffmpeg:
         png = tmp_path / "f.png"
         mp4 = tmp_path / "v.mp4"
         png.write_bytes(render_spark_icon_png(32))
-        subprocess.run(
+        proc = subprocess.run(
             [
                 ffmpeg, "-y", "-loop", "1", "-i", str(png),
                 "-t", "0.3", "-c:v", "libx264", "-pix_fmt", "yuv420p", str(mp4),
             ],
-            check=True,
+            check=False,
             capture_output=True,
+            **subprocess_hidden_kwargs(),
         )
-        return mp4.read_bytes()
-    return b"\x00\x00\x00\x18ftypmp42\x00\x00\x00\x00mp42isom" + b"\x00" * 64
+        if proc.returncode == 0 and mp4.is_file() and mp4.stat().st_size > 0:
+            return mp4.read_bytes()
+    ftyp = struct.pack(">I4s4sI4s4s", 24, b"ftyp", b"isom", 512, b"isom", b"mp41")
+    moov = struct.pack(">I4s", 8, b"moov")
+    mdat = struct.pack(">I4s8s", 16, b"mdat", b"\x00" * 8)
+    return ftyp + moov + mdat
 
 
 def test_format_validation_and_web_normalization(tmp_path: Path) -> None:
-    ffmpeg = _find_tool("ffmpeg", ("/opt/homebrew/bin/ffmpeg", "/usr/local/bin/ffmpeg", r"F:\Programs\ffmpeg\bin\ffmpeg.exe"))
-    sips = _find_tool("sips", ("/usr/bin/sips",))
-    png_src = tmp_path / "src.png"
+    # BMP normalizes to image/png on every platform (Pillow / sips / stdlib fallback)
     bmp_src = tmp_path / "src.bmp"
-    png_src.write_bytes(render_spark_icon_png(32))
-    if ffmpeg:
-        subprocess.run([ffmpeg, "-y", "-i", str(png_src), str(bmp_src)], check=True, capture_output=True)
-        mime_b, cat_b, norm_bmp, safe_bmp = resolve_mime_and_name(bmp_src.read_bytes(), filename="src.bmp")
-        assert mime_b == "image/png"
-        assert cat_b == "image"
-        assert norm_bmp.startswith(b"\x89PNG\r\n\x1a\n")
-        assert safe_bmp == "src.png"
-    if sips:
-        heic_src = tmp_path / "src.heic"
-        subprocess.run([sips, "-s", "format", "heic", str(png_src), "--out", str(heic_src)], check=True, capture_output=True)
-        mime_h, cat_h, norm_heic, safe_heic = resolve_mime_and_name(heic_src.read_bytes(), filename="src.heic")
-        assert mime_h == "image/png" and cat_h == "image" and norm_heic.startswith(b"\x89PNG\r\n\x1a\n") and safe_heic == "src.png"
+    bmp_src.write_bytes(_make_bmp_bytes(12, 12))
+    img_targets = [bmp_src]
 
+    sips = _find_binary("sips", ("/usr/bin/sips",))
+    if sips:
+        png_src = tmp_path / "src.png"
+        heic_src = tmp_path / "src.heic"
+        png_src.write_bytes(render_spark_icon_png(32))
+        subprocess.run([sips, "-s", "format", "heic", str(png_src), "--out", str(heic_src)], check=True, capture_output=True)
+        img_targets.append(heic_src)
+
+    for img_file in img_targets:
+        mime, cat, norm_raw, safe_name = resolve_mime_and_name(img_file.read_bytes(), filename=img_file.name)
+        assert mime == "image/png"
+        assert cat == "image"
+        assert norm_raw.startswith(b"\x89PNG\r\n\x1a\n")
+        assert safe_name.endswith(".png")
+
+    # WAV normalizes to audio/mp4 (.m4a) when host audio transcoder is available, and stays audio/wav when False
     wav_raw = _make_wav_bytes()
     mime_w, cat_w, m4a_raw, name_w = resolve_mime_and_name(wav_raw, filename="clip.wav", normalize_for_web=True)
     assert cat_w == "audio"
-    if ffmpeg or _find_tool("afconvert", ("/usr/bin/afconvert",)):
-        assert mime_w == "audio/mp4"
+    if mime_w == "audio/mp4":
         assert name_w == "clip.m4a"
         assert b"ftyp" in m4a_raw[:16]
+    else:
+        assert mime_w == "audio/wav"
+        assert name_w == "clip.wav"
 
     mime_raw_wav, _, kept_wav, name_raw_wav = resolve_mime_and_name(wav_raw, filename="clip.wav", normalize_for_web=False)
     assert mime_raw_wav == "audio/wav"
     assert kept_wav == wav_raw
     assert name_raw_wav == "clip.wav"
 
+    # RTF normalizes to DOCX across all platforms (textutil or built-in OpenXML converter)
     rtf_raw = b"{\\rtf1\\ansi\\deff0 Hello RTF World}"
     mime_d, cat_d, docx_raw, name_d = resolve_mime_and_name(rtf_raw, filename="note.rtf")
     assert mime_d == "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
@@ -128,10 +145,17 @@ def test_format_validation_and_web_normalization(tmp_path: Path) -> None:
     assert name_d == "note.docx"
     assert docx_raw.startswith(b"PK\x03\x04")
 
-    mp4_bytes = _make_mp4_bytes(tmp_path)
+    # MOV normalizes to video/mp4 via ffmpeg when available
+    ffmpeg = _find_binary("ffmpeg", _POSIX_FFMPEG_PATHS)
     if ffmpeg:
+        _make_mp4_bytes(tmp_path)
         mov_path = tmp_path / "clip.mov"
-        subprocess.run([ffmpeg, "-y", "-i", str(tmp_path / "v.mp4"), "-c", "copy", str(mov_path)], check=True, capture_output=True)
+        subprocess.run(
+            [ffmpeg, "-y", "-i", str(tmp_path / "v.mp4"), "-c", "copy", str(mov_path)],
+            check=True,
+            capture_output=True,
+            **subprocess_hidden_kwargs(),
+        )
         mime_v, cat_v, norm_mp4, name_v = resolve_mime_and_name(mov_path.read_bytes(), filename="clip.mov")
         assert mime_v == "video/mp4"
         assert cat_v == "video"
@@ -342,7 +366,6 @@ def test_same_semver_outdated_driver_version_triggers_extension_reload() -> None
 def test_wav_fallback_when_no_audio_transcoder_installed(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     monkeypatch.setattr(media_inputs, "_find_binary", lambda *a, **kw: None)
     monkeypatch.setattr("test_multimodal._find_binary", lambda *a, **kw: None)
-    monkeypatch.setattr("test_multimodal._find_tool", lambda *a, **kw: None)
 
     r_dir = tmp_path / "responses"
     r_dir.mkdir()

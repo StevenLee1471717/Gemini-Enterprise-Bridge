@@ -6,6 +6,7 @@ import asyncio
 import contextlib
 import hashlib
 import hmac
+import ipaddress
 import json
 import logging
 import math
@@ -19,17 +20,14 @@ from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, AsyncIterator, Callable, Deque, Dict, List, Optional, Sequence
-from zoneinfo import ZoneInfo
 
-from schemas import parse_model_and_session, resolve_target_web_model
+from platform_compat import SHANGHAI_TZ, atomic_write_json
+from schemas import normalize_default_model, parse_model_and_session, resolve_target_web_model
 
 logger = logging.getLogger("gemini_bridge.distribution")
 
 HOST_TENANT_ID = "host"
-try:
-    DEFAULT_TZ = ZoneInfo("Asia/Shanghai")
-except Exception:
-    DEFAULT_TZ = timezone(timedelta(hours=8))
+DEFAULT_TZ = SHANGHAI_TZ
 
 _FORWARDING_HEADERS = (
     "forwarded",
@@ -50,11 +48,18 @@ _LOCAL_HOST_HEADERS = {"127.0.0.1", "::1", "[::1]", "localhost", "0.0.0.0"}
 class DistributionAuthError(PermissionError):
     """Raised when API authentication or access boundary checks fail."""
 
-    def __init__(self, message: str, status_code: int = 401, code: str = "invalid_api_key") -> None:
+    def __init__(
+        self,
+        message: str,
+        status_code: int = 401,
+        code: str = "invalid_api_key",
+        principal: Optional["RequestPrincipal"] = None,
+    ) -> None:
         super().__init__(message)
         self.message = message
         self.status_code = status_code
         self.code = code
+        self.principal = principal
 
 
 class DistributionQuotaError(RuntimeError):
@@ -78,7 +83,20 @@ def _normalize_peer_ip(raw_host: Optional[str]) -> str:
     val = (raw_host or "").strip().lower()
     if val.startswith("::ffff:"):
         val = val[7:]
+    if "%" in val:
+        val = val.split("%", 1)[0]
     return val
+
+
+def _is_loopback_peer(peer_ip: str) -> bool:
+    if peer_ip in _LOCAL_PEER_HOSTS:
+        return True
+    if not peer_ip:
+        return False
+    try:
+        return ipaddress.ip_address(peer_ip).is_loopback
+    except ValueError:
+        return False
 
 
 def _extract_host_only(raw_host_header: Optional[str]) -> str:
@@ -97,7 +115,7 @@ def is_direct_local_connection(conn: Any) -> bool:
     """Return True ONLY for genuine local loopback requests with no reverse-proxy/tunnel forwarding."""
     client_obj = getattr(conn, "client", None)
     peer_ip = _normalize_peer_ip(getattr(client_obj, "host", None) if client_obj else None)
-    if peer_ip not in _LOCAL_PEER_HOSTS:
+    if not _is_loopback_peer(peer_ip):
         return False
 
     headers = getattr(conn, "headers", None)
@@ -180,6 +198,34 @@ def _today_shanghai() -> str:
     return datetime.now(DEFAULT_TZ).strftime("%Y-%m-%d")
 
 
+def _ip_matches_allowlist(client_ip: str, allowed_ips: Sequence[str]) -> bool:
+    if not allowed_ips:
+        return True
+    ip_str = (client_ip or "").strip()
+    if not ip_str or ip_str == "unknown":
+        return False
+    try:
+        addr = ipaddress.ip_address(ip_str)
+    except ValueError:
+        addr = None
+    for raw_rule in allowed_ips:
+        rule = (raw_rule or "").strip()
+        if not rule:
+            continue
+        if rule == "*" or rule.lower() == ip_str.lower():
+            return True
+        if addr is not None:
+            try:
+                if "/" in rule:
+                    if addr in ipaddress.ip_network(rule, strict=False):
+                        return True
+                elif addr == ipaddress.ip_address(rule):
+                    return True
+            except ValueError:
+                continue
+    return False
+
+
 @dataclass(frozen=True)
 class RequestPrincipal:
     """Authenticated caller identity resolved per incoming API request."""
@@ -213,16 +259,35 @@ class ClientRecord:
     rpm_limit: int = 30
     daily_request_limit: int = 0
     daily_token_limit: int = 0
+    daily_cost_limit_usd: float = 0.0
+    total_token_limit: int = 0
+    expires_at: int = 0
     allowed_models: List[str] = field(default_factory=list)
+    allowed_ips: List[str] = field(default_factory=list)
     created_at: int = field(default_factory=lambda: int(time.time()))
     last_used_at: int = 0
     last_ip: str = ""
+    last_model: str = ""
+    last_session_id: str = ""
     stats_day: str = field(default_factory=_today_shanghai)
     today_requests: int = 0
     today_tokens: int = 0
+    today_prompt_tokens: int = 0
+    today_completion_tokens: int = 0
+    today_cost_usd: float = 0.0
+    today_errors: int = 0
     total_requests: int = 0
     total_tokens: int = 0
+    total_prompt_tokens: int = 0
+    total_completion_tokens: int = 0
+    total_cost_usd: float = 0.0
     total_errors: int = 0
+
+    def is_expired(self, now_ts: Optional[int] = None) -> bool:
+        if self.expires_at <= 0:
+            return False
+        cur = int(time.time()) if now_ts is None else int(now_ts)
+        return cur >= self.expires_at
 
     def refresh_day(self, today: Optional[str] = None) -> None:
         cur = today or _today_shanghai()
@@ -230,6 +295,10 @@ class ClientRecord:
             self.stats_day = cur
             self.today_requests = 0
             self.today_tokens = 0
+            self.today_prompt_tokens = 0
+            self.today_completion_tokens = 0
+            self.today_cost_usd = 0.0
+            self.today_errors = 0
 
     def to_storage_dict(self) -> Dict[str, Any]:
         return {
@@ -243,20 +312,34 @@ class ClientRecord:
             "rpm_limit": self.rpm_limit,
             "daily_request_limit": self.daily_request_limit,
             "daily_token_limit": self.daily_token_limit,
+            "daily_cost_limit_usd": round(max(0.0, float(self.daily_cost_limit_usd or 0.0)), 6),
+            "total_token_limit": self.total_token_limit,
+            "expires_at": self.expires_at,
             "allowed_models": list(self.allowed_models),
+            "allowed_ips": list(self.allowed_ips),
             "created_at": self.created_at,
             "last_used_at": self.last_used_at,
             "last_ip": self.last_ip,
+            "last_model": self.last_model,
+            "last_session_id": self.last_session_id,
             "stats_day": self.stats_day,
             "today_requests": self.today_requests,
             "today_tokens": self.today_tokens,
+            "today_prompt_tokens": self.today_prompt_tokens,
+            "today_completion_tokens": self.today_completion_tokens,
+            "today_cost_usd": round(max(0.0, float(self.today_cost_usd or 0.0)), 6),
+            "today_errors": self.today_errors,
             "total_requests": self.total_requests,
             "total_tokens": self.total_tokens,
+            "total_prompt_tokens": self.total_prompt_tokens,
+            "total_completion_tokens": self.total_completion_tokens,
+            "total_cost_usd": round(max(0.0, float(self.total_cost_usd or 0.0)), 6),
             "total_errors": self.total_errors,
         }
 
     def to_view_dict(self, *, include_secret: bool = False, in_flight: int = 0, queued: int = 0) -> Dict[str, Any]:
         self.refresh_day()
+        expired = self.is_expired()
         out: Dict[str, Any] = {
             "client_id": self.client_id,
             "tenant_id": f"client:{self.client_id}",
@@ -264,18 +347,32 @@ class ClientRecord:
             "note": self.note,
             "key_preview": _mask_key(self.api_key),
             "enabled": self.enabled,
+            "expired": expired,
             "max_concurrency": self.max_concurrency,
             "rpm_limit": self.rpm_limit,
             "daily_request_limit": self.daily_request_limit,
             "daily_token_limit": self.daily_token_limit,
+            "daily_cost_limit_usd": round(max(0.0, float(self.daily_cost_limit_usd or 0.0)), 4),
+            "total_token_limit": self.total_token_limit,
+            "expires_at": self.expires_at,
             "allowed_models": list(self.allowed_models),
+            "allowed_ips": list(self.allowed_ips),
             "created_at": self.created_at,
             "last_used_at": self.last_used_at,
             "last_ip": self.last_ip,
+            "last_model": self.last_model,
+            "last_session_id": self.last_session_id,
             "today_requests": self.today_requests,
             "today_tokens": self.today_tokens,
+            "today_prompt_tokens": self.today_prompt_tokens,
+            "today_completion_tokens": self.today_completion_tokens,
+            "today_cost_usd": round(max(0.0, float(self.today_cost_usd or 0.0)), 6),
+            "today_errors": self.today_errors,
             "total_requests": self.total_requests,
             "total_tokens": self.total_tokens,
+            "total_prompt_tokens": self.total_prompt_tokens,
+            "total_completion_tokens": self.total_completion_tokens,
+            "total_cost_usd": round(max(0.0, float(self.total_cost_usd or 0.0)), 6),
             "total_errors": self.total_errors,
             "in_flight": in_flight,
             "queued": queued,
@@ -289,6 +386,46 @@ class ClientRecord:
 class _WaitTicket:
     seq: int
     client_id: str
+    aborted: bool = False
+
+
+@dataclass
+class LiveTaskEntry:
+    task_id: str
+    tenant_id: str
+    client_id: Optional[str]
+    tenant_name: str
+    client_ip: str
+    model: str
+    task_type: str = "chat"
+    session_id: str = ""
+    slot_key: str = ""
+    tab_id: Optional[int] = None
+    prompt_preview: str = ""
+    stream: bool = False
+    phase: str = "queued"
+    started_at: float = field(default_factory=time.time)
+
+    def to_dict(self, now_ts: Optional[float] = None) -> Dict[str, Any]:
+        cur = time.time() if now_ts is None else now_ts
+        return {
+            "task_id": self.task_id,
+            "tenant_id": self.tenant_id,
+            "client_id": self.client_id,
+            "tenant_name": self.tenant_name,
+            "client_ip": self.client_ip,
+            "model": self.model,
+            "task_type": self.task_type,
+            "session_id": self.session_id,
+            "slot_key": self.slot_key,
+            "tab_id": self.tab_id,
+            "prompt_preview": self.prompt_preview,
+            "stream": self.stream,
+            "phase": self.phase,
+            "state": self.phase,
+            "started_at": int(self.started_at),
+            "elapsed_ms": max(0, int((cur - self.started_at) * 1000)),
+        }
 
 
 class DistributionManager:
@@ -319,6 +456,7 @@ class DistributionManager:
         self._wait_tickets: List[_WaitTicket] = []
         self._ticket_seq: int = 0
         self._loop_conditions: Dict[int, asyncio.Condition] = {}
+        self._live_tasks: Dict[str, LiveTaskEntry] = {}
 
         if self._storage_path is not None:
             self._load()
@@ -387,17 +525,32 @@ class DistributionManager:
                 rpm_limit=max(0, min(1200, int(item.get("rpm_limit") if item.get("rpm_limit") is not None else 30))),
                 daily_request_limit=max(0, int(item.get("daily_request_limit") or 0)),
                 daily_token_limit=max(0, int(item.get("daily_token_limit") or 0)),
+                daily_cost_limit_usd=max(0.0, float(item.get("daily_cost_limit_usd") or 0.0)),
+                total_token_limit=max(0, int(item.get("total_token_limit") or 0)),
+                expires_at=max(0, int(item.get("expires_at") or 0)),
                 allowed_models=[
                     str(m).strip() for m in (item.get("allowed_models") or []) if str(m).strip()
+                ],
+                allowed_ips=[
+                    str(ip).strip() for ip in (item.get("allowed_ips") or []) if str(ip).strip()
                 ],
                 created_at=int(item.get("created_at") or time.time()),
                 last_used_at=int(item.get("last_used_at") or 0),
                 last_ip=str(item.get("last_ip") or ""),
+                last_model=str(item.get("last_model") or ""),
+                last_session_id=str(item.get("last_session_id") or ""),
                 stats_day=str(item.get("stats_day") or today),
                 today_requests=max(0, int(item.get("today_requests") or 0)),
                 today_tokens=max(0, int(item.get("today_tokens") or 0)),
+                today_prompt_tokens=max(0, int(item.get("today_prompt_tokens") or 0)),
+                today_completion_tokens=max(0, int(item.get("today_completion_tokens") or 0)),
+                today_cost_usd=max(0.0, float(item.get("today_cost_usd") or 0.0)),
+                today_errors=max(0, int(item.get("today_errors") or 0)),
                 total_requests=max(0, int(item.get("total_requests") or 0)),
                 total_tokens=max(0, int(item.get("total_tokens") or 0)),
+                total_prompt_tokens=max(0, int(item.get("total_prompt_tokens") or 0)),
+                total_completion_tokens=max(0, int(item.get("total_completion_tokens") or 0)),
+                total_cost_usd=max(0.0, float(item.get("total_cost_usd") or 0.0)),
                 total_errors=max(0, int(item.get("total_errors") or 0)),
             )
             rec.refresh_day(today)
@@ -419,21 +572,7 @@ class DistributionManager:
             "clients": [c.to_storage_dict() for c in self._clients.values()],
         }
         try:
-            self._storage_path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
-            fd, tmp_name = tempfile.mkstemp(
-                prefix=".dist_", suffix=".json", dir=str(self._storage_path.parent)
-            )
-            try:
-                with os.fdopen(fd, "w", encoding="utf-8") as fh:
-                    json.dump(payload, fh, ensure_ascii=False, indent=2)
-                os.chmod(tmp_name, 0o600)
-                os.replace(tmp_name, self._storage_path)
-            finally:
-                if os.path.exists(tmp_name):
-                    try:
-                        os.unlink(tmp_name)
-                    except OSError:
-                        pass
+            atomic_write_json(self._storage_path, payload, mode=0o600, dir_mode=0o700)
         except Exception as exc:
             logger.warning("保存分发配置文件失败 (%s): %s", self._storage_path, exc)
 
@@ -479,7 +618,11 @@ class DistributionManager:
         rpm_limit: int = 30,
         daily_request_limit: int = 0,
         daily_token_limit: int = 0,
+        daily_cost_limit_usd: float = 0.0,
+        total_token_limit: int = 0,
+        expires_at: int = 0,
         allowed_models: Optional[Sequence[str]] = None,
+        allowed_ips: Optional[Sequence[str]] = None,
     ) -> Dict[str, Any]:
         clean_name = (name or "").strip()[:64]
         if not clean_name:
@@ -500,7 +643,11 @@ class DistributionManager:
                 rpm_limit=max(0, min(1200, int(rpm_limit if rpm_limit is not None else 30))),
                 daily_request_limit=max(0, int(daily_request_limit or 0)),
                 daily_token_limit=max(0, int(daily_token_limit or 0)),
+                daily_cost_limit_usd=max(0.0, float(daily_cost_limit_usd or 0.0)),
+                total_token_limit=max(0, int(total_token_limit or 0)),
+                expires_at=max(0, int(expires_at or 0)),
                 allowed_models=[str(m).strip() for m in (allowed_models or []) if str(m).strip()],
+                allowed_ips=[str(ip).strip() for ip in (allowed_ips or []) if str(ip).strip()],
             )
             self._clients[cid] = rec
             self._save_locked()
@@ -517,7 +664,11 @@ class DistributionManager:
         rpm_limit: Optional[int] = None,
         daily_request_limit: Optional[int] = None,
         daily_token_limit: Optional[int] = None,
+        daily_cost_limit_usd: Optional[float] = None,
+        total_token_limit: Optional[int] = None,
+        expires_at: Optional[int] = None,
         allowed_models: Optional[Sequence[str]] = None,
+        allowed_ips: Optional[Sequence[str]] = None,
     ) -> Dict[str, Any]:
         with self._lock:
             rec = self._clients.get(client_id)
@@ -540,14 +691,123 @@ class DistributionManager:
                 rec.daily_request_limit = max(0, int(daily_request_limit))
             if daily_token_limit is not None:
                 rec.daily_token_limit = max(0, int(daily_token_limit))
+            if daily_cost_limit_usd is not None:
+                rec.daily_cost_limit_usd = max(0.0, float(daily_cost_limit_usd))
+            if total_token_limit is not None:
+                rec.total_token_limit = max(0, int(total_token_limit))
+            if expires_at is not None:
+                rec.expires_at = max(0, int(expires_at))
             if allowed_models is not None:
                 rec.allowed_models = [str(m).strip() for m in allowed_models if str(m).strip()]
+            if allowed_ips is not None:
+                rec.allowed_ips = [str(ip).strip() for ip in allowed_ips if str(ip).strip()]
+            if enabled is False:
+                for t in self._wait_tickets:
+                    if t.client_id == client_id:
+                        t.aborted = True
             self._save_locked()
             return rec.to_view_dict(
                 include_secret=True,
                 in_flight=self._client_in_flight.get(client_id, 0),
                 queued=self._client_queued.get(client_id, 0),
             )
+
+    def reset_client_quota(self, client_id: str, *, reset_total: bool = False) -> Dict[str, Any]:
+        with self._lock:
+            rec = self._clients.get(client_id)
+            if rec is None:
+                raise KeyError(f"未找到客户端：{client_id}")
+            rec.stats_day = _today_shanghai()
+            rec.today_requests = 0
+            rec.today_tokens = 0
+            rec.today_prompt_tokens = 0
+            rec.today_completion_tokens = 0
+            rec.today_cost_usd = 0.0
+            rec.today_errors = 0
+            self._rpm_windows.pop(client_id, None)
+            if reset_total:
+                rec.total_requests = 0
+                rec.total_tokens = 0
+                rec.total_prompt_tokens = 0
+                rec.total_completion_tokens = 0
+                rec.total_cost_usd = 0.0
+                rec.total_errors = 0
+            self._save_locked()
+            return rec.to_view_dict(
+                include_secret=True,
+                in_flight=self._client_in_flight.get(client_id, 0),
+                queued=self._client_queued.get(client_id, 0),
+            )
+
+    async def abort_client_waiters(self, client_id: str) -> int:
+        aborted_cnt = 0
+        with self._lock:
+            for t in self._wait_tickets:
+                if t.client_id == client_id and not t.aborted:
+                    t.aborted = True
+                    aborted_cnt += 1
+        cond = self._get_condition()
+        async with cond:
+            cond.notify_all()
+        return aborted_cnt
+
+    def register_live_task(
+        self,
+        task_id: str,
+        principal: RequestPrincipal,
+        *,
+        model: str,
+        task_type: str = "chat",
+        session_id: str = "",
+        prompt_preview: str = "",
+        stream: bool = False,
+        phase: str = "queued",
+        state: Optional[str] = None,
+    ) -> None:
+        eff_phase = state if state is not None else phase
+        t_label = "本机直连" if principal.is_host else f"客户端 · {principal.name}"
+        with self._lock:
+            self._live_tasks[task_id] = LiveTaskEntry(
+                task_id=task_id,
+                tenant_id=principal.tenant_id,
+                client_id=principal.client_id,
+                tenant_name=t_label,
+                client_ip=principal.client_ip,
+                model=model,
+                task_type=task_type,
+                session_id=session_id,
+                prompt_preview=(prompt_preview or "").strip()[:140],
+                stream=bool(stream),
+                phase=eff_phase,
+            )
+
+    def update_live_task(
+        self,
+        task_id: str,
+        *,
+        phase: Optional[str] = None,
+        state: Optional[str] = None,
+        slot_key: Optional[str] = None,
+        tab_id: Optional[int] = None,
+        session_id: Optional[str] = None,
+    ) -> None:
+        eff_phase = state if state is not None else phase
+        with self._lock:
+            entry = self._live_tasks.get(task_id)
+            if entry is None:
+                return
+            if eff_phase is not None:
+                entry.phase = eff_phase
+            if slot_key is not None:
+                entry.slot_key = slot_key
+            if tab_id is not None:
+                entry.tab_id = tab_id
+            if session_id is not None:
+                entry.session_id = session_id
+
+    def finish_live_task(self, task_id: str) -> None:
+        with self._lock:
+            self._live_tasks.pop(task_id, None)
 
     def rotate_client_key(self, client_id: str) -> Dict[str, Any]:
         with self._lock:
@@ -568,6 +828,9 @@ class DistributionManager:
         with self._lock:
             removed = self._clients.pop(client_id, None)
             self._rpm_windows.pop(client_id, None)
+            for t in self._wait_tickets:
+                if t.client_id == client_id:
+                    t.aborted = True
             if removed is None:
                 return False
             self._save_locked()
@@ -621,19 +884,7 @@ class DistributionManager:
             with self._lock:
                 matched = self._match_client_by_token_locked(token)
                 if matched is not None:
-                    if not self.external_access_enabled:
-                        raise DistributionAuthError(
-                            "主机管理员已临时暂停外部客户端接入。",
-                            status_code=403,
-                            code="external_access_paused",
-                        )
-                    if not matched.enabled:
-                        raise DistributionAuthError(
-                            f"客户端密钥（{matched.name}）已被暂停使用，请联系主机管理员。",
-                            status_code=403,
-                            code="client_disabled",
-                        )
-                    return RequestPrincipal(
+                    matched_principal = RequestPrincipal(
                         tenant_id=f"client:{matched.client_id}",
                         client_id=matched.client_id,
                         name=matched.name,
@@ -641,6 +892,35 @@ class DistributionManager:
                         is_direct_local=direct_local,
                         client_ip=client_ip,
                     )
+                    if not self.external_access_enabled:
+                        raise DistributionAuthError(
+                            "主机管理员已临时暂停外部客户端接入。",
+                            status_code=403,
+                            code="external_access_paused",
+                            principal=matched_principal,
+                        )
+                    if not matched.enabled:
+                        raise DistributionAuthError(
+                            f"客户端密钥（{matched.name}）已被暂停使用，请联系主机管理员。",
+                            status_code=403,
+                            code="client_disabled",
+                            principal=matched_principal,
+                        )
+                    if matched.is_expired():
+                        raise DistributionAuthError(
+                            f"客户端密钥（{matched.name}）已超过有效期，请联系主机管理员续期。",
+                            status_code=403,
+                            code="client_expired",
+                            principal=matched_principal,
+                        )
+                    if matched.allowed_ips and not _ip_matches_allowlist(client_ip, matched.allowed_ips):
+                        raise DistributionAuthError(
+                            f"当前来源 IP ({client_ip}) 未在客户端密钥白名单内。",
+                            status_code=403,
+                            code="ip_not_allowed",
+                            principal=matched_principal,
+                        )
+                    return matched_principal
             # If caller explicitly sent a `sk-geb-` key that doesn't exist, reject immediately
             # instead of falling through to keyless localhost.
             if token.startswith("sk-geb-"):
@@ -708,10 +988,10 @@ class DistributionManager:
     def _check_model_allowed_locked(self, rec: ClientRecord, requested_model: Optional[str]) -> None:
         if not rec.allowed_models:
             return
-        raw = (requested_model or "").strip()
+        raw = normalize_default_model(requested_model)
         base_model, _ = parse_model_and_session(raw)
         target_web = resolve_target_web_model(base_model)
-        allowed_norm = {m.strip().lower() for m in rec.allowed_models if m.strip()}
+        allowed_norm = {normalize_default_model(m).lower() for m in rec.allowed_models if m.strip()}
         allowed_web = {resolve_target_web_model(m) for m in rec.allowed_models if m.strip()}
         if base_model.lower() in allowed_norm or (target_web and target_web in allowed_web):
             return
@@ -756,6 +1036,18 @@ class DistributionManager:
                 status_code=429,
                 code="daily_quota_exceeded",
             )
+        if rec.daily_cost_limit_usd > 0 and rec.today_cost_usd >= rec.daily_cost_limit_usd:
+            raise DistributionQuotaError(
+                f"已达到今日额度预算上限（${rec.daily_cost_limit_usd:.2f}/日），请联系管理员调整配额。",
+                status_code=429,
+                code="daily_quota_exceeded",
+            )
+        if rec.total_token_limit > 0 and rec.total_tokens >= rec.total_token_limit:
+            raise DistributionQuotaError(
+                f"已达到该密钥累计总 Token 封顶上限（{rec.total_token_limit:,} Tokens），请联系管理员扩容。",
+                status_code=429,
+                code="total_quota_exceeded",
+            )
 
     def _consume_rpm_slot_locked(self, rec: ClientRecord, now_mono: float) -> None:
         if rec.rpm_limit <= 0:
@@ -778,8 +1070,10 @@ class DistributionManager:
         best_rank: Optional[tuple[int, int]] = None
         best_seq: Optional[int] = None
         for candidate in self._wait_tickets:
+            if candidate.aborted:
+                continue
             crec = self._clients.get(candidate.client_id)
-            if crec is None or not crec.enabled:
+            if crec is None or not crec.enabled or crec.is_expired():
                 continue
             cur_inf = self._client_in_flight.get(candidate.client_id, 0)
             if cur_inf >= crec.max_concurrency:
@@ -807,6 +1101,10 @@ class DistributionManager:
                 raise DistributionAuthError("主机管理员已暂停公网外部接入。", status_code=403, code="external_access_paused")
             if not rec.enabled:
                 raise DistributionAuthError("客户端密钥已被暂停使用。", status_code=403, code="client_disabled")
+            if rec.is_expired():
+                raise DistributionAuthError("客户端密钥已超过有效期。", status_code=403, code="client_expired")
+            if rec.allowed_ips and not _ip_matches_allowlist(principal.client_ip, rec.allowed_ips):
+                raise DistributionAuthError("来源 IP 不在允许白名单内。", status_code=403, code="ip_not_allowed")
             self._check_model_allowed_locked(rec, requested_model)
             self._check_daily_quota_locked(rec)
 
@@ -823,7 +1121,11 @@ class DistributionManager:
         cond = self._get_condition()
 
         if principal.is_host or not principal.client_id:
+            with self._lock:
+                self._host_waiting += 1
             async with cond:
+                with self._lock:
+                    self._host_waiting = max(0, self._host_waiting - 1)
                 self._host_in_flight += 1
                 cond.notify_all()
             try:
@@ -843,6 +1145,8 @@ class DistributionManager:
                 raise DistributionAuthError("主机管理员已暂停公网外部接入。", status_code=403, code="external_access_paused")
             if not rec.enabled:
                 raise DistributionAuthError("客户端密钥已被暂停使用。", status_code=403, code="client_disabled")
+            if rec.is_expired():
+                raise DistributionAuthError("客户端密钥已超过有效期。", status_code=403, code="client_expired")
             self._check_model_allowed_locked(rec, requested_model)
             self._check_daily_quota_locked(rec)
             max_waiters = max(6, rec.max_concurrency * 4)
@@ -867,10 +1171,12 @@ class DistributionManager:
             try:
                 while True:
                     with self._lock:
+                        if ticket.aborted:
+                            raise DistributionAuthError("管理员已中断当前客户端排队请求。", status_code=403, code="client_aborted")
                         rec = self._clients.get(cid)
                         if rec is None:
                             raise DistributionAuthError("客户端密钥已被吊销。", status_code=401, code="invalid_api_key")
-                        if not self.external_access_enabled or not rec.enabled:
+                        if not self.external_access_enabled or not rec.enabled or rec.is_expired():
                             raise DistributionAuthError("客户端接入已被暂停。", status_code=403, code="client_disabled")
                         self._check_daily_quota_locked(rec)
                         pool_cap = int(capacity_provider()) if capacity_provider is not None else 0
@@ -888,6 +1194,8 @@ class DistributionManager:
                             rec.last_used_at = int(time.time())
                             if principal.client_ip:
                                 rec.last_ip = principal.client_ip
+                            if requested_model:
+                                rec.last_model = str(requested_model)[:64]
                             admitted = True
                             break
 
@@ -931,11 +1239,17 @@ class DistributionManager:
         *,
         prompt_tokens: int = 0,
         completion_tokens: int = 0,
+        cost_usd: float = 0.0,
+        model: str = "",
+        session_id: str = "",
         error: bool = False,
     ) -> None:
         if principal.is_host or not principal.client_id:
             return
-        total_toks = max(0, int(prompt_tokens or 0)) + max(0, int(completion_tokens or 0))
+        p_toks = max(0, int(prompt_tokens or 0))
+        c_toks = max(0, int(completion_tokens or 0))
+        total_toks = p_toks + c_toks
+        eff_cost = max(0.0, float(cost_usd or 0.0))
         with self._lock:
             rec = self._clients.get(principal.client_id)
             if rec is None:
@@ -944,13 +1258,24 @@ class DistributionManager:
             rec.last_used_at = int(time.time())
             if principal.client_ip:
                 rec.last_ip = principal.client_ip
+            if model:
+                rec.last_model = str(model)[:64]
+            if session_id:
+                rec.last_session_id = str(session_id)[:80]
             if error:
+                rec.today_errors += 1
                 rec.total_errors += 1
             else:
                 rec.today_requests += 1
                 rec.total_requests += 1
                 rec.today_tokens += total_toks
                 rec.total_tokens += total_toks
+                rec.today_prompt_tokens += p_toks
+                rec.today_completion_tokens += c_toks
+                rec.today_cost_usd = round(rec.today_cost_usd + eff_cost, 8)
+                rec.total_prompt_tokens += p_toks
+                rec.total_completion_tokens += c_toks
+                rec.total_cost_usd = round(rec.total_cost_usd + eff_cost, 8)
             self._save_locked()
 
     def snapshot(
@@ -960,6 +1285,7 @@ class DistributionManager:
         pool_capacity: int = 0,
     ) -> Dict[str, Any]:
         with self._lock:
+            now_ts = time.time()
             ext_cap = self._compute_external_cap(pool_capacity) if pool_capacity > 0 else 0
             clients_list = [
                 rec.to_view_dict(
@@ -968,6 +1294,10 @@ class DistributionManager:
                     queued=self._client_queued.get(rec.client_id, 0),
                 )
                 for rec in sorted(self._clients.values(), key=lambda r: r.created_at, reverse=True)
+            ]
+            live_tasks_list = [
+                t.to_dict(now_ts)
+                for t in sorted(self._live_tasks.values(), key=lambda x: x.started_at, reverse=True)
             ]
             return {
                 "policy": {
@@ -978,12 +1308,15 @@ class DistributionManager:
                 },
                 "runtime": {
                     "host_in_flight": self._host_in_flight,
+                    "host_waiting": self._host_waiting,
                     "external_in_flight": self._external_in_flight,
                     "external_queued": sum(self._client_queued.values()),
                     "pool_capacity": pool_capacity,
                     "external_parallel_cap": ext_cap,
-                    "active_client_keys": sum(1 for c in self._clients.values() if c.enabled),
+                    "active_client_keys": sum(1 for c in self._clients.values() if c.enabled and not c.is_expired(int(now_ts))),
                     "total_client_keys": len(self._clients),
+                    "live_task_count": len(live_tasks_list),
                 },
                 "clients": clients_list,
+                "live_tasks": live_tasks_list,
             }

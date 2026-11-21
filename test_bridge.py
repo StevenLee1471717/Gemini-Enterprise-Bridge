@@ -61,7 +61,7 @@ def test_smart_context_builder_incremental_and_packed() -> None:
         ChatMessage(role="system", content="你是一名企业架构师。"),
         ChatMessage(role="user", content="请介绍 Vertex AI Search。"),
     ]
-    p1 = builder.build(t1_msgs, model="gemini-enterprise-web", session_key=session)
+    p1 = builder.build(t1_msgs, model="gemini-4-carbon", session_key=session)
     assert p1.strategy_used == "smart_single_turn"
     assert "你是一名企业架构师" in p1.prompt
     assert "请介绍 Vertex AI Search" in p1.prompt
@@ -76,7 +76,7 @@ def test_smart_context_builder_incremental_and_packed() -> None:
         ChatMessage(role="assistant", content="Vertex AI Search 是企业级检索与生成平台。"),
         ChatMessage(role="user", content="它与 Agentspace 是什么关系？"),
     ]
-    p2 = builder.build(t2_msgs, model="gemini-enterprise-web", session_key=session)
+    p2 = builder.build(t2_msgs, model="gemini-4-carbon", session_key=session)
     assert p2.strategy_used == "smart_incremental_delta"
     assert p2.prompt == "它与 Agentspace 是什么关系？"
     assert p2.reset_chat is False
@@ -87,7 +87,7 @@ def test_smart_context_builder_incremental_and_packed() -> None:
         ChatMessage(role="assistant", content="回复 A"),
         ChatMessage(role="user", content="追问 B"),
     ]
-    p3 = builder.build(other_msgs, model="gemini-enterprise-web-newchat", session_key=session)
+    p3 = builder.build(other_msgs, model="gemini-4-carbon-newchat", session_key=session)
     assert p3.strategy_used == "smart_packed_context"
     assert p3.reset_chat is True
     assert "前情提要 A" in p3.prompt
@@ -146,12 +146,17 @@ def test_health_models_and_503_when_disconnected() -> None:
 
         models = client.get("/v1/models").json()
         assert models["object"] == "list"
-        model_ids = {m["id"] for m in models["data"]}
-        assert "gemini-enterprise-web" in model_ids
+        model_ids = [m["id"] for m in models["data"]]
+        assert model_ids == [
+            "gemini-4-carbon",
+            "gemini-4-argon",
+            "gemini-3.1-pro",
+            "gemini-3.8-flash",
+        ]
 
         resp = client.post(
             "/v1/chat/completions",
-            json={"model": "gemini-enterprise-web", "messages": [{"role": "user", "content": "Hi"}]},
+            json={"model": "gemini-4-carbon", "messages": [{"role": "user", "content": "Hi"}]},
         )
         assert resp.status_code == 503
         body = resp.json()
@@ -239,7 +244,7 @@ def test_websocket_browser_sync_and_sse_streaming_roundtrip() -> None:
             r1 = client.post(
                 "/v1/chat/completions",
                 json={
-                    "model": "gemini-enterprise-web",
+                    "model": "gemini-4-carbon",
                     "stream": False,
                     "messages": [
                         {
@@ -262,7 +267,7 @@ def test_websocket_browser_sync_and_sse_streaming_roundtrip() -> None:
                 "POST",
                 "/v1/chat/completions",
                 json={
-                    "model": "gemini-enterprise-web",
+                    "model": "gemini-4-carbon",
                     "stream": True,
                     "stream_options": {"include_usage": True},
                     "messages": [
@@ -384,8 +389,17 @@ def test_http_poll_bridge_and_concurrent_fifo_serialization() -> None:
 
 
 def test_model_alias_resolution_and_models_endpoint() -> None:
-    assert resolve_target_web_model("gemini-enterprise-web") is None
-    assert resolve_target_web_model("gemini-enterprise-web-newchat") is None
+    from schemas import normalize_default_model
+
+    assert resolve_target_web_model(None) == "4-carbon"
+    assert resolve_target_web_model("") == "4-carbon"
+    assert resolve_target_web_model("default") == "4-carbon"
+    assert resolve_target_web_model("gemini-enterprise-web") == "4-carbon"
+    assert resolve_target_web_model("gemini-enterprise-web-newchat") == "4-carbon"
+    assert normalize_default_model("") == "gemini-4-carbon"
+    assert normalize_default_model("gemini-enterprise-web") == "gemini-4-carbon"
+    assert normalize_default_model("gemini-enterprise-web-newchat") == "gemini-4-carbon-newchat"
+    assert normalize_default_model("gemini-enterprise-web@slot1") == "gemini-4-carbon@slot1"
     assert resolve_target_web_model("gemini-enterprise-gcloud") is None
 
     for alias in ("3.1pro", "3.1-pro", "gemini-3.1-pro", "gemini-3.1-pro-newchat"):
@@ -419,18 +433,14 @@ def test_model_alias_resolution_and_models_endpoint() -> None:
 
     with TestClient(app) as client:
         models_resp = client.get("/v1/models").json()
-        listed_ids = {m["id"] for m in models_resp["data"]}
-        for expected_id in (
-            "gemini-3.1-pro",
-            "gemini-3.1-pro-newchat",
-            "gemini-4-argon",
-            "gemini-4-argon-newchat",
+        listed_ids = [m["id"] for m in models_resp["data"]]
+        assert listed_ids == [
             "gemini-4-carbon",
-            "gemini-4-carbon-newchat",
+            "gemini-4-argon",
+            "gemini-3.1-pro",
             "gemini-3.8-flash",
-            "gemini-3.8-flash-newchat",
-        ):
-            assert expected_id in listed_ids
+        ]
+        assert "gemini-enterprise-web" not in listed_ids
 
         ready = threading.Event()
         with client.websocket_connect("/ws/browser?client_id=ext-models") as ws:
@@ -1478,8 +1488,12 @@ def test_gemini_4_carbon_deduplicated_and_context_window_metadata() -> None:
     from schemas import AVAILABLE_MODELS, estimate_tokens
 
     ids = [m["id"] for m in AVAILABLE_MODELS]
-    assert ids.count("gemini-4-carbon") == 1
-    assert ids.count("gemini-4-carbon-newchat") == 1
+    assert ids == [
+        "gemini-4-carbon",
+        "gemini-4-argon",
+        "gemini-3.1-pro",
+        "gemini-3.8-flash",
+    ]
     assert len(ids) == len(set(ids)), "AVAILABLE_MODELS must not contain duplicate model IDs"
 
     carbon_entry = next(m for m in AVAILABLE_MODELS if m["id"] == "gemini-4-carbon")
@@ -2535,7 +2549,7 @@ def test_models_list_and_retrieve_model_expose_full_1m_budget_fields() -> None:
         list_resp = client.get("/v1/models")
         assert list_resp.status_code == 200
         models = list_resp.json()["data"]
-        assert len(models) >= 15
+        assert len(models) >= 4
 
         for entry in models:
             assert entry["context_length"] == 1048576

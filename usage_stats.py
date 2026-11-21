@@ -104,6 +104,23 @@ def resolve_canonical_billing_model(
     gcloud_fallback_model: Optional[str] = None,
 ) -> str:
     """Resolve requested OpenAI model + live browser active_model into canonical billing ID."""
+    base_req = (requested_model or "").split("@", 1)[0].split("#", 1)[0].strip().lower()
+    if base_req.endswith("-newchat"):
+        base_req = base_req[: -len("-newchat")].strip()
+    is_generic_placeholder = base_req in {
+        "",
+        "default",
+        "auto",
+        "web",
+        "gemini-enterprise",
+        "gemini-enterprise-web",
+    }
+
+    if is_generic_placeholder:
+        from_browser = _match_browser_label_to_canonical(browser_active_model)
+        if from_browser:
+            return from_browser
+
     req_target = resolve_target_web_model(requested_model)
     if req_target in _WEB_KEY_TO_CANONICAL:
         return _WEB_KEY_TO_CANONICAL[req_target]

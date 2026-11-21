@@ -2,12 +2,167 @@ param(
     [switch]$Test,
     [switch]$ExportOnly,
     [switch]$SkipUpdate,
+    [switch]$Stop,
+    [switch]$Status,
+    [switch]$Background,
+    [switch]$EnsureCodexProfile,
+    [switch]$InstallStartup,
+    [switch]$UninstallStartup,
+    [switch]$Force,
     [int]$Port = 0
 )
 
 $ErrorActionPreference = "Stop"
 [Console]::OutputEncoding = [System.Text.Encoding]::UTF8
+$env:PYTHONUTF8 = "1"
+$env:PYTHONIOENCODING = "utf-8"
 Set-Location -Path $PSScriptRoot
+
+function Resolve-HostPython {
+    $candidates = @(
+        @("py", "-3"),
+        @("python"),
+        @("python3")
+    )
+    $extraDirs = @()
+    if ($env:LOCALAPPDATA) {
+        $extraDirs += Get-ChildItem -Path (Join-Path $env:LOCALAPPDATA "Programs\Python\Python3*") -Directory -ErrorAction SilentlyContinue | Sort-Object Name -Descending
+    }
+    if ($env:ProgramFiles) {
+        $extraDirs += Get-ChildItem -Path (Join-Path $env:ProgramFiles "Python3*") -Directory -ErrorAction SilentlyContinue | Sort-Object Name -Descending
+    }
+    foreach ($dir in $extraDirs) {
+        $exe = Join-Path $dir.FullName "python.exe"
+        if (Test-Path $exe) {
+            $candidates += , @($exe)
+        }
+    }
+
+    foreach ($cand in $candidates) {
+        $bin = $cand[0]
+        $extraArgs = if ($cand.Count -gt 1) { $cand[1..($cand.Count - 1)] } else { @() }
+        try {
+            $cmdObj = Get-Command $bin -ErrorAction SilentlyContinue
+            if (-not $cmdObj -and -not (Test-Path $bin)) {
+                continue
+            }
+            $probe = & $bin @extraArgs -c "import sys; assert sys.version_info >= (3, 10); print(sys.executable)" 2>$null
+            if ($LASTEXITCODE -eq 0 -and $probe) {
+                $resolvedExe = ($probe | Select-Object -Last 1).Trim()
+                if ($resolvedExe -and (Test-Path $resolvedExe) -and ($resolvedExe -notmatch "WindowsApps\\python")) {
+                    return $resolvedExe
+                }
+            }
+        } catch {
+            continue
+        }
+    }
+    throw "Python 3.10+ was not found (or only Microsoft Store stub exists). Install Python via: winget install -e --id Python.Python.3.12"
+}
+
+function Resolve-ActivePort {
+    param([int]$OverridePort)
+    if ($OverridePort -gt 0) {
+        return $OverridePort
+    }
+    $portVal = 8000
+    if ($env:BRIDGE_PORT) {
+        [void][int]::TryParse($env:BRIDGE_PORT, [ref]$portVal)
+    } elseif (Test-Path ".env") {
+        $portLine = Get-Content ".env" -Encoding UTF8 | Where-Object { $_ -match "^\s*BRIDGE_PORT\s*=\s*(\d+)" } | Select-Object -First 1
+        if ($portLine -match "(\d+)") {
+            $portVal = [int]$Matches[1]
+        }
+    }
+    return $portVal
+}
+
+function Get-PortListenerPid {
+    param([int]$TargetPort)
+    try {
+        $conn = Get-NetTCPConnection -LocalPort $TargetPort -State Listen -ErrorAction Stop | Select-Object -First 1
+        if ($conn -and $conn.OwningProcess -gt 0) {
+            return [int]$conn.OwningProcess
+        }
+    } catch {
+        $lines = netstat -ano 2>$null | Select-String -Pattern "LISTENING"
+        foreach ($ln in $lines) {
+            $text = $ln.Line.Trim()
+            if ($text -match ":$TargetPort\s+\S+\s+LISTENING\s+(\d+)$") {
+                return [int]$Matches[1]
+            }
+        }
+    }
+    return 0
+}
+
+function Get-BridgeLiveStatus {
+    param([int]$TargetPort)
+    try {
+        $resp = Invoke-RestMethod -Uri "http://127.0.0.1:$TargetPort/api/status" -Method Get -TimeoutSec 2 -ErrorAction Stop
+        return $resp
+    } catch {
+        return $null
+    }
+}
+
+function Stop-BridgeInstance {
+    param([int]$TargetPort, [switch]$ForceStop)
+    $live = Get-BridgeLiveStatus -TargetPort $TargetPort
+    if ($live -and $live.hub -and (-not $ForceStop)) {
+        $inFlight = [int]($live.hub.in_flight_requests)
+        $queued = [int]($live.hub.queued_requests)
+        if (($inFlight -gt 0) -or ($queued -gt 0)) {
+            Write-Host "[Busy] Port $TargetPort currently has in_flight=$inFlight, queued=$queued requests. Pass -Force to stop anyway." -ForegroundColor Yellow
+            exit 2
+        }
+    }
+    $oldPid = Get-PortListenerPid -TargetPort $TargetPort
+    if ($oldPid -le 0) {
+        Write-Host "[Stop] No listener found on port $TargetPort." -ForegroundColor Gray
+        return
+    }
+    Write-Host "[Stop] Stopping listener on port $TargetPort (PID=$oldPid) ..." -ForegroundColor Yellow
+    try {
+        Stop-Process -Id $oldPid -Force -ErrorAction Stop
+        Start-Sleep -Milliseconds 700
+        Write-Host "[Stop] Stopped PID=$oldPid." -ForegroundColor Green
+    } catch {
+        Write-Host "[Warn] Could not stop PID=$oldPid ($($_.Exception.Message))." -ForegroundColor Red
+        exit 1
+    }
+}
+
+$StartupVbs = Join-Path ([Environment]::GetFolderPath("Startup")) "Gemini-Enterprise-Bridge.vbs"
+if ($UninstallStartup) {
+    if (Test-Path $StartupVbs) {
+        Remove-Item -Path $StartupVbs -Force
+        Write-Host "[Startup] Removed auto-start entry: $StartupVbs" -ForegroundColor Green
+    } else {
+        Write-Host "[Startup] No auto-start entry found at: $StartupVbs" -ForegroundColor Gray
+    }
+    exit 0
+}
+
+$ActivePort = Resolve-ActivePort -OverridePort $Port
+if ($Port -gt 0) {
+    $env:BRIDGE_PORT = "$Port"
+}
+
+if ($Status) {
+    $live = Get-BridgeLiveStatus -TargetPort $ActivePort
+    if ($live -and $live.hub) {
+        Write-Host "[OK] Running on http://127.0.0.1:$ActivePort/ | browser_connected=$($live.hub.browser_connected) | in_flight=$($live.hub.in_flight_requests) | queued=$($live.hub.queued_requests)" -ForegroundColor Green
+        exit 0
+    }
+    Write-Host "[Offline] No responsive Bridge service on http://127.0.0.1:$ActivePort/" -ForegroundColor Yellow
+    exit 1
+}
+
+if ($Stop) {
+    Stop-BridgeInstance -TargetPort $ActivePort -ForceStop:$Force
+    exit 0
+}
 
 Write-Host "============================================================" -ForegroundColor Cyan
 Write-Host "  Gemini Enterprise Web-to-API Bridge (Local OpenAI Proxy)  " -ForegroundColor Cyan
@@ -38,12 +193,13 @@ $VenvDir = if (Test-Path (Join-Path $LocalVenv "Scripts\python.exe")) { $LocalVe
 $VenvPython = Join-Path $VenvDir "Scripts\python.exe"
 
 if (-not (Test-Path $VenvPython)) {
+    $HostPython = Resolve-HostPython
     Write-Host "[Setup] Creating isolated Python venv at: $VenvDir ..." -ForegroundColor Yellow
     $ParentDir = Split-Path -Parent $VenvDir
     if (-not (Test-Path $ParentDir)) {
         New-Item -ItemType Directory -Force -Path $ParentDir | Out-Null
     }
-    python -m venv $VenvDir
+    & $HostPython -m venv $VenvDir
 }
 
 $ReqHashFile = Join-Path $VenvDir ".req.sha256"
@@ -68,6 +224,25 @@ function Invoke-SyncDependenciesAndExtension {
     & $VenvPython extension_exporter.py
 }
 
+if ($EnsureCodexProfile) {
+    $BackupDir = Join-Path $PSScriptRoot ".cache\codex-profile-backups\$(Get-Date -Format 'yyyyMMdd-HHmmss')"
+    & $VenvPython configure_codex_context.py --ensure-bridge-profile --port $ActivePort --apply --backup-dir $BackupDir
+    exit $LASTEXITCODE
+}
+
+if ($InstallStartup) {
+    $EscapedPs1 = $PSCommandPath.Replace('"', '""')
+    $VbsLines = @(
+        'Set sh = CreateObject("WScript.Shell")',
+        "sh.Run `"powershell.exe -NoProfile -WindowStyle Hidden -ExecutionPolicy Bypass -File `"`"$EscapedPs1`"`" -Background`", 0, False"
+    )
+    Set-Content -Path $StartupVbs -Value ($VbsLines -join "`r`n") -Encoding ASCII
+    Write-Host "[Startup] Installed Windows login auto-start: $StartupVbs" -ForegroundColor Green
+    if (-not $Background) {
+        exit 0
+    }
+}
+
 if ($ExportOnly) {
     & $VenvPython extension_exporter.py
     exit 0
@@ -77,7 +252,21 @@ if ($Test) {
     & $VenvPython extension_exporter.py
     Write-Host "[Test] Running automated test suite (pytest) ..." -ForegroundColor Cyan
     & $VenvPython -m pytest -v
-    exit $LASTEXITCODE
+    if ($LASTEXITCODE -ne 0) {
+        exit $LASTEXITCODE
+    }
+    $NodeCmd = Get-Command node -ErrorAction SilentlyContinue
+    if ($NodeCmd) {
+        Write-Host "[Test] Running Node.js extension & Shadow DOM suites ..." -ForegroundColor Cyan
+        Get-ChildItem -Path $PSScriptRoot -Filter "test_*.mjs" | Sort-Object Name | ForEach-Object {
+            Write-Host "  -> $($_.Name)" -ForegroundColor Gray
+            & $NodeCmd.Source $_.FullName
+            if ($LASTEXITCODE -ne 0) {
+                exit $LASTEXITCODE
+            }
+        }
+    }
+    exit 0
 }
 
 # Check GitHub Releases for backend & extension updates on every startup unless disabled
@@ -109,14 +298,33 @@ if ($Port -gt 0) {
     $env:BRIDGE_PORT = "$Port"
 }
 
-$ActivePort = 8000
-if ($env:BRIDGE_PORT) {
-    [void][int]::TryParse($env:BRIDGE_PORT, [ref]$ActivePort)
-} elseif (Test-Path ".env") {
-    $portLine = Get-Content ".env" | Where-Object { $_ -match "^\s*BRIDGE_PORT\s*=\s*(\d+)" } | Select-Object -First 1
-    if ($portLine -match "(\d+)") {
-        $ActivePort = [int]$Matches[1]
+if ($Background) {
+    $ExistingLive = Get-BridgeLiveStatus -TargetPort $ActivePort
+    if ($ExistingLive -and $ExistingLive.hub) {
+        Write-Host "[Running] Gemini Enterprise Bridge is already active on http://127.0.0.1:${ActivePort}/" -ForegroundColor Green
+        exit 0
     }
+    $ExistingPid = Get-PortListenerPid -TargetPort $ActivePort
+    if ($ExistingPid -gt 0) {
+        Stop-BridgeInstance -TargetPort $ActivePort -ForceStop:$Force
+    }
+    $LogsDir = Join-Path (Split-Path -Parent $PSScriptRoot) "logs"
+    if (-not (Test-Path $LogsDir)) {
+        New-Item -ItemType Directory -Force -Path $LogsDir | Out-Null
+    }
+    $StdOutLog = Join-Path $LogsDir "server.log"
+    $StdErrLog = Join-Path $LogsDir "server-error.log"
+    Start-Process -FilePath $VenvPython -ArgumentList @("server.py") -WorkingDirectory $PSScriptRoot -WindowStyle Hidden -RedirectStandardOutput $StdOutLog -RedirectStandardError $StdErrLog | Out-Null
+    for ($i = 0; $i -lt 25; $i++) {
+        Start-Sleep -Milliseconds 400
+        $check = Get-BridgeLiveStatus -TargetPort $ActivePort
+        if ($check -and $check.hub) {
+            Write-Host "[Started] Gemini Enterprise Bridge is running in background: http://127.0.0.1:${ActivePort}/" -ForegroundColor Green
+            exit 0
+        }
+    }
+    Write-Host "[Error] Background service did not become ready within 10s. Check logs at: $StdErrLog" -ForegroundColor Red
+    exit 1
 }
 
 $ExtFolder = Join-Path $PSScriptRoot "extension"
@@ -127,18 +335,10 @@ Write-Host "  3. OpenAI Base URL: http://127.0.0.1:${ActivePort}/v1  (Models: ge
 Write-Host "  4. Local Dashboard: http://127.0.0.1:${ActivePort}/" -ForegroundColor Green
 Write-Host ""
 
-# Gracefully replace any stale server.py listener occupying $ActivePort
-$ExistingListener = Get-NetTCPConnection -LocalPort $ActivePort -State Listen -ErrorAction SilentlyContinue | Select-Object -First 1
-if ($ExistingListener) {
-    $OldPid = $ExistingListener.OwningProcess
-    Write-Host "[Port] Port ${ActivePort} is currently in use by PID=${OldPid}; stopping old instance..." -ForegroundColor Yellow
-    try {
-        Stop-Process -Id $OldPid -Force -ErrorAction Stop
-        Start-Sleep -Milliseconds 800
-        Write-Host "[Port] Stopped previous instance (PID=${OldPid})." -ForegroundColor Green
-    } catch {
-        Write-Host "[Warn] Could not stop PID=${OldPid} ($($_.Exception.Message)). Close the old terminal if bind fails." -ForegroundColor Red
-    }
+# Safely check in-flight requests before replacing any existing listener occupying $ActivePort
+$OldPid = Get-PortListenerPid -TargetPort $ActivePort
+if ($OldPid -gt 0) {
+    Stop-BridgeInstance -TargetPort $ActivePort -ForceStop:$Force
 }
 
 $env:BRIDGE_SUPERVISED = "1"

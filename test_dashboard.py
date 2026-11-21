@@ -30,7 +30,13 @@ def test_served_dashboard_javascript_parses(tmp_path: Path) -> None:
     for script in scripts:
         result = subprocess.run(
             [node, "--check", "--input-type=commonjs"],
-            input=script, capture_output=True, text=True, encoding="utf-8", timeout=10, check=False,
+            input=script,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=10,
+            check=False,
         )
         assert result.returncode == 0, result.stderr
 
@@ -76,6 +82,24 @@ def test_dashboard_ui_structure_and_slot_reset_api(tmp_path: Path) -> None:
             "distClientsTable",
             "detailTenantChip",
             "secDiag",
+            "navBtnSeats",
+            "navBtnDist",
+            "navBtnAudit",
+            "navBtnLedger",
+            "navBtnProbe",
+            "navBtnDiag",
+            "gatewaySettingsDrawer",
+            "toggleCreateKeyBtn",
+            "createKeyPanel",
+            "liveTasksFold",
+            "auditSubTabs",
+            "sessionsPager",
+            "sessionsPrevBtn",
+            "sessionsNextBtn",
+            "auditLogsPager",
+            "auditLogsPrevBtn",
+            "auditLogsNextBtn",
+            "ledgerSubTabs",
         ):
             assert required_id in html
         for removed_marker in (
@@ -97,6 +121,9 @@ def test_dashboard_ui_structure_and_slot_reset_api(tmp_path: Path) -> None:
         assert "grid-template-columns: repeat(3, minmax(0, 1fr))" in html
         assert "[hidden] { display: none !important; }" in html
         assert "@keyframes refreshSpin" in html
+        assert ".app-shell" in html
+        assert ".table-viewport" in html
+        assert "max-height: 460px" in html
 
         status = client.get("/api/status").json()
         assert status["default_model"] == "gemini-4-carbon"
@@ -310,6 +337,37 @@ def test_codex_rollout_lifecycle_prevents_idle_flicker_and_guards_reset(tmp_path
         assert st4["activity_label"] == "工作中 · 模型回复"
         slot.in_flight_request_id = None
 
+        # Older gateways could leave the same Codex thread pinned on two pages.
+        old_slot = hub._upsert_single_slot(
+            client_id="ext-codex",
+            tab_id=302,
+            tab_url="https://vertexaisearch.cloud.google.com/u/1/home/cid/abc/r/session/998",
+        )
+        hub.restore_slot_affinity(old_slot.slot_key, tid)
+        hub.restore_slot_affinity(slot.slot_key, tid)
+        slots = {
+            s["tab_id"]: s for s in client.get("/api/status").json()["context_monitor"]["slots"]
+        }
+        assert slots[301]["activity_phase"] == "waiting_model"
+        assert slots[302]["activity_phase"] == "idle"
+        assert hub.compute_working_tab_ids() == [301]
+
+        old_slot.pending_tool_call_until = rollout_file.stat().st_mtime + 1200.0
+        slots = {
+            s["tab_id"]: s for s in client.get("/api/status").json()["context_monitor"]["slots"]
+        }
+        assert slots[302]["activity_source"] == "pending_tool_window"
+        assert hub.compute_working_tab_ids() == [301, 302]
+        old_slot.pending_tool_call_until = 0
+
+        old_slot.in_flight_request_id = "req-old-still-working"
+        slots = {
+            s["tab_id"]: s for s in client.get("/api/status").json()["context_monitor"]["slots"]
+        }
+        assert slots[302]["activity_phase"] == "generating"
+        assert hub.compute_working_tab_ids() == [301, 302]
+        old_slot.in_flight_request_id = None
+
         # 5) Staleness guard: if Codex process died > 15m ago without task_complete, auto-recover to idle
         stale_check = lookup_codex_thread_activity(
             tid,
@@ -369,6 +427,29 @@ def test_status_reflects_extension_max_parallel_tabs(tmp_path: Path) -> None:
             assert hub["client_max_parallel_tabs"] == 6
             assert hub["server_max_parallel_tabs"] == 10
             assert hub["active_client"]["max_parallel_tabs"] == 6
+
+
+def test_dashboard_seat_numbers_follow_browser_tab_order(tmp_path: Path) -> None:
+    settings = BridgeSettings(auto_export_extension=False, generated_dir=str(tmp_path))
+    tabs = [
+        {"tab_id": tab_id, "tab_url": "https://vertexaisearch.cloud.google.com/home/cid/demo"}
+        for tab_id in range(101, 113)
+    ]
+    app = create_app(settings)
+    with TestClient(app) as client, client.websocket_connect("/ws/browser?client_id=ext-seat-order") as ws:
+        assert ws.receive_json()["type"] == "welcome"
+        ws.send_json({"type": "tab_status", "max_parallel_tabs": 12, "tabs": tabs})
+        assert ws.receive_json()["type"] == "ack"
+
+        # Moving tab 108 from 8th to 11th changes its badge in Chrome, not its hub insertion order.
+        tabs.insert(10, tabs.pop(7))
+        ws.send_json({"type": "heartbeat", "tabs": tabs})
+        assert ws.receive_json()["type"] == "pong"
+        slots = client.get("/api/status").json()["hub"]["worker_slots"]
+        assert slots[7]["tab_id"] == 108
+        assert {slot["tab_id"]: slot["seat_index"] for slot in slots} == {
+            tab["tab_id"]: seat_index for seat_index, tab in enumerate(tabs, start=1)
+        }
 
 
 def test_slot_compaction_count_tracks_rollout_and_inline_summaries(tmp_path: Path) -> None:
@@ -451,3 +532,70 @@ def test_slot_compaction_count_tracks_rollout_and_inline_summaries(tmp_path: Pat
         assert cb.get_slot_context_metrics("ext:502")["compaction_count"] == 2
     finally:
         cb.close()
+
+
+def test_simplified_seat_cap_options_custom_input_and_no_unlimited(tmp_path: Path) -> None:
+    import time
+
+    settings = BridgeSettings(
+        auto_export_extension=False,
+        max_parallel_tabs=10,
+        generated_dir=str(tmp_path),
+    )
+    app = create_app(settings)
+    with TestClient(app) as client:
+        html = client.get("/").text
+        assert "dashSeatCapGroup" in html
+        assert 'data-cap="1">1</button>' in html
+        assert 'data-cap="5">5</button>' in html
+        assert 'data-cap="10">10</button>' in html
+        assert 'data-cap="custom">自定义</button>' in html
+        assert 'id="dashSeatCapCustomInput"' in html
+        assert 'data-cap="0"' not in html
+        assert 'data-cap="4"' not in html
+        assert 'data-cap="6"' not in html
+        assert 'data-cap="8"' not in html
+
+        with client.websocket_connect("/ws/browser?client_id=ext-custom") as ws:
+            welcome = ws.receive_json()
+            assert welcome["type"] == "welcome"
+            ws.send_json(
+                {
+                    "type": "tab_status",
+                    "max_parallel_tabs": 5,
+                    "capabilities": ["multi_tab", "spawn_tab"],
+                    "tabs": [
+                        {
+                            "tab_id": 201,
+                            "tab_url": "https://vertexaisearch.cloud.google.com/home/cid/demo",
+                            "tab_title": "Demo",
+                            "ready": True,
+                        }
+                    ],
+                }
+            )
+            ack = ws.receive_json()
+            assert ack["type"] == "ack"
+            hub = {}
+            for _ in range(20):
+                hub = client.get("/api/status").json()["hub"]
+                if hub.get("client_max_parallel_tabs") == 5:
+                    break
+                time.sleep(0.02)
+            assert hub["max_parallel_tabs"] == 5
+            assert hub["unlimited_parallel_tabs"] is False
+            assert hub["parallel_capacity"] == 1
+
+            # Custom number (e.g. 8) succeeds and syncs to connected extension
+            res_eight = client.post("/api/seats/limit", json={"max_parallel_tabs": 8})
+            assert res_eight.status_code == 200
+            assert res_eight.json()["max_parallel_tabs"] == 8
+            assert res_eight.json()["unlimited"] is False
+            pushed_eight = ws.receive_json()
+            assert pushed_eight == {"type": "set_max_parallel_tabs", "max_parallel_tabs": 8}
+
+            # 0 (formerly unlimited) and out-of-range values are rejected
+            res_zero = client.post("/api/seats/limit", json={"max_parallel_tabs": 0})
+            assert res_zero.status_code == 400
+            res_over = client.post("/api/seats/limit", json={"max_parallel_tabs": 201})
+            assert res_over.status_code == 400

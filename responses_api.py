@@ -1,6 +1,7 @@
 """Responses protocol used by Codex, translated to the shared chat pipeline."""
 from __future__ import annotations
 
+import codecs
 import json
 import sqlite3
 import time
@@ -11,8 +12,9 @@ from typing import Any, AsyncIterator
 
 from fastapi.responses import JSONResponse, StreamingResponse
 
+from platform_compat import best_effort_chmod, configure_sqlite_connection
 from schemas import ChatCompletionRequest, ChatMessage
-from streaming_utils import with_keepalive
+from streaming_utils import ClosingStreamingResponse, with_keepalive
 
 
 class ResponsesError(ValueError):
@@ -34,8 +36,9 @@ class ResponseStore:
             directory.mkdir(parents=True, exist_ok=True, mode=0o700)
             database = directory / "responses.sqlite3"
         self.db = sqlite3.connect(str(database), check_same_thread=False)
+        configure_sqlite_connection(self.db, is_memory=(database == ":memory:"))
         if database != ":memory:":
-            database.chmod(0o600)
+            best_effort_chmod(database, 0o600)
         self.db.execute(
             "CREATE TABLE IF NOT EXISTS responses (id TEXT PRIMARY KEY, created REAL, checkpoint INTEGER, payload BLOB, tenant_id TEXT NOT NULL DEFAULT 'host')"
         )
@@ -296,7 +299,86 @@ def input_messages(items: Any, mapping: dict, store: ResponseStore, tenant_id: s
     return merged
 
 
-def prepare_request(payload: dict, store: ResponseStore, tenant_id: str = "host") -> tuple[ChatCompletionRequest, dict, list]:
+def _clean_sid_token(value: Any) -> str | None:
+    if not isinstance(value, str):
+        return None
+    cleaned = value.strip()
+    return cleaned or None
+
+
+def _parse_turn_metadata_blob(raw: Any) -> dict:
+    if isinstance(raw, dict):
+        return raw
+    if isinstance(raw, str) and raw.strip():
+        try:
+            parsed = json.loads(raw)
+            if isinstance(parsed, dict):
+                return parsed
+        except Exception:
+            return {}
+    return {}
+
+
+def extract_responses_thread_id(payload: dict, headers: Any = None) -> str | None:
+    hdrs = {str(k).lower(): v for k, v in (headers.items() if hasattr(headers, "items") else [])}
+    client_meta = payload.get("client_metadata") if isinstance(payload.get("client_metadata"), dict) else {}
+    turn_meta = _parse_turn_metadata_blob(hdrs.get("x-codex-turn-metadata")) or _parse_turn_metadata_blob(
+        client_meta.get("x-codex-turn-metadata")
+    )
+    req_meta = payload.get("metadata") if isinstance(payload.get("metadata"), dict) else {}
+    for candidate in (
+        hdrs.get("x-thread-id"),
+        hdrs.get("thread-id"),
+        client_meta.get("thread_id"),
+        turn_meta.get("thread_id"),
+        req_meta.get("thread_id"),
+        req_meta.get("subagent_id"),
+    ):
+        cleaned = _clean_sid_token(candidate)
+        if cleaned:
+            return cleaned
+    for win_candidate in (
+        hdrs.get("x-codex-window-id"),
+        client_meta.get("x-codex-window-id"),
+        turn_meta.get("window_id"),
+    ):
+        cleaned_win = _clean_sid_token(win_candidate)
+        if cleaned_win:
+            base_tid = cleaned_win.split(":", 1)[0].strip()
+            if base_tid:
+                return base_tid
+    return None
+
+
+def resolve_responses_session_id(payload: dict, headers: Any = None, previous: dict | None = None) -> str | None:
+    prev = previous if isinstance(previous, dict) else {}
+    explicit_tid = extract_responses_thread_id(payload, headers=headers) or _clean_sid_token(prev.get("_bridge_thread_id"))
+    if explicit_tid:
+        return explicit_tid
+    hdrs = {str(k).lower(): v for k, v in (headers.items() if hasattr(headers, "items") else [])}
+    client_meta = payload.get("client_metadata") if isinstance(payload.get("client_metadata"), dict) else {}
+    turn_meta = _parse_turn_metadata_blob(hdrs.get("x-codex-turn-metadata")) or _parse_turn_metadata_blob(
+        client_meta.get("x-codex-turn-metadata")
+    )
+    for candidate in (
+        payload.get("prompt_cache_key"),
+        prev.get("prompt_cache_key"),
+        client_meta.get("session_id"),
+        turn_meta.get("session_id"),
+        hdrs.get("session-id"),
+    ):
+        cleaned = _clean_sid_token(candidate)
+        if cleaned:
+            return cleaned
+    return None
+
+
+def prepare_request(
+    payload: dict,
+    store: ResponseStore,
+    tenant_id: str = "host",
+    headers: Any = None,
+) -> tuple[ChatCompletionRequest, dict, list]:
     for field, expected in {"model": str, "instructions": str, "previous_response_id": str, "prompt_cache_key": str,
                             "text": dict, "metadata": dict, "tools": list, "stream": bool, "store": bool}.items():
         if payload.get(field) is not None and not isinstance(payload[field], expected):
@@ -348,7 +430,8 @@ def prepare_request(payload: dict, store: ResponseStore, tenant_id: str = "host"
         stream_options={"include_usage": True}, tools=tools, tool_choice=choice,
         parallel_tool_calls=payload.get("parallel_tool_calls", True), response_format=response_format,
         max_completion_tokens=payload.get("max_output_tokens"), temperature=payload.get("temperature"), top_p=payload.get("top_p"),
-        session_id=payload.get("prompt_cache_key") or previous.get("prompt_cache_key"))
+        session_id=resolve_responses_session_id(payload, headers=headers, previous=previous))
+    req._bridge_thread_id = extract_responses_thread_id(payload, headers=headers) or _clean_sid_token(previous.get("_bridge_thread_id"))
     return req, mapping, [m.model_dump(exclude_none=True) for m in messages]
 
 
@@ -390,7 +473,14 @@ def usage_from_chat(usage: dict) -> dict:
             "output_tokens_details": {"reasoning_tokens": 0}}
 
 
-def remember(response: dict, history: list, store: ResponseStore, tenant_id: str = "host") -> None:
+def remember(
+    response: dict,
+    history: list,
+    store: ResponseStore,
+    tenant_id: str = "host",
+    *,
+    thread_id: str | None = None,
+) -> None:
     if not response["store"]:
         return
     from media_inputs import compact_messages_for_store
@@ -400,13 +490,32 @@ def remember(response: dict, history: list, store: ResponseStore, tenant_id: str
         getattr(store, "file_store", None),
         tenant_id=tenant_id,
     )
-    store.put(response["id"], response, combined, tenant_id=tenant_id)
+    stored_response = {**response, "_bridge_thread_id": thread_id} if thread_id else response
+    store.put(response["id"], stored_response, combined, tenant_id=tenant_id)
 
 
 async def chat_packets(body: AsyncIterator) -> AsyncIterator[dict]:
     buffer = ""
+    decoder = codecs.getincrementaldecoder("utf-8")(errors="replace")
     async for piece in body:
-        buffer += piece.decode() if isinstance(piece, bytes) else piece
+        chunk_str = decoder.decode(piece, final=False) if isinstance(piece, (bytes, bytearray)) else str(piece)
+        if "\r" in chunk_str:
+            chunk_str = chunk_str.replace("\r\n", "\n").replace("\r", "\n")
+        elif buffer.endswith("\r") and chunk_str.startswith("\n"):
+            buffer = buffer[:-1]
+        buffer += chunk_str
+        while "\n\n" in buffer:
+            block, buffer = buffer.split("\n\n", 1)
+            data = "\n".join(line[5:].lstrip() for line in block.splitlines() if line.startswith("data:"))
+            if data == "[DONE]":
+                return
+            if data:
+                yield json.loads(data)
+            elif block.startswith(":") or block.startswith("event: keepalive"):
+                yield {}
+    tail = decoder.decode(b"", final=True)
+    if tail:
+        buffer += tail.replace("\r\n", "\n").replace("\r", "\n")
         while "\n\n" in buffer:
             block, buffer = buffer.split("\n\n", 1)
             data = "\n".join(line[5:].lstrip() for line in block.splitlines() if line.startswith("data:"))
@@ -428,6 +537,7 @@ async def translate_response(
     image_generator=None,
     *,
     tenant_id: str = "host",
+    headers: Any = None,
 ) -> Any:
     eff_tenant = (tenant_id or "host").strip() or "host"
     async def resolve_image(item):
@@ -442,12 +552,14 @@ async def translate_response(
             return upstream
         upstream = json.loads(upstream.body)
     inherited_cache_key = payload.get("prompt_cache_key")
-    if not inherited_cache_key and payload.get("previous_response_id"):
+    inherited_thread_id = extract_responses_thread_id(payload, headers=headers)
+    if (not inherited_cache_key or not inherited_thread_id) and payload.get("previous_response_id"):
         try:
             prev_resp, _ = store.get(payload["previous_response_id"], tenant_id=eff_tenant)
-            inherited_cache_key = prev_resp.get("prompt_cache_key")
+            inherited_cache_key = inherited_cache_key or prev_resp.get("prompt_cache_key")
+            inherited_thread_id = inherited_thread_id or _clean_sid_token(prev_resp.get("_bridge_thread_id"))
         except Exception:
-            inherited_cache_key = None
+            inherited_cache_key = inherited_cache_key or None
     effective_payload = {**payload, "prompt_cache_key": inherited_cache_key} if inherited_cache_key else payload
     response = response_base(effective_payload, model)
     if not isinstance(upstream, StreamingResponse):
@@ -468,7 +580,7 @@ async def translate_response(
                 item = await resolve_image(item)
             response["output"].append(item)
         response.update(status="completed", usage=usage_from_chat(upstream.get("usage", {})))
-        remember(response, history, store, tenant_id=eff_tenant)
+        remember(response, history, store, tenant_id=eff_tenant, thread_id=inherited_thread_id)
         return JSONResponse(response)
 
     sequence = 0
@@ -483,13 +595,19 @@ async def translate_response(
         snapshot = {key: response[key] for key in ("id", "object", "created_at", "model")}
         return event("response.in_progress", response={**snapshot, "status": "in_progress", "output": []})
 
+    async def close_upstream():
+        if isinstance(upstream, ClosingStreamingResponse):
+            await upstream.close()
+        else:
+            await upstream.body_iterator.aclose()
+
     async def events() -> AsyncIterator[str]:
-        yield event("response.created", response=response)
-        yield event("response.in_progress", response=response)
         message = None
         calls: dict[int, dict] = {}
         finished = False
         try:
+            yield event("response.created", response=response)
+            yield event("response.in_progress", response=response)
             async for packet in chat_packets(upstream.body_iterator):
                 if not packet:
                     yield progress()
@@ -565,15 +683,16 @@ async def translate_response(
                 yield event("response.output_item.done", output_index=output_index, item=item)
             response["status"] = "completed"
             response["usage"] = response["usage"] or usage_from_chat({})
-            remember(response, history, store, tenant_id=eff_tenant)
+            remember(response, history, store, tenant_id=eff_tenant, thread_id=inherited_thread_id)
             yield event("response.completed", response=response)
         except Exception as exc:
             response.update(status="failed", error={"code": "bridge_error", "message": str(exc)})
             yield event("response.failed", response=response)
         finally:
-            await upstream.body_iterator.aclose()
-    return StreamingResponse(
+            await close_upstream()
+    return ClosingStreamingResponse(
         with_keepalive(events(), frame=progress),
         media_type="text/event-stream",
         headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+        on_close=close_upstream,
     )

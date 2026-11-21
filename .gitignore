@@ -16,6 +16,8 @@ build/
 .env
 .env.*
 !env.example
+codex_model_router/settings.json
+config-before-router-*.toml
 *.pem
 *.key
 

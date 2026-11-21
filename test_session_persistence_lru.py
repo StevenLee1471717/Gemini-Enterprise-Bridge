@@ -9,6 +9,7 @@ import time
 from fastapi.testclient import TestClient
 
 from config import BridgeSettings
+from context_builder import ConversationContextBuilder
 from server import create_app
 
 
@@ -36,6 +37,23 @@ def _recv_next_meaningful(ws) -> dict:
     if msg.get("type") == "execute_prompt" and msg.get("chunked"):
         msg["prompt"] = "".join(chunks[i] for i in range(msg["total_chunks"]))
     return msg
+
+
+def test_evicting_stale_seat_preserves_newer_thread_archive(tmp_path: Path):
+    builder = ConversationContextBuilder(archive_path=tmp_path / 'sessions.sqlite3')
+    base = 'https://vertexaisearch.cloud.google.com/u/0/app/cid1/r/session/'
+    try:
+        for slot, reply in [('old', 'first reply'), ('new', 'latest reply')]:
+            builder.record_completed_turn(
+                slot, [('user', 'prompt')], assistant_reply=reply,
+                session_url=base + slot, explicit_session_id='same-thread',
+            )
+        builder.evict_slot_to_archive('old')
+        stored = builder._archive.get_by_explicit_session_id('same-thread')
+        assert stored.session_url == base + 'new'
+        assert stored.turns[-1] == ('assistant', 'latest reply')
+    finally:
+        builder.close()
 
 
 def test_ws_disconnect_reconnect_preserves_slot_and_inherits_prompt_cache_key(tmp_path: Path):

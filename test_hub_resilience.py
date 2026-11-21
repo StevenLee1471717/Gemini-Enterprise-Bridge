@@ -60,6 +60,9 @@ def test_cancelled_capacity_wait_releases_slot_and_queue():
             assert not entered
             assert hub._slots['test:2'].waiting_count == 0
             assert not hub._slots['test:2'].lock.locked()
+            with pytest.raises(BridgeTimeoutError):
+                async with hub.acquire_slot(explicit_session_id='c', queue_timeout=.02):
+                    pytest.fail('a cancelled waiter must not give away the active permit')
         async with hub.acquire_slot(explicit_session_id='b', queue_timeout=.1):
             pass
     asyncio.run(run())
@@ -98,6 +101,69 @@ def test_old_session_binding_does_not_force_shared_page():
         hub._slots['test:1'].pinned_session_id = 'b'
         async with hub.acquire_slot(explicit_session_id='a') as slot:
             assert slot.slot_key == 'test:2'
+    asyncio.run(run())
+
+
+def test_verified_thread_queues_on_same_page_with_unlimited_capacity():
+    async def run():
+        hub, _ = make_hub(cap=0, tabs=3)
+        async with hub.acquire_slot(explicit_session_id='other', strict_session_affinity=True) as other:
+            pass
+
+        async def continuation():
+            async with hub.acquire_slot(
+                explicit_session_id='thread', strict_session_affinity=True,
+                matching_slot_keys=[other.slot_key], avoid_affinity_slot=True,
+            ) as slot:
+                return slot.slot_key
+
+        async with hub.acquire_slot(explicit_session_id='thread', strict_session_affinity=True) as first:
+            task = asyncio.create_task(continuation())
+            try:
+                async with hub.acquire_slot(explicit_session_id='independent', strict_session_affinity=True) as independent:
+                    assert independent.slot_key not in (first.slot_key, other.slot_key)
+                    assert not task.done()
+            except BaseException:
+                task.cancel()
+                await asyncio.gather(task, return_exceptions=True)
+                raise
+        assert await asyncio.wait_for(task, 1) == first.slot_key
+        assert await continuation() == first.slot_key
+        assert sum(s.pinned_session_id == 'thread' for s in hub._slots.values()) == 1
+    asyncio.run(run())
+
+
+def test_verified_thread_first_requests_share_one_spawn():
+    async def run():
+        hub, client = make_hub(cap=0, tabs=1)
+        hub.auto_spawn_tabs = True
+        client.transport = 'websocket'
+        client.websocket = object()
+        client.capabilities.add('spawn_tab')
+        hub.restore_slot_affinity('test:1', 'occupied')
+        spawning = asyncio.Event()
+        ready = asyncio.Event()
+        spawn_count = 0
+
+        async def spawn(*_):
+            nonlocal spawn_count
+            spawn_count += 1
+            spawning.set()
+            await ready.wait()
+            return hub._upsert_single_slot('test', 2)
+
+        async def request():
+            async with hub.acquire_slot(explicit_session_id='thread', strict_session_affinity=True) as slot:
+                return slot.slot_key
+
+        hub._spawn_worker_tab = spawn
+        first = asyncio.create_task(request())
+        await spawning.wait()
+        second = asyncio.create_task(request())
+        await asyncio.sleep(0)
+        ready.set()
+        assert await asyncio.wait_for(asyncio.gather(first, second), 1) == ['test:2', 'test:2']
+        assert spawn_count == 1
     asyncio.run(run())
 
 
@@ -220,4 +286,58 @@ def test_completion_must_match_original_chunks_and_failure_cancels(final):
         cancel=await client.command_queue.get()
         assert cancel['type']=='cancel_request'
         assert 'source=network_stream' in hub._recent_logs[-1]['message']
+    asyncio.run(run())
+
+
+def test_custom_parallel_tabs_wakes_waiters_and_rejects_unlimited_zero():
+    async def run():
+        # Legacy 0 falls back to default 10 rather than unlimited
+        hub, _ = make_hub(cap=0, tabs=14)
+        release = asyncio.Event()
+        entered = []
+
+        async def work(i):
+            async with hub.acquire_slot(explicit_session_id=f"u-{i}"):
+                entered.append(i)
+                await release.wait()
+
+        tasks = [asyncio.create_task(work(i)) for i in range(14)]
+        try:
+            await asyncio.sleep(0.03)
+            snap = hub.status_snapshot()
+            assert len(entered) == 10
+            assert snap["max_parallel_tabs"] == 10
+            assert snap["unlimited_parallel_tabs"] is False
+            assert snap["parallel_capacity"] == 10
+            assert snap["queued_requests"] == 4
+        finally:
+            release.set()
+            await asyncio.gather(*tasks)
+
+        # Switching from cap=2 -> custom cap=5 at runtime immediately wakes queued tasks
+        hub2, _ = make_hub(cap=2, tabs=5)
+        release2 = asyncio.Event()
+        entered2 = []
+
+        async def work2(i):
+            async with hub2.acquire_slot(explicit_session_id=f"w-{i}"):
+                entered2.append(i)
+                await release2.wait()
+
+        tasks2 = [asyncio.create_task(work2(i)) for i in range(5)]
+        try:
+            await asyncio.sleep(0.03)
+            assert len(entered2) == 2
+            assert hub2.status_snapshot()["queued_requests"] == 3
+            await hub2.set_max_parallel_tabs(5)
+            await asyncio.sleep(0.03)
+            assert len(entered2) == 5
+            assert hub2.status_snapshot()["queued_requests"] == 0
+        finally:
+            release2.set()
+            await asyncio.gather(*tasks2)
+
+        with pytest.raises(ValueError):
+            await hub2.set_max_parallel_tabs(0)
+
     asyncio.run(run())

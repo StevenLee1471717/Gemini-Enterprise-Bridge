@@ -77,6 +77,9 @@
         <button type="button" id="toggleManualBtn" class="btn manual-toggle-btn">
           设为我自己用 · 不接管此会话
         </button>
+        <button type="button" id="openManualTabBtn" class="btn manual-toggle-btn to-bridge" hidden>
+          + 新开自用 Gemini 聊天页（免接管）
+        </button>
       </div>
 
       <div class="pool-controls" id="poolControlsWrap">
@@ -90,10 +93,13 @@
         <div class="pool-rule-note">默认自动接管打开的聊天页；超出上限或手动自用页不接入</div>
         <div class="seg-group" id="maxTabsSegments" role="group" aria-label="自动开页上限">
           <button type="button" class="seg-btn" data-val="1">1 页</button>
-          <button type="button" class="seg-btn" data-val="4">4 页</button>
-          <button type="button" class="seg-btn" data-val="6">6 页</button>
-          <button type="button" class="seg-btn" data-val="8">8 页</button>
+          <button type="button" class="seg-btn" data-val="5">5 页</button>
           <button type="button" class="seg-btn" data-val="10">10 页</button>
+          <button type="button" class="seg-btn" id="customTabsBtn" data-val="custom">自定义</button>
+        </div>
+        <div class="custom-cap-row" id="customTabsRow" hidden>
+          <input type="number" id="customTabsInput" min="1" max="200" step="1" inputmode="numeric" placeholder="输入席位数字 (1~200)" aria-label="自定义席位数字" />
+          <button type="button" id="customTabsApplyBtn" class="btn small primary custom-cap-apply">确定</button>
         </div>
         <div hidden>
           <select id="autoSpawnSelect">
@@ -102,10 +108,7 @@
           </select>
           <select id="maxTabsSelect">
             <option value="1">1</option>
-            <option value="2">2</option>
-            <option value="4">4</option>
-            <option value="6">6</option>
-            <option value="8">8</option>
+            <option value="5">5</option>
             <option value="10" selected>10</option>
           </select>
         </div>

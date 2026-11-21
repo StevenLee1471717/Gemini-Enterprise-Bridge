@@ -8,7 +8,7 @@ import time
 import uuid
 from typing import Any, Dict, List, Optional, Union
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, PrivateAttr
 
 from multimodal import NormalizedAttachment, extract_attachments_from_content
 
@@ -139,6 +139,7 @@ class ChatMessage(_FlexibleModel):
 
 
 class ChatCompletionRequest(_FlexibleModel):
+    _bridge_thread_id: Optional[str] = PrivateAttr(default=None)
     model: str = Field(default="")
     messages: List[ChatMessage]
     stream: bool = False
@@ -411,13 +412,18 @@ WEB_MODEL_ALIASES: Dict[str, str] = {
     "2.5flash": "2.5-flash",
 }
 
-_KEEP_CURRENT_WEB_MODEL_IDS = {
+DEFAULT_MODEL_ID = "gemini-4-carbon"
+
+_LEGACY_DEFAULT_MODEL_IDS = {
     "",
     "default",
     "auto",
     "web",
     "gemini-enterprise",
     "gemini-enterprise-web",
+}
+
+_GCLOUD_PASSTHROUGH_MODEL_IDS = {
     "gemini-enterprise-gcloud",
     "gcloud",
 }
@@ -461,28 +467,52 @@ def model_requests_new_chat(model_name: Optional[str]) -> bool:
     return base_model.strip().lower().endswith("-newchat")
 
 
+def normalize_default_model(model_name: Optional[str], fallback: str = DEFAULT_MODEL_ID) -> str:
+    """Normalize empty or legacy placeholder model IDs (e.g. gemini-enterprise-web) to Carbon."""
+    fb_clean = (fallback or DEFAULT_MODEL_ID).strip()
+    if fb_clean.lower() in _LEGACY_DEFAULT_MODEL_IDS:
+        fb_clean = DEFAULT_MODEL_ID
+
+    if not model_name or not str(model_name).strip():
+        return fb_clean
+
+    base_model, session_tag = parse_model_and_session(str(model_name))
+    raw = base_model.strip()
+    wants_newchat = raw.lower().endswith("-newchat")
+    core = raw[: -len("-newchat")].strip() if wants_newchat else raw
+
+    if core.lower() in _LEGACY_DEFAULT_MODEL_IDS:
+        rebuilt = f"{fb_clean}-newchat" if wants_newchat and not fb_clean.lower().endswith("-newchat") else fb_clean
+        return f"{rebuilt}@{session_tag}" if session_tag else rebuilt
+
+    return str(model_name).strip()
+
+
 def resolve_target_web_model(model_name: Optional[str]) -> Optional[str]:
     """Resolve an OpenAI `model` parameter into a Gemini Enterprise web UI selector target.
 
     Returns:
-        - `None` when the current browser model should be kept unchanged (e.g. `gemini-enterprise-web` or `gcloud`)
+        - `"4-carbon"` by default when model is omitted or uses a legacy placeholder (`gemini-enterprise-web`)
+        - `None` when using official GCloud upstream (`gemini-enterprise-gcloud`)
         - Canonical web model key (`"3.1-pro"`, `"4-argon"`, `"4-carbon"`, `"3.8-flash"`, `"2.5-pro"`, `"2.5-flash"`)
         - Or a clean custom UI label for pass-through models (`gemini-web:<label>` or future Gemini versions)
     """
     base_model, _ = parse_model_and_session(model_name)
     if not base_model:
-        return None
+        return "4-carbon"
 
     raw = base_model.strip()
     if raw.lower().endswith("-newchat"):
         raw = raw[: -len("-newchat")].strip()
 
     if not raw:
-        return None
+        return "4-carbon"
 
     lowered = raw.lower()
-    if lowered in _KEEP_CURRENT_WEB_MODEL_IDS:
+    if lowered in _GCLOUD_PASSTHROUGH_MODEL_IDS:
         return None
+    if lowered in _LEGACY_DEFAULT_MODEL_IDS:
+        return "4-carbon"
 
     # Explicit custom web label prefix: `gemini-web:<Custom UI Label>` or `web:<Custom UI Label>`
     for prefix in ("gemini-web:", "web:"):
@@ -561,6 +591,25 @@ def _build_model_entry(
 
 AVAILABLE_MODELS: List[Dict[str, Any]] = [
     _build_model_entry(
+        "gemini-4-carbon",
+        "Primary flagship model — auto-select Gemini 4 Carbon in Gemini Enterprise (aliases: 4carbon, 4-carbon)",
+    ),
+    _build_model_entry(
+        "gemini-4-argon",
+        "Auto-select Gemini 4 Argon in Gemini Enterprise web UI (aliases: 4argon, 4-argon)",
+    ),
+    _build_model_entry(
+        "gemini-3.1-pro",
+        "Auto-select Gemini 3.1 Pro in Gemini Enterprise web UI (aliases: 3.1pro, 3.1-pro)",
+    ),
+    _build_model_entry(
+        "gemini-3.8-flash",
+        "Auto-select Gemini 3.8 Flash in Gemini Enterprise web UI (aliases: 3.8flash, 3.8-flash)",
+    ),
+]
+
+_EXTRA_RESOLVABLE_MODELS: List[Dict[str, Any]] = [
+    _build_model_entry(
         "gemini-enterprise-web",
         "Gemini Enterprise / Agentspace (keep currently selected web model)",
     ),
@@ -569,32 +618,16 @@ AVAILABLE_MODELS: List[Dict[str, Any]] = [
         "Start a fresh web chat session using the currently selected web model",
     ),
     _build_model_entry(
-        "gemini-3.1-pro",
-        "Auto-select Gemini 3.1 Pro in Gemini Enterprise web UI (aliases: 3.1pro, 3.1-pro)",
-    ),
-    _build_model_entry(
-        "gemini-3.1-pro-newchat",
-        "Start a fresh web chat session and select Gemini 3.1 Pro",
-    ),
-    _build_model_entry(
-        "gemini-4-argon",
-        "Auto-select Gemini 4 Argon in Gemini Enterprise web UI (aliases: 4argon, 4-argon)",
+        "gemini-4-carbon-newchat",
+        "Start a fresh web chat session and select Gemini 4 Carbon",
     ),
     _build_model_entry(
         "gemini-4-argon-newchat",
         "Start a fresh web chat session and select Gemini 4 Argon",
     ),
     _build_model_entry(
-        "gemini-4-carbon",
-        "Auto-select Gemini 4 Carbon in Gemini Enterprise web UI (aliases: 4carbon, 4-carbon)",
-    ),
-    _build_model_entry(
-        "gemini-4-carbon-newchat",
-        "Start a fresh web chat session and select Gemini 4 Carbon",
-    ),
-    _build_model_entry(
-        "gemini-3.8-flash",
-        "Auto-select Gemini 3.8 Flash in Gemini Enterprise web UI (aliases: 3.8flash, 3.8-flash)",
+        "gemini-3.1-pro-newchat",
+        "Start a fresh web chat session and select Gemini 3.1 Pro",
     ),
     _build_model_entry(
         "gemini-3.8-flash-newchat",
@@ -624,7 +657,7 @@ AVAILABLE_MODELS: List[Dict[str, Any]] = [
 ]
 
 _AVAILABLE_MODELS_BY_LOWER_ID: Dict[str, Dict[str, Any]] = {
-    m["id"].lower(): m for m in AVAILABLE_MODELS
+    m["id"].lower(): m for m in [*AVAILABLE_MODELS, *_EXTRA_RESOLVABLE_MODELS]
 }
 
 _CANONICAL_TARGET_TO_MODEL_ID: Dict[str, str] = {
@@ -682,7 +715,7 @@ def resolve_model_metadata(model_id: Optional[str]) -> Optional[Dict[str, Any]]:
         gcloud_base = _AVAILABLE_MODELS_BY_LOWER_ID["gemini-enterprise-gcloud"]
         return _clone_model_entry(gcloud_base, model_id=raw_id)
 
-    if lowered_core in _KEEP_CURRENT_WEB_MODEL_IDS:
+    if lowered_core in _LEGACY_DEFAULT_MODEL_IDS:
         target_key = (
             "gemini-enterprise-web-newchat" if wants_new_chat else "gemini-enterprise-web"
         )

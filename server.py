@@ -11,7 +11,7 @@ import re
 import time
 import urllib.parse
 import uuid
-from contextlib import asynccontextmanager
+from contextlib import AsyncExitStack, asynccontextmanager
 from pathlib import Path
 from typing import Any, AsyncIterator, Dict, Optional, Sequence
 
@@ -32,7 +32,7 @@ from agent_policy import (CARBON_CONTEXT_WINDOW, CARBON_AUTO_COMPACT_TOKENS,
                           COMPACTION_INSTRUCTIONS, CODING_WORKFLOW, has_coding_tools,
                           has_tool_history,
                           reading_diagnostics, split_checkpoint_history)
-from context_builder import ConversationContextBuilder, PendingCompactionCleanup
+from context_builder import ConversationContextBuilder, PendingCompactionCleanup, extract_dialogue_title
 from dashboard_html import DASHBOARD_HTML, get_dashboard_html
 from distribution import (
     DistributionAuthError,
@@ -40,15 +40,20 @@ from distribution import (
     DistributionQuotaError,
     HOST_TENANT_ID,
     RequestPrincipal,
+    extract_client_ip,
     extract_bearer_or_api_key,
     is_direct_local_connection,
     resolve_public_base_url,
 )
+from tunnel_manager import PublicTunnelManager
+from public_status import PublicStatusMonitor, get_public_status_html
 from extension_exporter import export_extension_bundle
 from gcloud_provider import GCloudUpstreamError, GCloudVertexProvider
 from logging_utils import LOG_MANAGER, request_id_var, summarize_for_debug
+from platform_compat import reconfigure_stdio_utf8
 from schemas import (
     AVAILABLE_MODELS,
+    DEFAULT_MODEL_ID,
     estimate_tokens,
     BridgeCallbackPayload,
     BridgeEventPayload,
@@ -58,6 +63,7 @@ from schemas import (
     build_chat_completion_chunk,
     build_chat_completion_response,
     build_usage,
+    normalize_default_model,
     parse_model_and_session,
     resolve_model_metadata,
     resolve_target_web_model,
@@ -84,8 +90,13 @@ from media_inputs import (
 )
 from image_outputs import generate_images
 from media_outputs import format_artifacts_markdown, generate_videos, persist_browser_outputs
-from responses_api import ResponseStore, ResponsesError, prepare_request, translate_response
-from streaming_utils import with_keepalive
+from responses_api import (
+    ResponseStore,
+    ResponsesError,
+    prepare_request,
+    translate_response,
+)
+from streaming_utils import ClosingStreamingResponse, with_keepalive
 from usage_ledger import UsageLedger, estimate_attachment_input_tokens
 from tool_calling import (
     ToolStreamProcessor,
@@ -101,6 +112,7 @@ from tool_calling import (
     split_text_slices,
 )
 
+reconfigure_stdio_utf8()
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
@@ -148,9 +160,10 @@ def create_app(
         repo=cfg.github_repo,
     )
     cb_host = "127.0.0.1" if cfg.host in {"0.0.0.0", "::"} else cfg.host
+    cb_host_url = f"[{cb_host}]" if (":" in cb_host and not cb_host.startswith("[")) else cb_host
     hub = BrowserBridgeHub(
         include_citations=cfg.include_citations,
-        callback_base_url=f"http://{cb_host}:{cfg.port}",
+        callback_base_url=f"http://{cb_host_url}:{cfg.port}",
         max_parallel_tabs=cfg.max_parallel_tabs,
         auto_spawn_tabs=cfg.auto_spawn_tabs,
         session_affinity_ttl_seconds=cfg.session_affinity_ttl_seconds,
@@ -189,6 +202,17 @@ def create_app(
         storage_path=dist_file,
         default_host_reserved_slots=cfg.host_reserved_slots,
     )
+    tunnel_file = cfg.tunnel_state_path or str(Path(dist_file).parent / "tunnel_state.json")
+    tunnel_manager = PublicTunnelManager(
+        target_port=cfg.port,
+        state_path=tunnel_file,
+        on_url_changed=lambda url: distribution.update_policy(public_base_url=url),
+    )
+    status_history_file = str(Path(dist_file).parent / "public_status_history.json")
+    public_status_monitor = PublicStatusMonitor(storage_path=status_history_file)
+    init_tun = tunnel_manager.snapshot()
+    if init_tun.get("running") and init_tun.get("active_url") and tunnel_manager.auto_sync_public_url and not distribution.public_base_url:
+        distribution.update_policy(public_base_url=str(init_tun["active_url"]))
     _principal_var: contextvars.ContextVar[Optional[RequestPrincipal]] = contextvars.ContextVar(
         "bridge_principal", default=None
     )
@@ -336,6 +360,24 @@ def create_app(
             return 8
         return 0
 
+    def _public_gateway_health() -> tuple[bool, bool]:
+        if cfg.backend_mode == "gcloud":
+            return gcloud.is_configured(), False
+        ready_keys = hub.list_ready_slot_keys()
+        if ready_keys:
+            busy_cnt = sum(
+                1
+                for k in ready_keys
+                if (slot_obj := hub._slots.get(k)) is not None
+                and (slot_obj.is_busy or slot_obj.waiting_count > 0)
+            )
+            return True, (busy_cnt >= len(ready_keys))
+        if hub.has_ready_client():
+            return True, False
+        if cfg.backend_mode == "auto" and gcloud.is_configured():
+            return True, False
+        return False, False
+
     def build_live_ledger_snapshot(include_catalog: bool = False, hub_snap: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
         if sync_and_hydrate_idle_slots():
             hub_snap = hub.status_snapshot()
@@ -354,6 +396,12 @@ def create_app(
             ),
             "context_monitor": ctx_mon,
             "distribution": distribution.snapshot(include_secrets=True, pool_capacity=pool_cap),
+            "tunnel": tunnel_manager.snapshot(),
+            "sessions_overview": context_builder.list_sessions_overview(
+                snap.get("worker_slots") or [],
+                tenant_label_fn=distribution.get_tenant_label,
+                limit=100,
+            ),
         }
 
     def prompt_for_usage(request: ChatCompletionRequest) -> str:
@@ -363,11 +411,13 @@ def create_app(
                     build_tool_system_instructions(request.tools or [], request.tool_choice, request.parallel_tool_calls),
                     build_response_format_instructions(request.response_format)]
         if (has_coding_tools(request.tools) and is_tool_generation_enabled(request.tools or [], request.tool_choice)
-                and CODING_WORKFLOW.strip() not in system_text):
+                and "[Coding workflow]" not in system_text):
             sections.append(CODING_WORKFLOW)
         return "\n\n".join(filter(None, sections))
 
     def record_context(request: ChatCompletionRequest, prepared, attachments=(), historical_images=(), sent_count: Optional[int] = None) -> None:
+        if not current_principal().is_host:
+            return
         nonlocal diagnostic_request
         diagnostic_request = request
         context_diagnostics.clear()
@@ -404,6 +454,7 @@ def create_app(
         ephemeral_probe: bool = False,
         ephemeral_compaction: bool = False,
         tenant_id: str = HOST_TENANT_ID,
+        strict_session_affinity: bool = False,
     ):
         sync_and_hydrate_idle_slots()
 
@@ -418,6 +469,8 @@ def create_app(
                 tenant_id=tenant_id,
             )
         )
+        if strict_session_affinity:
+            matching_slots = [k for k in matching_slots if hub._slots[k].pinned_session_id == explicit_session_id]
         aff_slot = None if (ephemeral_probe or ephemeral_compaction) else hub.get_affinity_slot_key(explicit_session_id)
         archived_match = None
         if not (ephemeral_probe or ephemeral_compaction) and aff_slot not in ready_keys and not matching_slots:
@@ -427,11 +480,14 @@ def create_app(
                 explicit_session_id=explicit_session_id,
                 tenant_id=tenant_id,
             )
+            if strict_session_affinity and archived_match and archived_match.explicit_session_id != explicit_session_id:
+                archived_match = None
 
         ephemeral_aux = bool(
             ephemeral_compaction
             or (
-                not tools_active
+                not strict_session_affinity
+                and not tools_active
                 and (
                     (aff_slot and context_builder.has_active_tool_session(aff_slot))
                     or any(context_builder.has_active_tool_session(k) for k in matching_slots)
@@ -449,6 +505,23 @@ def create_app(
             ]
             archived_match = None
 
+        aff_slot_obj = hub._slots.get(aff_slot) if aff_slot else None
+        has_compaction_resume = bool(
+            _consumed_compactions_var.get()
+            or context_builder.has_compaction_summary(request_messages)
+        )
+        avoid_affinity_slot = bool(
+            not (strict_session_affinity or ephemeral_probe or ephemeral_compaction or ephemeral_aux)
+            and tools_active
+            and aff_slot_obj is not None
+            and aff_slot in ready_keys
+            and aff_slot not in matching_slots
+            and context_builder.has_active_tool_session(aff_slot)
+            and not context_builder.has_pending_recovery(aff_slot)
+            and not has_compaction_resume
+            and time.time() < aff_slot_obj.pending_tool_call_until
+        )
+
         effective_sid = None if (ephemeral_aux or ephemeral_probe) else explicit_session_id
         async with hub.acquire_slot(
             explicit_session_id=explicit_session_id,
@@ -458,6 +531,8 @@ def create_app(
             preferred_session_url=archived_match.session_url if archived_match is not None else None,
             ephemeral_probe=ephemeral_probe,
             tenant_id=tenant_id,
+            avoid_affinity_slot=avoid_affinity_slot,
+            strict_session_affinity=strict_session_affinity and not (ephemeral_probe or ephemeral_compaction),
         ) as slot:
             slot.last_dispatch_submitted = False
             slot.last_dispatch_tab_reset = False
@@ -544,11 +619,33 @@ def create_app(
             cfg.port,
             LOG_MANAGER.current_level,
         )
+        async def _status_heartbeat_loop() -> None:
+            while True:
+                try:
+                    is_up, is_busy = _public_gateway_health()
+                    ledger_stats = public_status_monitor._extract_sanitized_ledger_metrics(
+                        usage_ledger, time.time()
+                    )
+                    public_status_monitor.record_sample(
+                        online=is_up,
+                        busy=is_busy,
+                        latest_chat_ms=ledger_stats.get("gateway_chat_ms"),
+                    )
+                except Exception:
+                    pass
+                await asyncio.sleep(60.0)
+
+        heartbeat_task = asyncio.create_task(_status_heartbeat_loop())
         try:
             yield
         finally:
             if bg_check_task is not None and not bg_check_task.done():
                 bg_check_task.cancel()
+            heartbeat_task.cancel()
+            try:
+                await heartbeat_task
+            except asyncio.CancelledError:
+                pass
             response_store.close()
             context_builder.close()
 
@@ -567,13 +664,17 @@ def create_app(
     app.state.update_manager = updater
     app.state.log_manager = LOG_MANAGER
     app.state.distribution = distribution
+    app.state.tunnel = tunnel_manager
+    app.state.tunnel_manager = tunnel_manager
+    app.state.public_status_monitor = public_status_monitor
     image_output_dir = Path(cfg.generated_dir) if cfg.generated_dir else (Path(__file__).resolve().parent / "generated")
     file_store = FileStore(image_output_dir)
     response_store = ResponseStore(file_store=file_store, directory=cfg.response_store_dir,
                                    ttl_seconds=cfg.response_store_ttl_seconds)
+    app.state.image_output_dir = image_output_dir
     app.state.file_store = file_store
     app.state.response_store = response_store
-    callback_origin = f"http://{cb_host}:{cfg.port}"
+    callback_origin = f"http://{cb_host_url}:{cfg.port}"
 
     def current_principal() -> RequestPrincipal:
         return _principal_var.get() or RequestPrincipal()
@@ -636,15 +737,21 @@ def create_app(
         **kwargs: Any,
     ) -> Dict[str, Any]:
         t_label = "本机直连" if principal_obj.is_host else f"客户端 · {principal_obj.name}"
+        clean_sid = _unscope_session_header(kwargs.pop("session_id", None), principal_obj) or ""
         rec = usage_ledger.record_request(
             tenant_id=principal_obj.tenant_id,
             tenant_name=t_label,
+            client_ip=principal_obj.client_ip,
+            session_id=clean_sid,
             **kwargs,
         )
         distribution.record_usage(
             principal_obj,
             prompt_tokens=int(kwargs.get("prompt_tokens") or 0),
             completion_tokens=int(kwargs.get("completion_tokens") or 0),
+            cost_usd=float(rec.get("cached_equivalent_cost_usd") or 0.0),
+            model=str(kwargs.get("requested_model") or ""),
+            session_id=clean_sid,
             error=False,
         )
         try:
@@ -670,6 +777,48 @@ def create_app(
                 await self.asgi_app(scope, receive, send)
                 return
             await self.cors_app(scope, receive, send)
+
+    def _extract_messages_preview(messages: Sequence[ChatMessage]) -> str:
+        for msg in reversed(list(messages or ())):
+            role = (msg.role or "").strip().lower()
+            if role == "user":
+                raw = msg.text_content().strip()
+                if not raw:
+                    continue
+                title = extract_dialogue_title([("user", raw)])
+                if title:
+                    return title[:140]
+                cleaned = re.sub(r"\s+", " ", raw).strip()
+                return cleaned[:140]
+            if role == "tool":
+                t_name = (msg.name or "工具").strip()
+                raw_t = re.sub(r"\s+", " ", msg.text_content().strip())
+                return f"[{t_name} 返回结果] {raw_t[:110]}"
+        return ""
+
+    def _extract_reply_preview(content: Optional[str], tool_calls: Optional[Sequence[Dict[str, Any]]] = None) -> str:
+        parts: list[str] = []
+        if tool_calls:
+            names = [
+                str((tc.get("function") or {}).get("name") or "tool")
+                for tc in tool_calls[:3]
+                if isinstance(tc, dict)
+            ]
+            suffix = "..." if len(tool_calls) > 3 else ""
+            parts.append(f"[调用 {len(tool_calls)} 项工具: {', '.join(names)}{suffix}]")
+        txt = re.sub(r"\s+", " ", (content or "").strip())
+        if txt:
+            parts.append(txt[:150])
+        return " ".join(parts)[:180]
+
+    def _should_audit_rejected_path(path: str) -> bool:
+        p = (path or "").lower()
+        if not p:
+            return False
+        return any(
+            p.endswith(seg) or seg in p
+            for seg in ("/chat/completions", "/responses", "/images/", "/videos/", "/audio/")
+        )
 
     wildcard_cors = "*" in (cfg.cors_allow_origins or [])
     app.add_middleware(
@@ -761,7 +910,23 @@ def create_app(
             )
 
     @app.exception_handler(DistributionAuthError)
-    async def distribution_auth_exception_handler(_req: Request, exc: DistributionAuthError) -> JSONResponse:
+    async def distribution_auth_exception_handler(req: Request, exc: DistributionAuthError) -> JSONResponse:
+        if _should_audit_rejected_path(req.url.path):
+            p_obj = _principal_var.get() or getattr(exc, "principal", None)
+            if p_obj is not None and not p_obj.is_host:
+                distribution.record_usage(p_obj, error=True)
+            t_id = p_obj.tenant_id if p_obj else "external_unauth"
+            t_name = ("本机直连" if p_obj.is_host else f"客户端 · {p_obj.name}") if p_obj else "未授权外部请求"
+            usage_ledger.record_failed_request(
+                task_type="responses" if "/responses" in req.url.path else "chat",
+                tenant_id=t_id,
+                tenant_name=t_name,
+                client_ip=p_obj.client_ip if p_obj else extract_client_ip(req),
+                status="forbidden",
+                status_code=exc.status_code,
+                error_code=exc.code,
+                error_message=exc.message,
+            )
         return _openai_error_response(
             status_code=exc.status_code,
             message=exc.message,
@@ -770,7 +935,21 @@ def create_app(
         )
 
     @app.exception_handler(DistributionQuotaError)
-    async def distribution_quota_exception_handler(_req: Request, exc: DistributionQuotaError) -> JSONResponse:
+    async def distribution_quota_exception_handler(req: Request, exc: DistributionQuotaError) -> JSONResponse:
+        if _should_audit_rejected_path(req.url.path):
+            p_obj = _principal_var.get() or RequestPrincipal()
+            t_name = "本机直连" if p_obj.is_host else f"客户端 · {p_obj.name}"
+            distribution.record_usage(p_obj, error=True)
+            usage_ledger.record_failed_request(
+                task_type="responses" if "/responses" in req.url.path else "chat",
+                tenant_id=p_obj.tenant_id,
+                tenant_name=t_name,
+                client_ip=p_obj.client_ip,
+                status="rate_limited",
+                status_code=exc.status_code,
+                error_code=exc.code,
+                error_message=exc.message,
+            )
         hdrs = {"Retry-After": str(exc.retry_after)} if exc.retry_after else None
         return _openai_error_response(
             status_code=exc.status_code,
@@ -807,6 +986,109 @@ def create_app(
             "backend_mode": cfg.backend_mode,
             "log_level": LOG_MANAGER.current_level,
         }
+
+    @app.get("/status", response_class=HTMLResponse, include_in_schema=False)
+    async def public_status_page() -> HTMLResponse:
+        return HTMLResponse(
+            content=get_public_status_html(),
+            headers={"Cache-Control": "no-store, no-cache, must-revalidate"},
+        )
+
+    @app.api_route("/status/ping", methods=["GET", "HEAD"], include_in_schema=False)
+    async def public_status_ping(http_request: Request) -> JSONResponse:
+        if not is_direct_local_connection(http_request):
+            req_orig = resolve_public_base_url(http_request, distribution.public_base_url, callback_origin)
+            tunnel_manager.note_verified_external_traffic(req_orig)
+        online, busy = _public_gateway_health()
+        code = 200 if online else 503
+        return JSONResponse(
+            status_code=code,
+            content={
+                "status": "ok" if online else "offline",
+                "online": online,
+                "busy": busy,
+                "ts": int(time.time()),
+            },
+            headers={
+                "Cache-Control": "no-store, no-cache, must-revalidate",
+                "Access-Control-Allow-Origin": "*",
+            },
+        )
+
+    def _resolve_effective_public_origin(http_request: Request) -> str:
+        tun_snap = tunnel_manager.snapshot()
+        active_tun_url = str(tun_snap.get("active_url") or "").strip() if tun_snap.get("running") else ""
+        req_origin = resolve_public_base_url(http_request, distribution.public_base_url, callback_origin)
+        if is_direct_local_connection(http_request) and (active_tun_url or distribution.public_base_url):
+            return active_tun_url or distribution.public_base_url
+        return req_origin
+
+    @app.get("/api/public/status", include_in_schema=False)
+    async def api_public_status(http_request: Request) -> JSONResponse:
+        online, busy = _public_gateway_health()
+        is_local_req = is_direct_local_connection(http_request)
+        eff_origin = _resolve_effective_public_origin(http_request)
+        if not is_local_req:
+            tunnel_manager.note_verified_external_traffic(eff_origin)
+        tun_snap = tunnel_manager.snapshot()
+        last_probe = tun_snap.get("last_probe") if isinstance(tun_snap.get("last_probe"), dict) else None
+        probe_matches_origin = bool(
+            last_probe
+            and eff_origin
+            and str(last_probe.get("public_url") or "").rstrip("/") == eff_origin.rstrip("/")
+        )
+        srv_probe_ms = (
+            int(last_probe["latency_ms"])
+            if (probe_matches_origin and last_probe.get("health_ok") and last_probe.get("latency_ms"))
+            else None
+        )
+        local_only_view = bool(
+            is_local_req and not tun_snap.get("running") and not (distribution.public_base_url or "").strip()
+        )
+        tunnel_probe_failed = bool(
+            is_local_req and probe_matches_origin and (last_probe.get("health_ok") is False)
+        )
+        payload = public_status_monitor.build_public_snapshot(
+            online=online,
+            busy=busy,
+            public_origin=eff_origin,
+            usage_ledger=usage_ledger,
+            server_probe_ms=srv_probe_ms,
+            local_only_view=local_only_view,
+            tunnel_probe_failed=tunnel_probe_failed,
+        )
+        return JSONResponse(
+            status_code=200,
+            content=payload,
+            headers={
+                "Cache-Control": "no-store, no-cache, must-revalidate",
+                "Access-Control-Allow-Origin": "*",
+            },
+        )
+
+    @app.post("/api/public/network-map", include_in_schema=False)
+    async def api_public_network_map(http_request: Request) -> JSONResponse:
+        eff_origin = _resolve_effective_public_origin(http_request)
+        # Only allow force-bypassing the 90s cache from local host admin
+        allow_force = is_direct_local_connection(http_request) and (
+            http_request.query_params.get("force") == "1"
+        )
+        try:
+            res = await public_status_monitor.run_network_map_probe(eff_origin, force=allow_force)
+        except Exception as exc:
+            return JSONResponse(
+                status_code=502,
+                content={"ok": False, "detail": f"分布式硬件节点拨测暂时繁忙：{exc}"},
+                headers={"Cache-Control": "no-store"},
+            )
+        return JSONResponse(
+            status_code=200 if res.get("ok") else 400,
+            content=res,
+            headers={
+                "Cache-Control": "no-store, no-cache, must-revalidate",
+                "Access-Control-Allow-Origin": "*",
+            },
+        )
 
     @app.get("/api/status", dependencies=[Depends(require_local_admin)])
     async def api_status() -> Dict[str, Any]:
@@ -853,6 +1135,8 @@ def create_app(
             "usage": live_ledger["usage"],
             "context_monitor": live_ledger["context_monitor"],
             "distribution": live_ledger["distribution"],
+            "tunnel": live_ledger["tunnel"],
+            "sessions_overview": live_ledger["sessions_overview"],
         }
 
     @app.get("/api/logs", dependencies=[Depends(require_local_admin)])
@@ -954,6 +1238,8 @@ def create_app(
             "usage": live_ledger["usage"],
             "context_monitor": live_ledger["context_monitor"],
             "distribution": live_ledger["distribution"],
+            "tunnel": live_ledger["tunnel"],
+            "sessions_overview": live_ledger["sessions_overview"],
         }
 
     @app.post("/api/slots/reset", dependencies=[Depends(require_local_admin), Depends(verify_api_key)])
@@ -1004,6 +1290,36 @@ def create_app(
             return JSONResponse(status_code=409, content={"ok": False, "detail": str(exc)})
         return JSONResponse(status_code=200, content=result)
 
+    @app.post("/api/seats/limit", dependencies=[Depends(require_local_admin), Depends(verify_api_key)])
+    async def api_set_seats_limit(request: Request) -> JSONResponse:
+        try:
+            body = await request.json()
+        except Exception:
+            body = {}
+        raw_limit = (body or {}).get("max_parallel_tabs")
+        if raw_limit is None:
+            return JSONResponse(status_code=400, content={"ok": False, "detail": "缺少参数 max_parallel_tabs"})
+        if isinstance(raw_limit, bool):
+            return JSONResponse(status_code=400, content={"ok": False, "detail": "max_parallel_tabs 必须为 1~200 的整数"})
+        try:
+            if isinstance(raw_limit, str):
+                trimmed = raw_limit.strip()
+                if not trimmed or not trimmed.lstrip("-").isdigit():
+                    raise ValueError("not integer")
+                parsed = int(trimmed)
+            elif isinstance(raw_limit, int):
+                parsed = raw_limit
+            elif isinstance(raw_limit, float) and raw_limit.is_integer():
+                parsed = int(raw_limit)
+            else:
+                raise ValueError("not integer")
+        except (TypeError, ValueError):
+            return JSONResponse(status_code=400, content={"ok": False, "detail": "max_parallel_tabs 必须为 1~200 的整数"})
+        if parsed < 1 or parsed > 200:
+            return JSONResponse(status_code=400, content={"ok": False, "detail": "席位上限范围应为 1~200"})
+        result = await hub.set_max_parallel_tabs(parsed)
+        return JSONResponse(status_code=200, content={**result, "hub": hub.status_snapshot()})
+
     # ------------------------------------------------------------------
     # Public API Distribution & Multi-Client Admin Endpoints (Local Only)
     # ------------------------------------------------------------------
@@ -1012,9 +1328,153 @@ def create_app(
     async def api_get_distribution() -> Dict[str, Any]:
         return {
             "status": "ok",
+            "tunnel": tunnel_manager.snapshot(),
             **distribution.snapshot(include_secrets=True, pool_capacity=_effective_pool_capacity()),
         }
 
+    @app.get("/api/tunnel", dependencies=[Depends(require_local_admin)])
+    async def api_get_tunnel() -> Dict[str, Any]:
+        return {
+            "ok": True,
+            "tunnel": tunnel_manager.snapshot(),
+            "distribution": distribution.snapshot(include_secrets=True, pool_capacity=_effective_pool_capacity()),
+        }
+
+    @app.post("/api/tunnel/start", dependencies=[Depends(require_local_admin), Depends(verify_api_key)])
+    async def api_start_tunnel(request: Request) -> JSONResponse:
+        try:
+            body = await request.json()
+        except Exception:
+            body = {}
+        if not isinstance(body, dict):
+            body = {}
+        try:
+            snap = await tunnel_manager.start(
+                mode=str(body.get("mode") or "quick") if "mode" in body else None,
+                named_tunnel_token=str(body.get("named_tunnel_token") or "") if "named_tunnel_token" in body else None,
+                named_public_url=str(body.get("named_public_url") or "") if "named_public_url" in body else None,
+                auto_sync_public_url=bool(body["auto_sync_public_url"]) if "auto_sync_public_url" in body else None,
+                restart=bool(body.get("restart", False)),
+            )
+        except (ValueError, RuntimeError) as exc:
+            return JSONResponse(
+                status_code=400,
+                content={
+                    "ok": False,
+                    "detail": str(exc),
+                    "tunnel": tunnel_manager.snapshot(),
+                },
+            )
+        return JSONResponse(
+            status_code=200,
+            content={
+                "ok": True,
+                "tunnel": snap,
+                "distribution": distribution.snapshot(include_secrets=True, pool_capacity=_effective_pool_capacity()),
+            },
+        )
+
+    @app.post("/api/tunnel/stop", dependencies=[Depends(require_local_admin), Depends(verify_api_key)])
+    async def api_stop_tunnel(request: Request) -> JSONResponse:
+        try:
+            body = await request.json()
+        except Exception:
+            body = {}
+        clear_url = bool((body or {}).get("clear_public_url", False)) if isinstance(body, dict) else False
+        snap = await asyncio.to_thread(tunnel_manager.stop, clear_public_url=clear_url)
+        return JSONResponse(
+            status_code=200,
+            content={
+                "ok": True,
+                "tunnel": snap,
+                "distribution": distribution.snapshot(include_secrets=True, pool_capacity=_effective_pool_capacity()),
+            },
+        )
+
+    @app.post("/api/tunnel/probe", dependencies=[Depends(require_local_admin), Depends(verify_api_key)])
+    async def api_probe_tunnel(request: Request) -> JSONResponse:
+        try:
+            body = await request.json()
+        except Exception:
+            body = {}
+        if not isinstance(body, dict):
+            body = {}
+        pub_url = str(body.get("public_url") or "").strip() or distribution.public_base_url
+        sample_key = str(body.get("sample_api_key") or "").strip() or None
+        if not sample_key:
+            dist_snap = distribution.snapshot(include_secrets=True)
+            for c_item in dist_snap.get("clients") or []:
+                if c_item.get("enabled") and not c_item.get("expired") and c_item.get("api_key"):
+                    sample_key = str(c_item["api_key"])
+                    break
+        try:
+            probe_res = await tunnel_manager.probe_and_recover(
+                pub_url or None,
+                sample_api_key=sample_key,
+                can_restart=lambda: not any(
+                    hub.status_snapshot().get(key)
+                    for key in ("in_flight_requests", "queued_requests")
+                ),
+            )
+        except ValueError as exc:
+            return JSONResponse(status_code=400, content={"ok": False, "detail": str(exc)})
+        return JSONResponse(
+            status_code=200,
+            content={
+                "ok": bool(probe_res.get("ok")),
+                "probe": probe_res,
+                "tunnel": tunnel_manager.snapshot(),
+                "distribution": distribution.snapshot(include_secrets=True, pool_capacity=_effective_pool_capacity()),
+            },
+        )
+
+    @app.get("/api/sessions", dependencies=[Depends(require_local_admin)])
+    async def api_list_sessions(tenant_id: Optional[str] = None) -> Dict[str, Any]:
+        hub_snap = hub.status_snapshot()
+        items = context_builder.list_sessions_overview(
+            hub_snap.get("worker_slots") or [],
+            tenant_label_fn=distribution.get_tenant_label,
+            limit=150,
+        )
+        if tenant_id and tenant_id.strip():
+            items = [x for x in items if x.get("tenant_id") == tenant_id.strip()]
+        return {"ok": True, "sessions": items}
+
+    @app.post("/api/sessions/delete", dependencies=[Depends(require_local_admin), Depends(verify_api_key)])
+    async def api_delete_session(request: Request) -> JSONResponse:
+        try:
+            body = await request.json()
+        except Exception:
+            body = {}
+        if not isinstance(body, dict):
+            return JSONResponse(status_code=400, content={"ok": False, "detail": "请求格式错误"})
+        session_ref = str(body.get("session_ref") or "").strip()
+        tenant_purge = str(body.get("purge_tenant_id") or "").strip()
+        if tenant_purge:
+            ev_res = hub.evict_tenant_slots(tenant_purge, abort_inflight=bool(body.get("abort_inflight", False)))
+            pg_res = context_builder.purge_tenant_sessions(tenant_purge, include_archive=True)
+            return JSONResponse(status_code=200, content={"ok": True, **ev_res, **pg_res})
+        if session_ref.startswith("archive:"):
+            akey = session_ref[len("archive:"):]
+            context_builder.delete_archived_session(akey)
+            return JSONResponse(status_code=200, content={"ok": True, "deleted": session_ref})
+        if session_ref.startswith("slot:"):
+            skey = session_ref[len("slot:"):]
+            slot_obj = hub._slots.get(skey)
+            if slot_obj is not None and slot_obj.is_busy and not body.get("force"):
+                return JSONResponse(status_code=409, content={"ok": False, "detail": "该席位正在执行任务中，请稍后再试或使用强制中断。"})
+            try:
+                await hub.reset_worker_slot(
+                    skey,
+                    on_reset_locked=lambda: context_builder.invalidate_session(skey),
+                )
+            except KeyError:
+                context_builder.invalidate_session(skey)
+            except RuntimeError as exc:
+                return JSONResponse(status_code=409, content={"ok": False, "detail": str(exc)})
+            context_builder.invalidate_session(skey)
+            return JSONResponse(status_code=200, content={"ok": True, "deleted": session_ref})
+        return JSONResponse(status_code=400, content={"ok": False, "detail": "缺少有效的 session_ref"})
     @app.patch("/api/distribution/policy", dependencies=[Depends(require_local_admin), Depends(verify_api_key)])
     @app.post("/api/distribution/policy", dependencies=[Depends(require_local_admin), Depends(verify_api_key)], include_in_schema=False)
     async def api_update_distribution_policy(request: Request) -> JSONResponse:
@@ -1053,6 +1513,13 @@ def create_app(
             allowed_models = [str(m).strip() for m in raw_models if str(m).strip()]
         else:
             allowed_models = []
+        raw_ips = body.get("allowed_ips")
+        if isinstance(raw_ips, str):
+            allowed_ips = [ip.strip() for ip in raw_ips.split(",") if ip.strip()]
+        elif isinstance(raw_ips, list):
+            allowed_ips = [str(ip).strip() for ip in raw_ips if str(ip).strip()]
+        else:
+            allowed_ips = []
         try:
             created = distribution.create_client(
                 name=str(body.get("name") or ""),
@@ -1061,7 +1528,11 @@ def create_app(
                 rpm_limit=int(body.get("rpm_limit") if body.get("rpm_limit") is not None else 30),
                 daily_request_limit=int(body.get("daily_request_limit") or 0),
                 daily_token_limit=int(body.get("daily_token_limit") or 0),
+                daily_cost_limit_usd=float(body.get("daily_cost_limit_usd") or 0.0),
+                total_token_limit=int(body.get("total_token_limit") or 0),
+                expires_at=int(body.get("expires_at") or 0),
                 allowed_models=allowed_models,
+                allowed_ips=allowed_ips,
             )
         except (ValueError, TypeError) as exc:
             return JSONResponse(status_code=400, content={"ok": False, "detail": str(exc)})
@@ -1091,6 +1562,15 @@ def create_app(
                 allowed_models = [str(m).strip() for m in raw_models if str(m).strip()]
             else:
                 allowed_models = []
+        allowed_ips: Optional[list[str]] = None
+        if "allowed_ips" in body:
+            raw_ips = body.get("allowed_ips")
+            if isinstance(raw_ips, str):
+                allowed_ips = [ip.strip() for ip in raw_ips.split(",") if ip.strip()]
+            elif isinstance(raw_ips, list):
+                allowed_ips = [str(ip).strip() for ip in raw_ips if str(ip).strip()]
+            else:
+                allowed_ips = []
         try:
             updated = distribution.update_client(
                 client_id,
@@ -1101,12 +1581,19 @@ def create_app(
                 rpm_limit=int(body["rpm_limit"]) if "rpm_limit" in body and body["rpm_limit"] is not None else None,
                 daily_request_limit=int(body["daily_request_limit"]) if "daily_request_limit" in body and body["daily_request_limit"] is not None else None,
                 daily_token_limit=int(body["daily_token_limit"]) if "daily_token_limit" in body and body["daily_token_limit"] is not None else None,
+                daily_cost_limit_usd=float(body["daily_cost_limit_usd"]) if "daily_cost_limit_usd" in body and body["daily_cost_limit_usd"] is not None else None,
+                total_token_limit=int(body["total_token_limit"]) if "total_token_limit" in body and body["total_token_limit"] is not None else None,
+                expires_at=int(body["expires_at"]) if "expires_at" in body and body["expires_at"] is not None else None,
                 allowed_models=allowed_models,
+                allowed_ips=allowed_ips,
             )
         except KeyError as exc:
             return JSONResponse(status_code=404, content={"ok": False, "detail": str(exc)})
         except (ValueError, TypeError) as exc:
             return JSONResponse(status_code=400, content={"ok": False, "detail": str(exc)})
+        if body.get("enabled") is False:
+            await distribution.abort_client_waiters(client_id)
+            hub.evict_tenant_slots(f"client:{client_id}", abort_inflight=bool(body.get("abort_inflight", False)))
         return JSONResponse(
             status_code=200,
             content={
@@ -1131,16 +1618,56 @@ def create_app(
             },
         )
 
+    @app.post("/api/distribution/clients/{client_id}/reset-quota", dependencies=[Depends(require_local_admin), Depends(verify_api_key)])
+    async def api_reset_distribution_client_quota(client_id: str, request: Request) -> JSONResponse:
+        try:
+            body = await request.json()
+        except Exception:
+            body = {}
+        reset_total = bool((body or {}).get("reset_total", False)) if isinstance(body, dict) else False
+        try:
+            updated = distribution.reset_client_quota(client_id, reset_total=reset_total)
+        except KeyError as exc:
+            return JSONResponse(status_code=404, content={"ok": False, "detail": str(exc)})
+        return JSONResponse(
+            status_code=200,
+            content={
+                "ok": True,
+                "client": updated,
+                "distribution": distribution.snapshot(include_secrets=True, pool_capacity=_effective_pool_capacity()),
+            },
+        )
+
+    @app.post("/api/distribution/clients/{client_id}/disconnect", dependencies=[Depends(require_local_admin), Depends(verify_api_key)])
+    async def api_disconnect_distribution_client(client_id: str, request: Request) -> JSONResponse:
+        try:
+            body = await request.json()
+        except Exception:
+            body = {}
+        purge_archive = bool((body or {}).get("purge_archive", False)) if isinstance(body, dict) else False
+        aborted_waiters = await distribution.abort_client_waiters(client_id)
+        tenant_tag = f"client:{client_id}"
+        ev_res = hub.evict_tenant_slots(tenant_tag, abort_inflight=True)
+        pg_res = context_builder.purge_tenant_sessions(tenant_tag, include_archive=purge_archive)
+        return JSONResponse(
+            status_code=200,
+            content={
+                "ok": True,
+                "aborted_waiters": aborted_waiters,
+                **ev_res,
+                **pg_res,
+                "distribution": distribution.snapshot(include_secrets=True, pool_capacity=_effective_pool_capacity()),
+            },
+        )
+
     @app.delete("/api/distribution/clients/{client_id}", dependencies=[Depends(require_local_admin), Depends(verify_api_key)])
     async def api_delete_distribution_client(client_id: str) -> JSONResponse:
         if not distribution.delete_client(client_id):
             return JSONResponse(status_code=404, content={"ok": False, "detail": f"未找到客户端：{client_id}"})
+        await distribution.abort_client_waiters(client_id)
         tenant_tag = f"client:{client_id}"
-        for skey, slot_obj in list(hub._slots.items()):
-            if slot_obj.owner_tenant_id == tenant_tag and not slot_obj.is_busy:
-                slot_obj.pinned_session_id = None
-                slot_obj.owner_tenant_id = None
-                context_builder.clear_session(skey)
+        hub.evict_tenant_slots(tenant_tag, abort_inflight=True)
+        context_builder.purge_tenant_sessions(tenant_tag, include_archive=True)
         return JSONResponse(
             status_code=200,
             content={
@@ -1420,24 +1947,39 @@ def create_app(
     ) -> Dict[str, Any]:
         principal = current_principal()
         pub_base = current_public_base_url()
-        img_model = str(img_payload.get("model") or cfg.default_model)
-        started = time.monotonic()
-        async with acquire_request_permit(principal, img_model):
-            res = await generate_images(
-                img_payload,
-                hub,
-                context_builder,
-                cfg,
-                image_output_dir,
-                img_attachments,
-                file_store=file_store,
-                tenant_id=principal.tenant_id,
-                public_base_url=pub_base,
-            )
-        p_toks = estimate_tokens(str(img_payload.get("prompt") or "")) + estimate_attachment_input_tokens(img_attachments)
+        img_model = normalize_default_model(img_payload.get("model"), cfg.default_model)
+        img_prompt_prev = str(img_payload.get("prompt") or "").strip()[:140]
         t_kind = explicit_task or ("image_edit" if img_attachments else "image_gen")
+        task_id = f"img_{uuid.uuid4().hex[:12]}"
+        started = time.monotonic()
+        distribution.register_live_task(
+            task_id,
+            principal,
+            model=img_model,
+            task_type=t_kind,
+            prompt_preview=img_prompt_prev,
+            state="queued",
+        )
+        try:
+            async with acquire_request_permit(principal, img_model):
+                distribution.update_live_task(task_id, state="running")
+                res = await generate_images(
+                    img_payload,
+                    hub,
+                    context_builder,
+                    cfg,
+                    image_output_dir,
+                    img_attachments,
+                    file_store=file_store,
+                    tenant_id=principal.tenant_id,
+                    public_base_url=pub_base,
+                )
+        finally:
+            distribution.finish_live_task(task_id)
+        p_toks = estimate_tokens(str(img_payload.get("prompt") or "")) + estimate_attachment_input_tokens(img_attachments)
         _record_request_with_tenant(
             principal,
+            request_id=task_id,
             requested_model=img_model,
             prompt_tokens=p_toks,
             completion_tokens=0,
@@ -1445,6 +1987,8 @@ def create_app(
             task_type=t_kind,
             strategy="browser_image",
             images_generated=max(1, len(res.get("data") or [])),
+            prompt_preview=img_prompt_prev,
+            reply_preview=f"[生成图片 {max(1, len(res.get('data') or []))} 张]",
             duration_ms=int((time.monotonic() - started) * 1000),
         )
         return res
@@ -1495,7 +2039,7 @@ def create_app(
                     parts.append({"type": "image_url", "image_url": {"url": saved["id"]}})
                 payload = {
                     "prompt": fields.get("prompt", ""),
-                    "model": fields.get("model") or cfg.default_model,
+                    "model": normalize_default_model(fields.get("model"), cfg.default_model),
                     "n": int(fields.get("n", "1") or "1"),
                     "size": fields.get("size", "auto"),
                     "response_format": fields.get("response_format", "b64_json"),
@@ -1537,13 +2081,24 @@ def create_app(
             await verify_api_key(http_request, authorization=authorization, x_api_key=x_api_key)
         if not re.fullmatch(r"[a-f0-9]{32}\.(png|jpg|webp|gif|bmp|svg|avif|ico)", filename) or not (image_output_dir / filename).is_file():
             return _openai_error_response(404, "图片文件不存在。", "invalid_request_error", "image_not_found")
+        caller_p = _principal_var.get()
+        if caller_p is not None and not caller_p.is_host:
+            owner_meta_file = image_output_dir / ".img_owners" / f"{filename}.json"
+            img_owner = "host"
+            if owner_meta_file.is_file():
+                try:
+                    img_owner = str(json.loads(owner_meta_file.read_text(encoding="utf-8")).get("tenant_id") or "host")
+                except Exception:
+                    img_owner = "host"
+            if img_owner != caller_p.tenant_id:
+                return _openai_error_response(404, "图片文件不存在或无权访问。", "invalid_request_error", "image_not_found")
         return FileResponse(image_output_dir / filename)
 
     @app.post("/v1/videos/generations", dependencies=[Depends(verify_api_key)])
     async def video_generations(payload: Dict[str, Any]) -> Any:
         principal = current_principal()
         pub_base = current_public_base_url()
-        v_model = str(payload.get("model") or cfg.default_model)
+        v_model = normalize_default_model(payload.get("model"), cfg.default_model)
         try:
             raw_refs = payload.get("images") or payload.get("files") or []
             if not isinstance(raw_refs, list):
@@ -1556,20 +2111,35 @@ def create_app(
                 tenant_id=principal.tenant_id,
             ) if raw_refs else []
             v_started = time.monotonic()
-            async with acquire_request_permit(principal, v_model):
-                v_res = await generate_videos(
-                    payload,
-                    hub,
-                    context_builder,
-                    cfg,
-                    image_output_dir,
-                    file_store,
-                    attachments,
-                    tenant_id=principal.tenant_id,
-                    public_base_url=pub_base,
-                )
+            v_task_id = f"vid_{uuid.uuid4().hex[:12]}"
+            v_prompt_prev = str(payload.get("prompt") or "").strip()[:140]
+            distribution.register_live_task(
+                v_task_id,
+                principal,
+                model=v_model,
+                task_type="video_gen",
+                prompt_preview=v_prompt_prev,
+                state="queued",
+            )
+            try:
+                async with acquire_request_permit(principal, v_model):
+                    distribution.update_live_task(v_task_id, state="running")
+                    v_res = await generate_videos(
+                        payload,
+                        hub,
+                        context_builder,
+                        cfg,
+                        image_output_dir,
+                        file_store,
+                        attachments,
+                        tenant_id=principal.tenant_id,
+                        public_base_url=pub_base,
+                    )
+            finally:
+                distribution.finish_live_task(v_task_id)
             _record_request_with_tenant(
                 principal,
+                request_id=v_task_id,
                 requested_model=v_model,
                 prompt_tokens=estimate_tokens(str(payload.get("prompt") or "")) + estimate_attachment_input_tokens(attachments),
                 completion_tokens=0,
@@ -1577,6 +2147,8 @@ def create_app(
                 task_type="video_gen",
                 strategy="browser_video",
                 videos_generated=max(1, len(v_res.get("data") or [])),
+                prompt_preview=v_prompt_prev,
+                reply_preview=f"[生成视频 {max(1, len(v_res.get('data') or []))} 段]",
                 duration_ms=int((time.monotonic() - v_started) * 1000),
             )
             return v_res
@@ -1605,7 +2177,7 @@ def create_app(
                     tenant_id=principal.tenant_id,
                 )
                 fid = saved["id"]
-                model_req = fields.get("model") or cfg.default_model
+                model_req = normalize_default_model(fields.get("model"), cfg.default_model)
                 hint = fields.get("prompt", "").strip()
                 lang = fields.get("language", "").strip()
                 resp_fmt = (fields.get("response_format") or "json").strip().lower()
@@ -1624,7 +2196,7 @@ def create_app(
                         tenant_id=principal.tenant_id,
                     )
                     fid = saved["id"]
-                model_req = payload.get("model") or cfg.default_model
+                model_req = normalize_default_model(payload.get("model"), cfg.default_model)
                 hint = str(payload.get("prompt") or "").strip()
                 lang = str(payload.get("language") or "").strip()
                 resp_fmt = str(payload.get("response_format") or "json").strip().lower()
@@ -1653,31 +2225,51 @@ def create_app(
                 image_output_dir=image_output_dir,
                 tenant_id=principal.tenant_id,
             )
-            async with acquire_request_permit(principal, model_req):
-                if not hub.has_ready_client():
-                    raise BridgeUnavailableError("没有连接可用的 Gemini Enterprise 页面。")
-                aud_sid = principal.scope_session_id("audio_" + uuid.uuid4().hex)
-                async with hub.acquire_slot(
-                    explicit_session_id=aud_sid,
-                    queue_timeout=cfg.queue_timeout_seconds,
-                    tenant_id=principal.tenant_id,
-                ) as slot:
-                    context_builder.clear_session(slot.slot_key)
-                    try:
-                        raw_reply = await hub.dispatch_complete_on_slot(
-                            slot=slot,
-                            prompt=msg.text_content(),
-                            target_model=resolve_target_web_model(model_req),
-                            reset_chat=True,
-                            suppress_citations=True,
-                            request_timeout=cfg.request_timeout_seconds,
-                            attachments=attachments,
+            aud_task_id = f"aud_{uuid.uuid4().hex[:12]}"
+            aud_preview = ("[语音翻译] " if translate_to_english else "[语音转写] ") + (hint or lang or "音频文件")
+            distribution.register_live_task(
+                aud_task_id,
+                principal,
+                model=model_req,
+                task_type="audio",
+                prompt_preview=aud_preview,
+                state="queued",
+            )
+            try:
+                async with acquire_request_permit(principal, model_req):
+                    if not hub.has_ready_client():
+                        raise BridgeUnavailableError("没有连接可用的 Gemini Enterprise 页面。")
+                    aud_sid = principal.scope_session_id("audio_" + uuid.uuid4().hex)
+                    async with hub.acquire_slot(
+                        explicit_session_id=aud_sid,
+                        queue_timeout=cfg.queue_timeout_seconds,
+                        tenant_id=principal.tenant_id,
+                    ) as slot:
+                        distribution.update_live_task(
+                            aud_task_id,
+                            state="running",
+                            slot_key=slot.slot_key,
+                            tab_id=slot.tab_id,
                         )
-                    finally:
                         context_builder.clear_session(slot.slot_key)
+                        try:
+                            raw_reply = await hub.dispatch_complete_on_slot(
+                                slot=slot,
+                                prompt=msg.text_content(),
+                                target_model=resolve_target_web_model(model_req),
+                                reset_chat=True,
+                                suppress_citations=True,
+                                request_timeout=cfg.request_timeout_seconds,
+                                attachments=attachments,
+                            )
+                        finally:
+                            context_builder.clear_session(slot.slot_key)
+            finally:
+                distribution.finish_live_task(aud_task_id)
             cleaned_text = parse_assistant_output(raw_reply).content.strip()
             _record_request_with_tenant(
                 principal,
+                request_id=aud_task_id,
                 requested_model=model_req,
                 prompt_tokens=estimate_tokens(instruction) + estimate_attachment_input_tokens(attachments),
                 completion_tokens=estimate_tokens(cleaned_text),
@@ -1686,6 +2278,8 @@ def create_app(
                 strategy="audio_translate" if translate_to_english else "audio_transcribe",
                 audio_requests=1,
                 duration_ms=int((time.monotonic() - audio_started) * 1000),
+                prompt_preview=aud_preview,
+                reply_preview=cleaned_text[:150],
             )
             if resp_fmt in {"text", "srt", "vtt"}:
                 from fastapi.responses import PlainTextResponse
@@ -1714,18 +2308,22 @@ def create_app(
         principal = current_principal()
         try:
             request, mapping, history = prepare_request(
-                payload, response_store, tenant_id=principal.tenant_id
+                payload,
+                response_store,
+                tenant_id=principal.tenant_id,
+                headers=raw_request.headers,
             )
         except (ResponsesError, ValidationError) as exc:
             return _openai_error_response(400, str(exc), "invalid_request_error", "invalid_responses_request")
         try:
+            forwarded_x_sid = None if request._bridge_thread_id else raw_request.headers.get("x-session-id")
             tok = _ledger_task_var.set("responses")
             cmp_in_tok = _consumed_compactions_var.set(
                 _extract_input_compaction_tokens(payload.get("input"))
             )
             try:
                 upstream = await chat_completions(
-                    request, x_session_id=raw_request.headers.get("x-session-id"),
+                    request, x_session_id=forwarded_x_sid,
                     x_bridge_session=raw_request.headers.get("x-bridge-session"))
             finally:
                 _consumed_compactions_var.reset(cmp_in_tok)
@@ -1757,19 +2355,22 @@ def create_app(
                 )
                 return [a for a in rebuilt if a["category"] == "image"]
 
-            return await translate_response(upstream, payload, request.model or cfg.default_model, mapping, history, response_store,
+            eff_resp_model = normalize_default_model(request.model, cfg.default_model)
+            return await translate_response(upstream, payload, eff_resp_model, mapping, history, response_store,
                 image_generator=lambda prompt: _run_tracked_image_gen(
-                    {"prompt": prompt, "model": request.model or cfg.default_model},
+                    {"prompt": prompt, "model": eff_resp_model},
                     _responses_gen_images(),
                 ),
-                tenant_id=principal.tenant_id)
+                tenant_id=principal.tenant_id,
+                headers=raw_request.headers)
         except (ResponsesError, BridgeUnavailableError, BridgeTimeoutError, BridgeExecutionError) as exc:
             return _openai_error_response(502, str(exc), "bridge_error", "response_execution_failed")
 
     @app.get("/v1/responses/{response_id}", dependencies=[Depends(verify_api_key)])
     async def retrieve_response(response_id: str) -> Any:
         try:
-            return response_store.get(response_id, tenant_id=current_principal().tenant_id)[0]
+            stored = response_store.get(response_id, tenant_id=current_principal().tenant_id)[0]
+            return {k: v for k, v in stored.items() if not str(k).startswith("_")}
         except ResponsesError as exc:
             return _openai_error_response(404, str(exc), "invalid_request_error", "response_not_found")
 
@@ -1791,13 +2392,14 @@ def create_app(
             return _openai_error_response(400, str(exc), "invalid_request_error", "invalid_token_request")
 
     @app.post("/v1/responses/compact", dependencies=[Depends(verify_api_key)])
-    async def compact_response(payload: Dict[str, Any]) -> Any:
+    async def compact_response(payload: Dict[str, Any], raw_request: Request) -> Any:
         principal = current_principal()
         try:
             request, _, _ = prepare_request(
                 {**payload, "tools": [], "stream": False},
                 response_store,
                 tenant_id=principal.tenant_id,
+                headers=raw_request.headers,
             )
             request.messages, recent_tool_rounds = split_checkpoint_history(request.messages)
             request.messages.append(ChatMessage(role="user", content=COMPACTION_INSTRUCTIONS))
@@ -1851,6 +2453,8 @@ def create_app(
         x_session_id: Optional[str] = Header(default=None),
         x_bridge_session: Optional[str] = Header(default=None),
         x_bridge_probe: Optional[str] = Header(default=None),
+        x_thread_id: Optional[str] = Header(default=None),
+        thread_id: Optional[str] = Header(default=None, alias="thread-id"),
     ) -> Any:
         if not request.messages:
             return _openai_error_response(
@@ -1862,15 +2466,24 @@ def create_app(
 
         principal = current_principal()
         pub_base_url = current_public_base_url()
-        raw_model_name = request.model or cfg.default_model
+        raw_model_name = normalize_default_model(request.model, cfg.default_model)
         distribution.preflight_check(principal, requested_model=raw_model_name)
         base_model_name, model_session_tag = parse_model_and_session(raw_model_name)
-        model_name = base_model_name or cfg.default_model
+        model_name = normalize_default_model(base_model_name, cfg.default_model)
+        clean_x_bridge = x_bridge_session.strip() if isinstance(x_bridge_session, str) and x_bridge_session.strip() else None
+        clean_thread_hdr = (
+            (x_thread_id.strip() if isinstance(x_thread_id, str) and x_thread_id.strip() else None)
+            or (thread_id.strip() if isinstance(thread_id, str) and thread_id.strip() else None)
+        )
+        clean_x_sid = x_session_id.strip() if isinstance(x_session_id, str) and x_session_id.strip() else None
+        clean_req_sid = request.session_id.strip() if isinstance(request.session_id, str) and request.session_id.strip() else None
+        verified_thread_id = request._bridge_thread_id or clean_thread_hdr
         raw_explicit_session_id = (
-            model_session_tag
-            or (x_session_id.strip() if x_session_id and x_session_id.strip() else None)
-            or (x_bridge_session.strip() if x_bridge_session and x_bridge_session.strip() else None)
-            or (request.session_id.strip() if request.session_id and request.session_id.strip() else None)
+            verified_thread_id
+            or model_session_tag
+            or clean_x_bridge
+            or clean_x_sid
+            or clean_req_sid
         )
         is_probe_req = bool(
             (isinstance(x_bridge_probe, str) and x_bridge_probe.strip() == "1")
@@ -1920,6 +2533,9 @@ def create_app(
         completion_id = uuid.uuid4().hex
         created_ts = int(time.time())
         req_started_mono = time.monotonic()
+        prompt_preview_text = "[一键模型连通体检]" if is_probe_req else ("[上下文压缩归档]" if is_compaction_req else _extract_messages_preview(request.messages))
+        clean_visible_sid = _unscope_session_header(explicit_session_id, principal) or ""
+        t_label_for_err = "本机直连" if principal.is_host else f"客户端 · {principal.name}"
         superseded_compactions: list[PendingCompactionCleanup] = (
             []
             if is_compaction_req
@@ -1985,7 +2601,7 @@ def create_app(
             if not gcloud.is_configured():
                 return _openai_error_response(
                     status_code=503,
-                    message="未配置 GCP_PROJECT_ID，无法使用 gemini-enterprise-gcloud 模式。请在 .env 中配置或改用 gemini-enterprise-web。",
+                    message=f"未配置 GCP_PROJECT_ID，无法使用 gemini-enterprise-gcloud 模式。请在 .env 中配置或改用 {DEFAULT_MODEL_ID}。",
                     error_type="service_unavailable_error",
                     code="gcloud_not_configured",
                 )
@@ -2005,6 +2621,22 @@ def create_app(
                         )
                 except GCloudUpstreamError as exc:
                     distribution.record_usage(principal, error=True)
+                    usage_ledger.record_failed_request(
+                        request_id=completion_id,
+                        requested_model=model_name,
+                        task_type=request_task_type,
+                        tenant_id=principal.tenant_id,
+                        tenant_name=t_label_for_err,
+                        client_ip=principal.client_ip,
+                        session_id=clean_visible_sid,
+                        prompt_preview=prompt_preview_text,
+                        status="error",
+                        status_code=502,
+                        error_code="gcloud_failed",
+                        error_message=str(exc),
+                        slot_key="gcloud",
+                        duration_ms=int((time.monotonic() - req_started_mono) * 1000),
+                    )
                     return _openai_error_response(502, str(exc), "upstream_error", "gcloud_failed")
 
                 parsed = parse_assistant_output(
@@ -2026,6 +2658,7 @@ def create_app(
                 gc_usage = resp_gcloud.get("usage") or {}
                 _record_request_with_tenant(
                     principal,
+                    request_id=completion_id,
                     requested_model=model_name,
                     prompt_tokens=logical_in_tokens,
                     completion_tokens=int(gc_usage.get("completion_tokens") or 0),
@@ -2033,6 +2666,10 @@ def create_app(
                     task_type=request_task_type,
                     strategy="gcloud_direct",
                     slot_key="gcloud",
+                    session_id=explicit_session_id,
+                    prompt_preview=prompt_preview_text,
+                    reply_preview=_extract_reply_preview(parsed.content, parsed.tool_calls),
+                    tool_calls_count=len(parsed.tool_calls or []),
                     duration_ms=int((time.monotonic() - req_started_mono) * 1000),
                 )
                 return resp_gcloud
@@ -2100,6 +2737,7 @@ def create_app(
                         completion_usage_str = parsed.content or ""
                     _record_request_with_tenant(
                         principal,
+                        request_id=completion_id,
                         requested_model=model_name,
                         prompt_tokens=logical_in_tokens,
                         completion_tokens=estimate_tokens(completion_usage_str),
@@ -2107,6 +2745,10 @@ def create_app(
                         task_type=request_task_type,
                         strategy="gcloud_stream",
                         slot_key="gcloud",
+                        session_id=explicit_session_id,
+                        prompt_preview=prompt_preview_text,
+                        reply_preview=_extract_reply_preview(parsed.content, parsed.tool_calls),
+                        tool_calls_count=len(parsed.tool_calls or []),
                         duration_ms=int((time.monotonic() - req_started_mono) * 1000),
                     )
                 except GCloudUpstreamError as exc:
@@ -2159,6 +2801,17 @@ def create_app(
 
         if not request.stream:
             completed_compaction_rec: Optional[PendingCompactionCleanup] = None
+            if not is_probe_req:
+                distribution.register_live_task(
+                    completion_id,
+                    principal,
+                    model=model_name,
+                    task_type=request_task_type,
+                    session_id=clean_visible_sid,
+                    prompt_preview=prompt_preview_text,
+                    stream=False,
+                    state="queued",
+                )
             try:
                 async with (
                     acquire_request_permit(principal, raw_model_name),
@@ -2171,9 +2824,17 @@ def create_app(
                         ephemeral_probe=is_probe_req,
                         ephemeral_compaction=is_compaction_req,
                         tenant_id=principal.tenant_id,
+                        strict_session_affinity=bool(verified_thread_id),
                     ) as (slot, effective_sid, resumed_from_archive),
                 ):
                     session_key = slot.slot_key
+                    if not is_probe_req:
+                        distribution.update_live_task(
+                            completion_id,
+                            state="running",
+                            slot_key=session_key,
+                            tab_id=slot.tab_id,
+                        )
                     prepared = context_builder.build(
                         messages=request.messages,
                         model=model_name,
@@ -2188,7 +2849,7 @@ def create_app(
                     sent_attachments = _select_sent_attachments(prepared, turn_attachments)
                     turn_logical_in_tokens = estimate_tokens(usage_prompt) + estimate_attachment_input_tokens(turn_attachments)
                     record_context(request, prepared, turn_attachments, turn_skipped_markers, sent_count=len(sent_attachments))
-                    if resumed_from_archive:
+                    if resumed_from_archive and principal.is_host:
                         context_diagnostics["resumed_archived_session"] = True
                     raw_out_images: list[dict[str, Any]] = []
                     raw_out_files: list[dict[str, Any]] = []
@@ -2291,6 +2952,7 @@ def create_app(
                         slot_ctx = context_builder.get_slot_context_metrics(session_key) or {}
                     _record_request_with_tenant(
                         principal,
+                        request_id=completion_id,
                         requested_model=model_name,
                         prompt_tokens=turn_logical_in_tokens,
                         completion_tokens=estimate_tokens(comp_for_ledger),
@@ -2303,6 +2965,11 @@ def create_app(
                         videos_generated=sum(1 for a in (saved_outputs or []) if a.get("category") == "video"),
                         slot_key=session_key,
                         tab_id=slot.tab_id,
+                        session_id=effective_sid or explicit_session_id,
+                        session_title=context_builder.get_session_title(session_key),
+                        prompt_preview=prompt_preview_text,
+                        reply_preview=_extract_reply_preview(parsed.content, parsed.tool_calls),
+                        tool_calls_count=len(parsed.tool_calls or []),
                         context_tokens=slot_ctx.get("total_context_tokens"),
                         context_limit=slot_ctx.get("context_limit_tokens"),
                         duration_ms=int((time.monotonic() - req_started_mono) * 1000),
@@ -2310,13 +2977,37 @@ def create_app(
                     slot_header_val = slot.slot_key
             except BridgeUnavailableError as exc:
                 distribution.record_usage(principal, error=True)
+                usage_ledger.record_failed_request(
+                    request_id=completion_id, requested_model=model_name, task_type=request_task_type,
+                    tenant_id=principal.tenant_id, tenant_name=t_label_for_err, client_ip=principal.client_ip,
+                    session_id=clean_visible_sid, prompt_preview=prompt_preview_text,
+                    status="error", status_code=503, error_code="browser_not_connected", error_message=str(exc),
+                    duration_ms=int((time.monotonic() - req_started_mono) * 1000),
+                )
                 return _openai_error_response(503, str(exc), "bridge_unavailable_error", "browser_not_connected")
             except BridgeTimeoutError as exc:
                 distribution.record_usage(principal, error=True)
+                usage_ledger.record_failed_request(
+                    request_id=completion_id, requested_model=model_name, task_type=request_task_type,
+                    tenant_id=principal.tenant_id, tenant_name=t_label_for_err, client_ip=principal.client_ip,
+                    session_id=clean_visible_sid, prompt_preview=prompt_preview_text,
+                    status="timeout", status_code=504, error_code="browser_timeout", error_message=str(exc),
+                    duration_ms=int((time.monotonic() - req_started_mono) * 1000),
+                )
                 return _openai_error_response(504, str(exc), "timeout_error", "browser_timeout")
             except (BridgeExecutionError, ToolProtocolError, BrowserTaskFailure) as exc:
                 distribution.record_usage(principal, error=True)
+                usage_ledger.record_failed_request(
+                    request_id=completion_id, requested_model=model_name, task_type=request_task_type,
+                    tenant_id=principal.tenant_id, tenant_name=t_label_for_err, client_ip=principal.client_ip,
+                    session_id=clean_visible_sid, prompt_preview=prompt_preview_text,
+                    status="error", status_code=502, error_code="dom_execution_failed", error_message=str(exc),
+                    duration_ms=int((time.monotonic() - req_started_mono) * 1000),
+                )
                 return _openai_error_response(502, str(exc), "bridge_execution_error", "dom_execution_failed")
+            finally:
+                if not is_probe_req:
+                    distribution.finish_live_task(completion_id)
 
             resp_payload = build_chat_completion_response(
                 request_id=completion_id,
@@ -2340,6 +3031,22 @@ def create_app(
             return JSONResponse(content=resp_payload, headers=resp_headers)
 
         browser_stream_lease = await _StreamPermitLease(principal, raw_model_name).enter()
+        if not is_probe_req:
+            distribution.register_live_task(
+                completion_id,
+                principal,
+                model=model_name,
+                task_type=request_task_type,
+                session_id=clean_visible_sid,
+                prompt_preview=prompt_preview_text,
+                stream=True,
+                state="queued",
+            )
+
+        async def close_browser_stream():
+            if not is_probe_req:
+                distribution.finish_live_task(completion_id)
+            await browser_stream_lease.close()
 
         async def browser_sse() -> AsyncIterator[str]:
             initial = build_chat_completion_chunk(
@@ -2365,17 +3072,28 @@ def create_app(
             try:
                 handoff_cleanup_triggered = False
                 stream_compaction_rec: Optional[PendingCompactionCleanup] = None
-                async with conversation_slot(
-                    request_messages=request.messages,
-                    model_name=model_name,
-                    explicit_session_id=explicit_session_id,
-                    tools_active=tools_active,
-                    queue_timeout=cfg.queue_timeout_seconds,
-                    ephemeral_probe=is_probe_req,
-                    ephemeral_compaction=is_compaction_req,
-                    tenant_id=principal.tenant_id,
-                ) as (slot, effective_sid, resumed_from_archive):
+                async with (
+                    conversation_slot(
+                        request_messages=request.messages,
+                        model_name=model_name,
+                        explicit_session_id=explicit_session_id,
+                        tools_active=tools_active,
+                        queue_timeout=cfg.queue_timeout_seconds,
+                        ephemeral_probe=is_probe_req,
+                        ephemeral_compaction=is_compaction_req,
+                        tenant_id=principal.tenant_id,
+                        strict_session_affinity=bool(verified_thread_id),
+                    ) as (slot, effective_sid, resumed_from_archive),
+                    AsyncExitStack() as stream_cleanup,
+                ):
                     session_key = slot.slot_key
+                    if not is_probe_req:
+                        distribution.update_live_task(
+                            completion_id,
+                            state="running",
+                            slot_key=session_key,
+                            tab_id=slot.tab_id,
+                        )
                     prepared = context_builder.build(
                         messages=request.messages,
                         model=model_name,
@@ -2391,11 +3109,11 @@ def create_app(
                     sent_attachments = _select_sent_attachments(prepared, turn_attachments)
                     turn_logical_in_tokens = estimate_tokens(usage_prompt) + estimate_attachment_input_tokens(turn_attachments)
                     record_context(request, prepared, turn_attachments, turn_skipped_markers, sent_count=len(sent_attachments))
-                    if resumed_from_archive:
+                    if resumed_from_archive and principal.is_host:
                         context_diagnostics["resumed_archived_session"] = True
                     stream_out_images: list[dict[str, Any]] = []
                     stream_out_files: list[dict[str, Any]] = []
-                    async for delta in hub.dispatch_stream_on_slot(
+                    dispatch_stream = hub.dispatch_stream_on_slot(
                         slot=slot,
                         prompt=prepared.prompt,
                         target_model=target_web_model,
@@ -2405,7 +3123,9 @@ def create_app(
                         attachments=sent_attachments,
                         output_images=stream_out_images,
                         output_files=stream_out_files,
-                    ):
+                    )
+                    stream_cleanup.push_async_callback(dispatch_stream.aclose)
+                    async for delta in dispatch_stream:
                         if (
                             not handoff_cleanup_triggered
                             and superseded_compactions
@@ -2416,7 +3136,7 @@ def create_app(
                                 superseded_compactions, exclude_slot_key=session_key
                             )
                         if not delta:
-                            if time.monotonic() - last_sse_ts >= 14.5:
+                            if time.monotonic() - last_sse_ts >= 12.0:
                                 yield ": keepalive\n\n"
                                 last_sse_ts = time.monotonic()
                             continue
@@ -2554,6 +3274,7 @@ def create_app(
                         slot_ctx = context_builder.get_slot_context_metrics(session_key) or {}
                         _record_request_with_tenant(
                             principal,
+                            request_id=completion_id,
                             requested_model=model_name,
                             prompt_tokens=turn_logical_in_tokens,
                             completion_tokens=estimate_tokens(completion_usage_str),
@@ -2566,16 +3287,30 @@ def create_app(
                             videos_generated=sum(1 for a in (saved_stream_outputs or []) if a.get("category") == "video"),
                             slot_key=session_key,
                             tab_id=slot.tab_id,
+                            session_id=effective_sid or explicit_session_id,
+                            session_title=context_builder.get_session_title(session_key),
+                            prompt_preview=prompt_preview_text,
+                            reply_preview=_extract_reply_preview(parsed.content, parsed.tool_calls),
+                            tool_calls_count=len(parsed.tool_calls or []),
                             context_tokens=slot_ctx.get("total_context_tokens"),
                             context_limit=slot_ctx.get("context_limit_tokens"),
                             duration_ms=int((time.monotonic() - req_started_mono) * 1000),
                         )
             except (BridgeUnavailableError, BridgeTimeoutError, BridgeExecutionError, ToolProtocolError, BrowserTaskFailure) as exc:
                 distribution.record_usage(principal, error=True)
+                usage_ledger.record_failed_request(
+                    request_id=completion_id, requested_model=model_name, task_type=request_task_type,
+                    tenant_id=principal.tenant_id, tenant_name=t_label_for_err, client_ip=principal.client_ip,
+                    session_id=clean_visible_sid, prompt_preview=prompt_preview_text,
+                    status="timeout" if isinstance(exc, BridgeTimeoutError) else "error",
+                    status_code=504 if isinstance(exc, BridgeTimeoutError) else 502,
+                    error_code="browser_stream_failed", error_message=str(exc),
+                    duration_ms=int((time.monotonic() - req_started_mono) * 1000),
+                )
                 yield "data: " + json.dumps({"error": {"message": str(exc), "type": "bridge_error", "code": "browser_failed"}}, ensure_ascii=False) + "\n\n"
                 return
             finally:
-                await browser_stream_lease.close()
+                await close_browser_stream()
 
             stop_chunk = build_chat_completion_chunk(
                 request_id=completion_id,
@@ -2612,16 +3347,26 @@ def create_app(
         if client_visible_sid:
             sse_headers["X-Bridge-Session-Id"] = client_visible_sid
 
-        return StreamingResponse(
+        return ClosingStreamingResponse(
             with_keepalive(browser_sse()),
             media_type="text/event-stream",
             headers=sse_headers,
+            on_close=close_browser_stream,
         )
 
     return app
 
 
-app = create_app()
+_default_app: Optional[FastAPI] = None
+
+
+def __getattr__(name: str) -> Any:
+    global _default_app
+    if name == "app":
+        if _default_app is None:
+            _default_app = create_app()
+        return _default_app
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
 
 if __name__ == "__main__":
@@ -2635,10 +3380,11 @@ if __name__ == "__main__":
         log_payloads=runtime_cfg.log_payloads,
     )
     uvicorn.run(
-        app,
+        create_app(runtime_cfg),
         host=runtime_cfg.host,
         port=runtime_cfg.port,
         log_level="debug" if LOG_MANAGER.is_debug_enabled() else "info",
         ws_max_size=16 * 1024 * 1024,
         h11_max_incomplete_event_size=16 * 1024 * 1024,
+        timeout_graceful_shutdown=5,
     )

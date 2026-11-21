@@ -18,47 +18,66 @@ _ADJOINED_CLOSE_SUGGESTION_AFTER_NL = re.compile(
 )
 _FENCE_PREFIX_HOLD_RE = re.compile(r'^[ \t]{0,3}(?:`+|~+)?$')
 _FENCE_OPEN_PREFIX_RE = re.compile(r'^([ \t]{0,3})(`{3,}|~{3,})(.*)$', re.DOTALL)
-_LOCAL_ABS_ROOT_RE = re.compile(
-    r'^/(?:Users|Volumes|Applications|private/(?:var|tmp)|var/folders|tmp)/'
+_POSIX_ABS_ROOT_RE = re.compile(
+    r'^/(?:Users|Volumes|Applications|private/(?:var|tmp)|var/folders|tmp|home|mnt|opt)/'
 )
+_WIN_DRIVE_ROOT_RE = re.compile(r'^[A-Za-z]:[\\/]')
+_WIN_UNC_ROOT_RE = re.compile(r'^(?:\\\\|//)[^\\/\s]+[\\/][^\\/\s]+[\\/]')
 _LINE_ANCHOR_RE = re.compile(r'(?::\d+(?::\d+)?|#L\d+(?:C\d+)?)$')
-_FORBIDDEN_PATH_CHARS_RE = re.compile(r'[\x00-\x1f"<>|*?;&$`\\\t]')
+_FORBIDDEN_PATH_CHARS_RE = re.compile(r'[\x00-\x1f"<>|*?;&$`\t]')
 _EXT_FILENAME_RE = re.compile(
     r'^(?:\.[A-Za-z0-9][A-Za-z0-9._-]*|Makefile|Dockerfile|README|LICENSE|.+\.[A-Za-z0-9]{1,12})$'
 )
 
 
 def _format_local_file_markdown_link(raw: str) -> str | None:
-    if not raw or raw != raw.strip() or len(raw) > 512 or raw.endswith('/'):
+    if not raw or raw != raw.strip() or len(raw) > 512 or raw.endswith(('/', '\\')):
         return None
-    if not _LOCAL_ABS_ROOT_RE.match(raw):
+    is_win_drive = bool(_WIN_DRIVE_ROOT_RE.match(raw))
+    is_win_unc = bool(not is_win_drive and _WIN_UNC_ROOT_RE.match(raw))
+    is_posix = bool(not is_win_drive and not is_win_unc and _POSIX_ABS_ROOT_RE.match(raw))
+    if not (is_win_drive or is_win_unc or is_posix):
         return None
     if _FORBIDDEN_PATH_CHARS_RE.search(raw) or ' --' in raw:
+        return None
+    if is_posix and '\\' in raw:
         return None
     m_anchor = _LINE_ANCHOR_RE.search(raw)
     anchor = m_anchor.group(0) if m_anchor else ''
     base_path = raw[: m_anchor.start()] if m_anchor else raw
-    if not base_path or base_path.endswith('/'):
+    if not base_path or base_path.endswith(('/', '\\')):
         return None
-    is_app_bundle = base_path.lower().endswith('.app')
-    try:
-        exists = os.path.exists(base_path)
-    except OSError:
-        exists = False
+    if is_win_drive:
+        if ':' in base_path[2:] or '\\\\' in base_path:
+            return None
+    elif is_win_unc:
+        if ':' in base_path or '\\\\' in base_path[2:]:
+            return None
+    norm_base = base_path.replace('\\', '/')
+    is_app_bundle = norm_base.lower().endswith('.app')
+    exists = False
+    # Never probe remote UNC shares (\\server\share) with os.path.exists on Windows:
+    # SMB lookup on an unreachable host stalls the event loop for 30-45s.
+    if (os.name == 'nt' and is_win_drive) or (os.name != 'nt' and is_posix):
+        try:
+            exists = os.path.exists(base_path)
+        except OSError:
+            exists = False
     if exists:
         if os.path.isdir(base_path) and not is_app_bundle:
             return None
         if not os.path.isfile(base_path) and not is_app_bundle:
             return None
     else:
-        name_only = posixpath.basename(base_path)
+        name_only = posixpath.basename(norm_base)
         if not name_only or not _EXT_FILENAME_RE.match(name_only):
             return None
-    name = posixpath.basename(base_path)
+    name = posixpath.basename(norm_base)
     label = f'{name}{anchor}'.replace('[', '\\[').replace(']', '\\]')
-    if any(ch in raw for ch in (' ', '(', ')')):
-        return f'[{label}](<{raw}>)'
-    return f'[{label}]({raw})'
+    target = f'{norm_base}{anchor}' if (is_win_drive or is_win_unc) else raw
+    if any(ch in target for ch in (' ', '(', ')')):
+        return f'[{label}](<{target}>)'
+    return f'[{label}]({target})'
 
 
 def _scan_line_backticks(line: str, allow_incomplete_tail: bool) -> tuple[str, str]:
@@ -256,6 +275,7 @@ def _find_top_level_suggestion(text, fence='', line=''):
 
 
 def _is_potential_suggestion_line(line_tail: str) -> bool:
+    line_tail = line_tail.rstrip('\r')
     if not line_tail or '\n' in line_tail or len(line_tail) > 128:
         return False
     stripped_sec = re.sub(
@@ -358,8 +378,9 @@ class WebTextFilter:
         text = self.pending + text
         self.pending = ''
         if not self.fence or self.fence == '```':
+            clean_prev_line = self.line.rstrip('\r')
             if (
-                re.match(r'^[ \t]{0,3}`{3}[ \t]*$', self.line)
+                re.match(r'^[ \t]{0,3}`{3}[ \t]*$', clean_prev_line)
                 and re.match(
                     r'^(?:(?:`{3,}|~{3,})[ \t]*suggested_questions(?=[ \t\r\n])|\[\[(?:suggested_questions|section:suggested_questions)\]\])',
                     text,
@@ -369,7 +390,7 @@ class WebTextFilter:
                 text = '\n' + text
             elif (
                 self.fence == '```'
-                and re.match(r'^[ \t]{0,3}`{3}[ \t]*$', self.line)
+                and re.match(r'^[ \t]{0,3}`{3}[ \t]*$', clean_prev_line)
                 and '\n' not in text
                 and _is_potential_suggestion_line(text)
             ):

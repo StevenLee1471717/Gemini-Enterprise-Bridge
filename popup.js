@@ -25,10 +25,14 @@ const elCurTabTitle = document.getElementById("curTabTitle");
 const elCurTabBadge = document.getElementById("curTabBadge");
 const elCurTabDesc = document.getElementById("curTabDesc");
 const elToggleManualBtn = document.getElementById("toggleManualBtn");
+const elOpenManualTabBtn = document.getElementById("openManualTabBtn");
 const elAutoSpawn = document.getElementById("autoSpawnSelect");
 const elAutoSpawnCheck = document.getElementById("autoSpawnCheck");
 const elMaxTabs = document.getElementById("maxTabsSelect");
 const elMaxTabsSegments = document.getElementById("maxTabsSegments");
+const elCustomTabsRow = document.getElementById("customTabsRow");
+const elCustomTabsInput = document.getElementById("customTabsInput");
+const elCustomTabsApplyBtn = document.getElementById("customTabsApplyBtn");
 const elPoolControlsWrap = document.getElementById("poolControlsWrap");
 const elModeSelect = document.getElementById("driverModeSelect");
 const elWsUrl = document.getElementById("wsUrlInput");
@@ -38,6 +42,90 @@ const elSendSel = document.getElementById("sendSelector");
 const elReplySel = document.getElementById("replySelector");
 const elDiagOut = document.getElementById("diagOutput");
 const elSaveToast = document.getElementById("saveToast");
+let customCapEditing = false;
+
+const POPUP_DEFAULT_VERTEX_HOME_URL =
+  "https://vertexaisearch.cloud.google.com/home/cid/f8a26a7c-0f51-4098-bf58-52506661472b?hl=en_US";
+
+function hasPopupVertexWorkspacePath(rawOrPath) {
+  return /\/(?:cid|app)\/[^/?#]+/i.test(String(rawOrPath || ""));
+}
+
+function normalizePopupVertexHomeUrl(rawUrl) {
+  if (!rawUrl || typeof rawUrl !== "string") return "";
+  try {
+    const u = new URL(rawUrl.trim());
+    if (!u.hostname.toLowerCase().endsWith("vertexaisearch.cloud.google.com")) {
+      return "";
+    }
+    const nextPath = (u.pathname || "")
+      .replace(/\/r\/session\/[^/?#]+.*$/i, "")
+      .replace(/\/session\/[^/?#]+.*$/i, "")
+      .replace(/\/c\/[^/?#]+.*$/i, "")
+      .replace(/\/+$/, "");
+    if (!nextPath) {
+      return "";
+    }
+    u.pathname = nextPath;
+    u.hash = "";
+    return u.toString();
+  } catch (_) {
+    return "";
+  }
+}
+
+async function resolvePopupVertexHomeUrl() {
+  let tabs = [];
+  try {
+    tabs = (await chrome.tabs.query({ url: "https://vertexaisearch.cloud.google.com/*" })) || [];
+  } catch (_) {}
+  const ordered = tabs.filter((t) => t && t.active).concat(tabs.filter((t) => t && !t.active));
+  for (const t of ordered) {
+    const clean = normalizePopupVertexHomeUrl(t.url || "");
+    if (clean && hasPopupVertexWorkspacePath(clean)) {
+      try {
+        await chrome.storage.local.set({ lastVertexHomeUrl: clean });
+      } catch (_) {}
+      return clean;
+    }
+  }
+  let storedClean = "";
+  try {
+    const data = await chrome.storage.local.get("lastVertexHomeUrl");
+    storedClean = normalizePopupVertexHomeUrl(data && data.lastVertexHomeUrl ? data.lastVertexHomeUrl : "");
+    if (storedClean && hasPopupVertexWorkspacePath(storedClean)) {
+      return storedClean;
+    }
+  } catch (_) {}
+  for (const t of ordered) {
+    const clean = normalizePopupVertexHomeUrl(t.url || "");
+    if (clean) return clean;
+  }
+  return storedClean || POPUP_DEFAULT_VERTEX_HOME_URL;
+}
+
+async function openCleanGeminiTab({ manual = true, active = true } = {}) {
+  const targetUrl = await resolvePopupVertexHomeUrl();
+  if (active) {
+    const res = await chrome.runtime.sendMessage({
+      type: "GEB_POPUP_OPEN_CLEAN_TAB",
+      manual,
+      url: targetUrl
+    });
+    if (res && res.handled) {
+      return res;
+    }
+  }
+  const created = await chrome.tabs.create({ url: targetUrl, active });
+  if (manual && created && created.id) {
+    await chrome.runtime.sendMessage({
+      type: "GEB_TOGGLE_TAB_MANUAL",
+      tabId: created.id,
+      manual: true
+    });
+  }
+  return { ok: true, tabId: created ? created.id : null, url: targetUrl };
+}
 
 let initialFormHydrated = false;
 let toastTimer = null;
@@ -82,6 +170,42 @@ function cleanTabTitle(rawTitle, index) {
   return `${index + 1} 号页 · ${text.slice(0, 16)}`;
 }
 
+function normalizeMaxParallelTabs(val, fallback = 10) {
+  let parsed = NaN;
+  if (typeof val === "string") {
+    const trimmed = val.trim();
+    if (!trimmed) return fallback;
+    if (!/^\d+$/.test(trimmed)) return fallback;
+    parsed = Number(trimmed);
+  } else if (typeof val === "number") {
+    parsed = val;
+  } else {
+    return fallback;
+  }
+  if (!Number.isInteger(parsed) || parsed < 1) return fallback;
+  return Math.min(200, parsed);
+}
+
+function parseCustomParallelTabsInput(raw) {
+  const trimmed = String(raw ?? "").trim();
+  if (!/^\d+$/.test(trimmed)) return null;
+  const parsed = Number(trimmed);
+  if (!Number.isInteger(parsed) || parsed < 1 || parsed > 200) return null;
+  return parsed;
+}
+
+function ensureSelectHasValue(selectEl, valStr) {
+  if (!selectEl) return;
+  let opt = selectEl.querySelector(`option[value="${valStr}"]`);
+  if (!opt) {
+    opt = document.createElement("option");
+    opt.value = valStr;
+    opt.textContent = valStr;
+    selectEl.appendChild(opt);
+  }
+  selectEl.value = valStr;
+}
+
 function syncSegmentUI(maxTabsVal, autoSpawnEnabled, isFixedSingleTab) {
   if (elAutoSpawnCheck) {
     elAutoSpawnCheck.checked = Boolean(autoSpawnEnabled);
@@ -92,16 +216,22 @@ function syncSegmentUI(maxTabsVal, autoSpawnEnabled, isFixedSingleTab) {
   }
   if (elMaxTabsSegments) {
     const buttons = elMaxTabsSegments.querySelectorAll(".seg-btn");
-    const target = String(maxTabsVal || 10);
-    let matched = false;
+    const normalizedNum = normalizeMaxParallelTabs(maxTabsVal, 10);
+    const target = String(normalizedNum);
+    const isPreset = target === "1" || target === "5" || target === "10";
+    const editingCustom = typeof customCapEditing !== "undefined" && Boolean(customCapEditing);
     buttons.forEach((btn) => {
-      const isHit = btn.getAttribute("data-val") === target;
-      if (isHit) matched = true;
-      btn.classList.toggle("active", isHit);
+      const dVal = btn.getAttribute("data-val");
+      if (dVal === "custom") {
+        btn.classList.toggle("active", editingCustom || !isPreset);
+        btn.textContent = !isPreset ? `自定义 (${normalizedNum})` : "自定义";
+      } else {
+        btn.classList.toggle("active", !editingCustom && dVal === target);
+      }
       btn.disabled = Boolean(isFixedSingleTab);
     });
-    if (!matched && buttons.length > 0) {
-      buttons[buttons.length - 1].classList.add("active");
+    if (typeof elCustomTabsRow !== "undefined" && elCustomTabsRow) {
+      elCustomTabsRow.hidden = !editingCustom || Boolean(isFixedSingleTab);
     }
   }
 }
@@ -110,8 +240,15 @@ function renderCurrentTabControl(focusedTab, settings, maxCap) {
   if (!elCurTabPanel || !elCurTabBadge || !elCurTabDesc || !elToggleManualBtn) {
     return;
   }
-  if (focusedTab && focusedTab.isVertex && focusedTab.id) {
+  const isUsableFocused = Boolean(
+    focusedTab &&
+    focusedTab.isVertex &&
+    focusedTab.id &&
+    (!focusedTab.url || normalizePopupVertexHomeUrl(focusedTab.url))
+  );
+  if (isUsableFocused) {
     const st = focusedTab.state || {};
+    if (elOpenManualTabBtn) elOpenManualTabBtn.hidden = false;
     if (elCurTabTitle) {
       elCurTabTitle.textContent = st.seatIndex
         ? `当前标签页（席位 #${st.seatIndex}）`
@@ -131,7 +268,10 @@ function renderCurrentTabControl(focusedTab, settings, maxCap) {
       elCurTabPanel.className = "cur-tab-panel";
       elCurTabBadge.textContent = "超出上限 · 未接管";
       elCurTabBadge.className = "pill";
-      elCurTabDesc.textContent = `已达 ${maxCap} 页接管上限，此页暂未接入；也可锁定为你的专属自用页。`;
+      elCurTabDesc.textContent =
+        maxCap > 0
+          ? `已达 ${maxCap} 页接管上限，此页暂未接入；也可锁定为你的专属自用页。`
+          : "此页暂未接入；也可锁定为你的专属自用页。";
       elToggleManualBtn.textContent = "设为我自己用 · 不接管此会话";
       elToggleManualBtn.className = "btn manual-toggle-btn to-manual";
     } else {
@@ -151,6 +291,7 @@ function renderCurrentTabControl(focusedTab, settings, maxCap) {
       elToggleManualBtn.className = "btn manual-toggle-btn to-manual";
     }
   } else {
+    if (elOpenManualTabBtn) elOpenManualTabBtn.hidden = true;
     if (elCurTabTitle) elCurTabTitle.textContent = "当前浏览标签页";
     elCurTabPanel.className = "cur-tab-panel";
     elCurTabBadge.textContent = "非 Gemini 页";
@@ -204,14 +345,17 @@ async function loadState(overwriteInputs = false) {
       logs
     } = state;
 
-    const maxCap = Number(settings.maxParallelTabs || 10);
+    const maxCap = normalizeMaxParallelTabs(settings.maxParallelTabs, 10);
     const autoSpawnOn = settings.autoSpawnTabs !== false;
 
+    if (elMaxTabs && (!customCapEditing || overwriteInputs)) {
+      ensureSelectHasValue(elMaxTabs, String(maxCap));
+    }
     if (!initialFormHydrated || overwriteInputs) {
       elEnabled.checked = Boolean(settings.enabled);
       elModeSelect.value = settings.driverMode || "auto";
       if (elAutoSpawn) elAutoSpawn.value = autoSpawnOn ? "true" : "false";
-      if (elMaxTabs) elMaxTabs.value = String(maxCap);
+      if (elMaxTabs) ensureSelectHasValue(elMaxTabs, String(maxCap));
       elWsUrl.value = settings.wsUrl || "ws://127.0.0.1:8000/ws/browser";
       if (elModelSel) elModelSel.value = settings.customModelSelector || "";
       elInputSel.value = settings.customInputSelector || "";
@@ -259,7 +403,8 @@ async function loadState(overwriteInputs = false) {
       if (elHeroSub) elHeroSub.textContent = "请确认本机 8000 服务已启动，插件会自动重连";
       elWsPill.textContent = "未连接";
       elWsPill.className = "pill err";
-      elTabStatus.textContent = managedTotal > 0 ? `${managedTotal} / ${maxCap} 页` : "0 页";
+      elTabStatus.textContent =
+        managedTotal > 0 ? `${managedTotal} / ${maxCap} 页` : "0 页";
       if (elOpenVertexBtn) elOpenVertexBtn.hidden = allOpenTotal > 0;
     } else if (managedTotal === 0) {
       if (elHeroDot) elHeroDot.className = "status-dot";
@@ -291,11 +436,13 @@ async function loadState(overwriteInputs = false) {
         if (manualTotal > 0) extraParts.push(`${manualTotal} 页自用免接管`);
         if (overflowTotal > 0) extraParts.push(`${overflowTotal} 页超上限未接入`);
         if (extraParts.length > 0) {
-          elHeroSub.textContent = extraParts.join(" · ") + ` · 接管上限 ${maxCap} 页`;
+          const capLabel = `接管上限 ${maxCap} 页`;
+          elHeroSub.textContent = extraParts.join(" · ") + ` · ${capLabel}`;
         } else {
+          const inlineCapLabel = `上限 ${maxCap} 页`;
           elHeroSub.textContent = autoSpawnOn
-            ? `新开页面自动接入（上限 ${maxCap} 页），繁忙时可自动扩容`
-            : `新开页面自动接入（上限 ${maxCap} 页），仅用已打开页面`;
+            ? `新开页面自动接入（${inlineCapLabel}），繁忙时可自动扩容`
+            : `新开页面自动接入（${inlineCapLabel}），仅用已打开页面`;
         }
       }
       elTabStatus.textContent = `${managedTotal} / ${maxCap} 页`;
@@ -331,7 +478,7 @@ async function saveSettings() {
     enabled: elEnabled.checked,
     driverMode: elModeSelect.value,
     autoSpawnTabs: elAutoSpawn ? elAutoSpawn.value !== "false" : true,
-    maxParallelTabs: elMaxTabs ? Number(elMaxTabs.value) || 4 : 4,
+    maxParallelTabs: elMaxTabs ? normalizeMaxParallelTabs(elMaxTabs.value, 10) : 10,
     wsUrl: elWsUrl.value.trim() || "ws://127.0.0.1:8000/ws/browser",
     customModelSelector: elModelSel ? elModelSel.value.trim() : "",
     customInputSelector: elInputSel.value.trim(),
@@ -390,7 +537,7 @@ if (elToggleManualBtn) {
       elToggleManualBtn.disabled = true;
       try {
         if (act === "open_manual") {
-          await chrome.runtime.sendMessage({ type: "GEB_POPUP_OPEN_MANUAL_TAB" });
+          await openCleanGeminiTab({ manual: true, active: true });
           window.close();
           return;
         }
@@ -402,6 +549,20 @@ if (elToggleManualBtn) {
         }
       } finally {
         elToggleManualBtn.disabled = false;
+      }
+    })();
+  });
+}
+
+if (elOpenManualTabBtn) {
+  elOpenManualTabBtn.addEventListener("click", () => {
+    void (async () => {
+      elOpenManualTabBtn.disabled = true;
+      try {
+        await openCleanGeminiTab({ manual: true, active: true });
+        window.close();
+      } finally {
+        elOpenManualTabBtn.disabled = false;
       }
     })();
   });
@@ -422,23 +583,77 @@ if (elAutoSpawnCheck) {
   });
 }
 
+function submitCustomParallelTabs() {
+  if (!elCustomTabsInput) return;
+  const parsed = parseCustomParallelTabsInput(elCustomTabsInput.value);
+  if (parsed === null) {
+    if (elErrorBanner) {
+      elErrorBanner.hidden = false;
+      elErrorBanner.textContent = "请输入 1~200 之间的正整数席位数";
+    }
+    elCustomTabsInput.focus();
+    return;
+  }
+  if (elErrorBanner) {
+    elErrorBanner.hidden = true;
+    elErrorBanner.textContent = "";
+  }
+  customCapEditing = false;
+  if (elCustomTabsRow) elCustomTabsRow.hidden = true;
+  ensureSelectHasValue(elMaxTabs, String(parsed));
+  void saveSettings();
+}
+
 if (elMaxTabsSegments) {
   elMaxTabsSegments.addEventListener("click", (ev) => {
     const btn = ev.target && ev.target.closest(".seg-btn");
     if (!btn || btn.disabled) return;
     const val = btn.getAttribute("data-val");
-    if (!val) return;
-    if (elMaxTabs) {
-      let opt = elMaxTabs.querySelector(`option[value="${val}"]`);
-      if (!opt) {
-        opt = document.createElement("option");
-        opt.value = val;
-        opt.textContent = val;
-        elMaxTabs.appendChild(opt);
+    if (val === null || val === "") return;
+    if (val === "custom") {
+      const curNum = elMaxTabs ? normalizeMaxParallelTabs(elMaxTabs.value, 10) : 10;
+      const isPreset = curNum === 1 || curNum === 5 || curNum === 10;
+      if (customCapEditing && elCustomTabsRow && !elCustomTabsRow.hidden) {
+        customCapEditing = false;
+        elCustomTabsRow.hidden = true;
+        syncSegmentUI(curNum, elAutoSpawn ? elAutoSpawn.value !== "false" : true, false);
+        return;
       }
-      elMaxTabs.value = val;
+      customCapEditing = true;
+      if (elCustomTabsRow) elCustomTabsRow.hidden = false;
+      if (elCustomTabsInput) {
+        elCustomTabsInput.value = isPreset ? "" : String(curNum);
+        elCustomTabsInput.focus();
+        if (!isPreset) elCustomTabsInput.select();
+      }
+      syncSegmentUI(curNum, elAutoSpawn ? elAutoSpawn.value !== "false" : true, false);
+      return;
     }
+    customCapEditing = false;
+    if (elCustomTabsRow) elCustomTabsRow.hidden = true;
+    ensureSelectHasValue(elMaxTabs, val);
     void saveSettings();
+  });
+}
+
+if (elCustomTabsApplyBtn) {
+  elCustomTabsApplyBtn.addEventListener("click", () => {
+    submitCustomParallelTabs();
+  });
+}
+
+if (elCustomTabsInput) {
+  elCustomTabsInput.addEventListener("keydown", (ev) => {
+    if (ev.key === "Enter") {
+      ev.preventDefault();
+      submitCustomParallelTabs();
+    } else if (ev.key === "Escape") {
+      ev.preventDefault();
+      customCapEditing = false;
+      if (elCustomTabsRow) elCustomTabsRow.hidden = true;
+      const curNum = elMaxTabs ? normalizeMaxParallelTabs(elMaxTabs.value, 10) : 10;
+      syncSegmentUI(curNum, elAutoSpawn ? elAutoSpawn.value !== "false" : true, false);
+    }
   });
 }
 
@@ -470,7 +685,10 @@ if (spawnBtn) {
 
 if (elOpenVertexBtn) {
   elOpenVertexBtn.addEventListener("click", () => {
-    void chrome.tabs.create({ url: "https://vertexaisearch.cloud.google.com/" });
+    void (async () => {
+      await openCleanGeminiTab({ manual: false, active: true });
+      window.close();
+    })();
   });
 }
 
@@ -497,7 +715,21 @@ document.getElementById("clearLogsBtn").addEventListener("click", () => {
   })();
 });
 
-void loadState(true);
+const popupParams =
+  typeof window !== "undefined" && typeof URLSearchParams === "function"
+    ? new URLSearchParams(window.location?.search || "")
+    : null;
+if (popupParams && popupParams.get("geb_open_manual") === "1") {
+  void (async () => {
+    await openCleanGeminiTab({
+      manual: true,
+      active: popupParams.get("bg") !== "1"
+    });
+    window.close();
+  })();
+} else {
+  void loadState(true);
+}
 setInterval(() => {
   void loadState(false);
 }, 2500);

@@ -1770,6 +1770,9 @@
     );
 
     if (!hasSessionPathInUrl() && beforeReplies === 0) {
+      if (composerAttachmentControls().length > 0) {
+        await clearComposerAttachments("重置会话清理");
+      }
       const existingInput = findComposerInput();
       if (existingInput && (existingInput.innerText || existingInput.value || "").trim()) {
         await fillInputWithPrompt(existingInput, "");
@@ -2809,9 +2812,72 @@
     return sent;
   }
 
+  function resetFileInputs() {
+    for (const inp of querySelectorAllDeep('input[type="file"]')) {
+      try {
+        inp.value = "";
+      } catch (_) {}
+      try {
+        if (typeof DataTransfer === "function" && inp.files && inp.files.length > 0) {
+          inp.files = new DataTransfer().files;
+        }
+      } catch (_) {}
+    }
+  }
+
+  async function clearComposerAttachments(reason = "") {
+    resetFileInputs();
+    let controls = composerAttachmentControls();
+    const initialCount = controls.length;
+    if (initialCount === 0) return 0;
+
+    let activatedTab = false;
+    for (let round = 0; round < 8 && controls.length > 0; round += 1) {
+      if (round === 4 && !activatedTab && Boolean(document.hidden || document.visibilityState === "hidden")) {
+        activatedTab = true;
+        try {
+          await requestBriefTabActivation(200);
+          await sleep(120);
+        } catch (_) {}
+        controls = composerAttachmentControls();
+        if (controls.length === 0) break;
+      }
+      for (const ctrl of controls) {
+        try {
+          const innerBtn =
+            ctrl.shadowRoot &&
+            querySelectorAllDeep('button, [role="button"]', ctrl.shadowRoot).find((el) => !el.disabled);
+          if (round === 0) {
+            ctrl.click();
+          } else if (round === 1 && innerBtn && innerBtn !== ctrl) {
+            innerBtn.click();
+          } else {
+            dispatchRealisticClick(innerBtn || ctrl);
+          }
+        } catch (_) {}
+      }
+      resetFileInputs();
+      controls = composerAttachmentControls();
+      if (controls.length === 0) break;
+      await sleep(round < 2 ? 120 : 180);
+      controls = composerAttachmentControls();
+    }
+
+    if (controls.length > 0) {
+      throw new Error("输入框中残留了前次未提交的附件，自动清理失败，已停止发送，避免把错误文件带入当前请求。");
+    }
+    if (reason !== "silent") {
+      logDriver(
+        "warn",
+        `检测到输入框残留 ${initialCount} 个未提交附件${reason ? ` (${reason})` : ""}，已自动清理干净。`
+      );
+    }
+    return initialCount;
+  }
+
   async function attachFilesToComposer(attachments, onProgress = null) {
     if (composerAttachmentControls().length) {
-      throw new Error("输入框中残留了前次未提交的附件，已停止发送，避免把错误文件带入当前请求。");
+      await clearComposerAttachments("发送前自动清理");
     }
     if (!attachments || attachments.length === 0) return;
     const files = [];
@@ -2906,6 +2972,7 @@
 
     let usedClipboardFallback = false;
     if (input) {
+      resetFileInputs();
       const transfer = buildFileDataTransfer(files);
       try {
         const desc =
@@ -2949,10 +3016,26 @@
       }
       const pending = querySelectorAllDeep('[role="progressbar"],[aria-busy="true"],md-circular-progress,mat-progress-spinner,mat-spinner', composerScope).some(isElementVisible);
       if (pending) sawUploadActivity = true;
-      const curControlCount = composerAttachmentControls().length;
-      if (curControlCount > baselineControlCount) sawUploadActivity = true;
-      const chipAppeared = curControlCount === files.length ||
-        (new Set(files.map((file) => file.name)).size === files.length &&
+      const controlCount = composerAttachmentControls().length;
+      if (controlCount > baselineControlCount) sawUploadActivity = true;
+      if (!pending && controlCount > files.length) {
+        logDriver("warn", `输入框附件数量多于预期 (${controlCount}/${files.length})，正在自动清理并重新挂载当前附件...`);
+        await clearComposerAttachments("重复附件清理");
+        if (input) {
+          const retryTransfer = buildFileDataTransfer(files);
+          input.files = retryTransfer.files;
+          input.dispatchEvent(new Event("change", { bubbles: true, composed: true }));
+        } else {
+          const liveComposer = findComposerInput();
+          const hostEl = liveComposer ? getComposerRootHost(liveComposer) : null;
+          dispatchClipboardPasteAndDropFiles(liveComposer, hostEl, files);
+        }
+        readySince = 0;
+        continue;
+      }
+      const chipAppeared = controlCount === files.length ||
+        (controlCount === 0 &&
+         new Set(files.map((file) => file.name)).size === files.length &&
          files.every((file) => !baselineScopedText.includes(file.name) && scopedText.includes(file.name)));
       if (chipAppeared) sawUploadActivity = true;
       if (!sawUploadActivity && !pending && !usedClipboardFallback && Date.now() - startedAt > 2800) {
@@ -2964,6 +3047,7 @@
       }
       readySince = chipAppeared && !pending ? (readySince || Date.now()) : 0;
       if (readySince && Date.now() - readySince >= 1200) {
+        resetFileInputs();
         logDriver("info", `已上传 ${files.length} 个多模态附件 (${files.map((f) => f.name).join(", ")})。`);
         return;
       }
@@ -3036,8 +3120,16 @@
     timeout_ms: timeoutMs
   }) {
     const mediaGenerationMode = Boolean(imageGeneration || videoGeneration);
-    if (activeJob && !activeJob.cancelled) {
-      stopJob(activeJob);
+    if (activeJob) {
+      if (activeJob.requestId !== requestId) {
+        emitToIsolated({
+          type: "request_error",
+          request_id: requestId,
+          submitted: false,
+          error: "该 Google 标签页仍在处理上一项请求"
+        });
+      }
+      return;
     }
 
     let resolveNetworkComplete;
@@ -3075,7 +3167,6 @@
     let promptSubmitted = false;
     let filledInputInThisJob = false;
     let composerEl = null;
-    let hadPreexistingAttachments = false;
 
     try {
       if (!String(prompt || "").trim()) {
@@ -3126,7 +3217,6 @@
       const baselineReplies = collectAssistantReplyTexts();
       const baselineCount = baselineReplies.length;
       const baselineLastText = baselineCount > 0 ? baselineReplies[baselineCount - 1] : "";
-      hadPreexistingAttachments = composerAttachmentControls().length > 0;
 
       await attachFilesToComposer(attachments, () => {
         lastActivityAt = Date.now();
@@ -3179,7 +3269,12 @@
       });
       if ((attachments || []).length) {
         for (let attempt = 0; attempt < 12 && composerAttachmentControls().length; attempt += 1) await sleep(150);
-        if (composerAttachmentControls().length) throw new Error("提交后仍有附件留在输入框，文件未完整发送，已停止等待错误结果。");
+        if (composerAttachmentControls().length) {
+          try {
+            await clearComposerAttachments("提交后残留清理");
+          } catch (_) {}
+          throw new Error("提交后仍有附件留在输入框，文件未完整发送，已自动清理残留附件并停止等待错误结果。");
+        }
       }
       logDriver("info", `已提交问题 (${sendMethod}, len=${prompt.length})，等待响应流...`);
 
@@ -3342,12 +3437,10 @@
         promptSubmitted = true;
       }
       if (!promptSubmitted) {
-        if (!hadPreexistingAttachments && (attachments || []).length > 0) {
-          for (const ctrl of composerAttachmentControls()) {
-            try {
-              ctrl.click();
-            } catch (_) {}
-          }
+        if (composerAttachmentControls().length > 0) {
+          try {
+            await clearComposerAttachments("任务中断清理");
+          } catch (_) {}
         }
         if (filledInputInThisJob && composerEl) {
           try {
@@ -3393,6 +3486,7 @@
       detectedModelLabel: detectedModel || null,
       activeModel: detectedModel || sharedState.lastSelectedModel || null,
       assistantBlocksCount: replies.length,
+      composerAttachmentsCount: composerAttachmentControls().length,
       capturedRpc: sharedState.lastCapturedRpc
         ? { url: sharedState.lastCapturedRpc.url.slice(0, 120), capturedAt: sharedState.lastCapturedRpc.capturedAt }
         : null,
@@ -3537,6 +3631,8 @@
     findComposerInput,
     findSendButton,
     fillInputWithPrompt,
+    composerAttachmentControls,
+    clearComposerAttachments,
     attachImagesToComposer,
     attachFilesToComposer,
     submitComposer,

@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import base64
+import json
 from pathlib import Path
 import time
 import uuid
@@ -85,6 +86,12 @@ async def generate_images(
             file_meta = file_store.save(
                 norm_raw, filename=name, declared_mime=mime, purpose="assistants_output", tenant_id=eff_tenant
             )
+        owners_dir = output_dir / ".img_owners"
+        owners_dir.mkdir(parents=True, exist_ok=True)
+        (owners_dir / f"{name}.json").write_text(
+            json.dumps({"tenant_id": eff_tenant, "file_id": file_meta["id"] if file_meta else ""}, ensure_ascii=False),
+            encoding="utf-8",
+        )
         if payload.get("response_format") == "url":
             entry = {"url": f"{eff_base}/v1/images/files/{name}", "mime_type": mime}
         else:

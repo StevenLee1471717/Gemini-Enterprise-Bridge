@@ -51,3 +51,30 @@ await ctx.handleBackendCommand({type:'execute_prompt_chunk', request_id:'missing
 await ctx.handleBackendCommand({type:'execute_prompt', request_id:'missing-chunk', tab_id:1, chunked:true, total_chunks:2});
 assert.match(sent.find(e => e.type === 'request_error' && e.request_id === 'missing-chunk').error, /分段/);
 console.log('PASS: incomplete input chunks fail before page submission');
+
+const pageMessages = [];
+chrome.tabs.sendMessage = async (tabId, message) => {
+  pageMessages.push({tabId, ...message});
+  return {ok:true};
+};
+let continuePreparation;
+const realPrepare = ctx.prepareTabForBackgroundExecution;
+ctx.prepareTabForBackgroundExecution = (tab) => new Promise(resolve => {
+  continuePreparation = () => resolve(tab);
+});
+const waiting = ctx.handleBackendCommand({type:'execute_prompt', request_id:'cancel-during-prepare', tab_id:1, prompt:'hello'});
+await new Promise(resolve => setImmediate(resolve));
+assert.ok(continuePreparation);
+await ctx.handleBackendCommand({type:'execute_prompt', request_id:'cancel-during-prepare', tab_id:1, prompt:'hello'});
+await ctx.handleBackendCommand({type:'execute_prompt', request_id:'other-request', tab_id:1, prompt:'different'});
+assert.match(sent.find(e => e.type === 'request_error' && e.request_id === 'other-request').error, /上一项请求/);
+assert.equal(sent.filter(e => e.type === 'request_ack' && e.request_id === 'cancel-during-prepare').length, 1);
+await ctx.handleBackendCommand({type:'cancel_request', request_id:'cancel-during-prepare', tab_id:99});
+continuePreparation();
+await waiting;
+assert.ok(!pageMessages.some(e => e.type === 'GEB_EXECUTE_PROMPT' && e.request_id === 'cancel-during-prepare'));
+assert.equal(pageMessages.find(e => e.type === 'GEB_CANCEL_REQUEST').tabId, 1);
+ctx.prepareTabForBackgroundExecution = realPrepare;
+await ctx.handleBackendCommand({type:'execute_prompt', request_id:'after-cancel', tab_id:1, prompt:'new'});
+assert.ok(pageMessages.some(e => e.type === 'GEB_EXECUTE_PROMPT' && e.request_id === 'after-cancel'));
+console.log('PASS: a preparing request reserves its tab, cancellation prevents late submission and releases the tab');

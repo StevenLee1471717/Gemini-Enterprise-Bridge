@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import collections
 import contextlib
 import hashlib
 import logging
@@ -13,6 +14,7 @@ import secrets
 import time
 import urllib.parse
 import uuid
+import weakref
 from dataclasses import dataclass, field
 from typing import Any, AsyncIterator, Callable, Dict, List, Optional, Sequence, Set
 
@@ -35,6 +37,47 @@ class BridgeTimeoutError(TimeoutError):
 
 class BridgeExecutionError(RuntimeError):
     """Raised when the browser driver reports an execution failure."""
+
+
+class _DynamicParallelLimiter:
+    """FIFO async concurrency gate supporting runtime cap changes (1..200)."""
+
+    def __init__(self, cap_getter: Callable[[], int]) -> None:
+        self._cap_getter = cap_getter
+        self._in_use = 0
+        self._waiters: collections.deque[asyncio.Future[None]] = collections.deque()
+
+    def _can_acquire(self) -> bool:
+        cap = max(1, int(self._cap_getter()))
+        return self._in_use < cap
+
+    def wake_waiters(self) -> None:
+        while self._waiters and self._can_acquire():
+            fut = self._waiters.popleft()
+            if not fut.done():
+                self._in_use += 1
+                fut.set_result(None)
+
+    async def acquire(self) -> bool:
+        if not self._waiters and self._can_acquire():
+            self._in_use += 1
+            return True
+        fut: asyncio.Future[None] = asyncio.get_running_loop().create_future()
+        self._waiters.append(fut)
+        try:
+            await fut
+            return True
+        except BaseException:
+            with contextlib.suppress(ValueError):
+                self._waiters.remove(fut)
+            if fut.done() and not fut.cancelled():
+                self._in_use -= 1
+            self.wake_waiters()
+            raise
+
+    def release(self) -> None:
+        self._in_use = max(0, self._in_use - 1)
+        self.wake_waiters()
 
 
 def make_slot_key(client_id: str, tab_id: Optional[int]) -> str:
@@ -73,6 +116,7 @@ class WorkerSlot:
     last_dispatch_submitted: bool = False
     last_dispatch_tab_reset: bool = False
     lock: asyncio.Lock = field(default_factory=asyncio.Lock)
+    seat_index: Optional[int] = None
 
     @property
     def is_busy(self) -> bool:
@@ -83,6 +127,7 @@ class WorkerSlot:
             "slot_key": self.slot_key,
             "client_id": self.client_id,
             "tab_id": self.tab_id,
+            "seat_index": self.seat_index,
             "tab_url": self.tab_url,
             "tab_title": self.tab_title,
             "tab_ready": self.tab_ready,
@@ -193,14 +238,15 @@ class BrowserBridgeHub:
         self,
         include_citations: bool = True,
         callback_base_url: str = "",
-        max_parallel_tabs: int = 6,
+        max_parallel_tabs: int = 10,
         auto_spawn_tabs: bool = True,
         session_affinity_ttl_seconds: float = 300.0,
         backend_version: str = APP_VERSION,
     ) -> None:
         self.include_citations = include_citations
         self.callback_base_url = callback_base_url.rstrip("/")
-        self.max_parallel_tabs = max(1, max_parallel_tabs)
+        parsed_cap = int(max_parallel_tabs)
+        self.max_parallel_tabs = 10 if parsed_cap <= 0 else min(200, parsed_cap)
         self.auto_spawn_tabs = auto_spawn_tabs
         self.session_affinity_ttl_seconds = max(0.0, session_affinity_ttl_seconds)
         self.backend_version = normalize_version(backend_version) or APP_VERSION
@@ -221,7 +267,9 @@ class BrowserBridgeHub:
         self._pending_opens: Dict[str, asyncio.Future[Dict[str, Any]]] = {}
         self._staged_attachments: Dict[str, StagedAttachment] = {}
         self._routing_lock = asyncio.Lock()
-        self._parallel_limit = asyncio.Semaphore(self.max_parallel_tabs)
+        self._thread_locks: weakref.WeakValueDictionary[str, asyncio.Lock] = weakref.WeakValueDictionary()
+        self._parallel_limit = _DynamicParallelLimiter(self._effective_global_tab_cap)
+
         self._total_requests = 0
         self._total_errors = 0
         self._recent_logs: List[Dict[str, Any]] = []
@@ -337,6 +385,38 @@ class BrowserBridgeHub:
             if mapped == slot.slot_key:
                 self._session_affinity.pop(sid, None)
 
+    def evict_tenant_slots(self, tenant_id: str, *, abort_inflight: bool = False) -> Dict[str, int]:
+        eff_tid = (tenant_id or "").strip()
+        if not eff_tid:
+            return {"evicted_slots": 0, "aborted_requests": 0}
+        evicted_slots = 0
+        aborted_reqs = 0
+        prefix = f"{eff_tid}::"
+        for sid in list(self._session_affinity.keys()):
+            if sid.startswith(prefix):
+                self._session_affinity.pop(sid, None)
+        for slot in list(self._slots.values()):
+            slot_belongs = slot.owner_tenant_id == eff_tid or (
+                bool(slot.pinned_session_id) and slot.pinned_session_id.startswith(prefix)
+            )
+            if not slot_belongs:
+                continue
+            if abort_inflight:
+                for req_id, inflight in list(self._pending.items()):
+                    if inflight.slot_key == slot.slot_key:
+                        inflight.events.put_nowait(
+                            {
+                                "type": "error",
+                                "message": "管理员已断开或重置当前客户端会话连接。",
+                            }
+                        )
+                        self._pending.pop(req_id, None)
+                        aborted_reqs += 1
+            if not slot.is_busy or abort_inflight:
+                self._evict_slot_binding(slot)
+                evicted_slots += 1
+        return {"evicted_slots": evicted_slots, "aborted_requests": aborted_reqs}
+
     def clear_slot_affinity_only(self, slot: WorkerSlot) -> None:
         old_sid = slot.pinned_session_id
         slot.pinned_session_id = None
@@ -394,7 +474,8 @@ class BrowserBridgeHub:
         state = self._clients.get(client_id)
         seen_keys: Set[str] = set()
 
-        for item in tabs_payload:
+        # The extension uses this same tab order for the numbers shown in Chrome.
+        for seat_index, item in enumerate(tabs_payload, start=1):
             if not isinstance(item, dict):
                 continue
             raw_tid = item.get("tab_id") if item.get("tab_id") is not None else item.get("id")
@@ -408,6 +489,7 @@ class BrowserBridgeHub:
                 active_model=str(item.get("active_model") or ""),
                 captured_rpc=item.get("captured_rpc") if "captured_rpc" in item else None,
             )
+            slot.seat_index = seat_index
             seen_keys.add(slot.slot_key)
 
         # Prune slots belonging to `client_id` that were closed in the browser
@@ -678,25 +760,36 @@ class BrowserBridgeHub:
             c.transport == "websocket" and c.is_alive(now) and "spawn_tab" in c.capabilities
             for c in self._clients.values()
         )
+        live_count = len(slots) if slots else (1 if active is not None else 0)
         if can_spawn:
             return max(min(len(slots), eff_max), eff_max)
-        live_count = len(slots) if slots else (1 if active is not None else 0)
         return min(live_count, eff_max)
 
     def status_snapshot(self) -> Dict[str, Any]:
         self._prune_stale_http_clients()
         now = time.time()
-        alive_states = [c for c in self._clients.values() if c.is_alive(now)]
-        clients = [c.to_public_dict() for c in alive_states]
+        alive_clients = [c for c in self._clients.values() if c.is_alive(now)]
+        clients = [c.to_public_dict() for c in alive_clients]
         slots = self._get_alive_ready_slots()
         active = self.select_active_client()
-        effective_max_tabs = (
-            self._effective_client_tab_cap(active) if active is not None else self.max_parallel_tabs
+        reported_client_cap = (
+            active.client_max_parallel_tabs
+            if active is not None
+            else next(
+                (c.client_max_parallel_tabs for c in alive_clients if c.client_max_parallel_tabs is not None),
+                None,
+            )
         )
+        effective_max_tabs = (
+            self._effective_client_tab_cap(active)
+            if active is not None
+            else self._effective_global_tab_cap()
+        )
+        parallel_cap = min(len(slots), effective_max_tabs)
         busy_slots = sum(1 for s in slots if s.is_busy)
         waiting_total = sum(s.waiting_count for s in slots)
         connected_ext_ver = ""
-        for st in alive_states:
+        for st in alive_clients:
             if st.extension_version and (
                 not connected_ext_ver
                 or compare_semver(st.extension_version, connected_ext_ver) > 0
@@ -712,15 +805,19 @@ class BrowserBridgeHub:
             "backend_update_required": backend_update_required,
             "active_client": active.to_public_dict() if active else None,
             "clients": clients,
-            "worker_slots": [s.to_public_dict() for s in slots],
-            "parallel_capacity": min(len(slots), effective_max_tabs),
+            "worker_slots": [
+                {**s.to_public_dict(), "codex_activity_owner": not self._is_duplicate_session_slot(s, now)}
+                for s in slots
+            ],
+            "parallel_capacity": parallel_cap,
             "connected_tabs": len(slots),
             "max_parallel_tabs": effective_max_tabs,
-            "client_max_parallel_tabs": active.client_max_parallel_tabs if active is not None else None,
+            "unlimited_parallel_tabs": False,
+            "client_max_parallel_tabs": reported_client_cap,
             "server_max_parallel_tabs": self.max_parallel_tabs,
             "auto_spawn_tabs": self.auto_spawn_tabs,
             "active_slots_busy": busy_slots,
-            "busy": len(self._pending) >= min(len(slots), effective_max_tabs) > 0,
+            "busy": len(self._pending) >= parallel_cap > 0,
             "queued_requests": waiting_total,
             "in_flight_requests": len(self._pending),
             "total_requests": self._total_requests,
@@ -760,7 +857,7 @@ class BrowserBridgeHub:
                 fut.set_result(data)
             return None
 
-        if msg_type == "reload_extension_ack":
+        if msg_type in {"reload_extension_ack", "set_max_parallel_tabs_ack"}:
             return None
 
         if msg_type in {"hello", "tab_status", "heartbeat"}:
@@ -810,7 +907,11 @@ class BrowserBridgeHub:
                                 emit_ext_reload = True
                 if data.get("max_parallel_tabs") is not None:
                     try:
-                        state.client_max_parallel_tabs = max(1, int(data["max_parallel_tabs"]))
+                        raw_cap = int(data["max_parallel_tabs"])
+                        state.client_max_parallel_tabs = (
+                            self.max_parallel_tabs if raw_cap <= 0 else min(200, raw_cap)
+                        )
+                        self._parallel_limit.wake_waiters()
                     except (TypeError, ValueError):
                         pass
                 if data.get("driver_mode"):
@@ -1011,15 +1112,28 @@ class BrowserBridgeHub:
     # ------------------------------------------------------------------
 
     def _effective_client_tab_cap(self, client: BrowserClientState) -> int:
-        if client.client_max_parallel_tabs is not None:
-            return min(self.max_parallel_tabs, client.client_max_parallel_tabs)
+        if client.client_max_parallel_tabs is not None and client.client_max_parallel_tabs > 0:
+            return min(200, client.client_max_parallel_tabs)
+        return self.max_parallel_tabs
+
+    def _effective_global_tab_cap(self) -> int:
+        now = time.time()
+        explicit_clients = [
+            c for c in self._clients.values() if c.is_alive(now) and c.client_max_parallel_tabs is not None
+        ]
+        if explicit_clients:
+            return sum(self._effective_client_tab_cap(c) for c in explicit_clients)
+        active = self.select_active_client()
+        if active is not None:
+            return self._effective_client_tab_cap(active)
         return self.max_parallel_tabs
 
     def _find_spawnable_client(self, ready_slots: Sequence[WorkerSlot]) -> Optional[tuple[BrowserClientState, str]]:
         """Find a connected WS extension client capable of spawning another background Vertex tab."""
         if not self.auto_spawn_tabs:
             return None
-        if len(ready_slots) + sum(c.spawning_count for c in self._clients.values()) >= self.max_parallel_tabs:
+        global_cap = self._effective_global_tab_cap()
+        if len(ready_slots) + sum(c.spawning_count for c in self._clients.values()) >= global_cap:
             return None
         now = time.time()
         for client in self._clients.values():
@@ -1061,15 +1175,9 @@ class BrowserBridgeHub:
         }
         if preserve_session_url:
             payload["preserve_session_url"] = True
-        sent = await self._safe_ws_send(
-            client,
-            payload,
-        )
-        if not sent:
-            self._pending_spawns.pop(spawn_id, None)
-            return None
-
         try:
+            if not await self._safe_ws_send(client, payload):
+                return None
             res = await asyncio.wait_for(fut, timeout=30.0)
         except asyncio.TimeoutError:
             self.add_log("warn", f"Auto-spawn tab timed out ({spawn_id}); falling back to existing pool", client.client_id)
@@ -1097,7 +1205,21 @@ class BrowserBridgeHub:
         self.add_log("info", f"Parallel worker tab #{slot.tab_id} ready ({slot.slot_key})", client.client_id)
         return slot
 
+    def _is_duplicate_session_slot(self, slot: WorkerSlot, now: float) -> bool:
+        sid = slot.pinned_session_id
+        mapped_key = self._session_affinity.get(sid) if sid else None
+        if not mapped_key or mapped_key == slot.slot_key:
+            return False
+        owner = self._slots.get(mapped_key)
+        if owner is None or owner.pinned_session_id != sid or not owner.tab_ready:
+            return False
+        client = self._clients.get(owner.client_id)
+        return client is not None and client.is_alive(now)
+
     def _is_slot_codex_active(self, slot: WorkerSlot, now: Optional[float] = None) -> bool:
+        ts = time.time() if now is None else now
+        if self._is_duplicate_session_slot(slot, ts):
+            return ts < slot.pending_tool_call_until
         if self.is_slot_session_active is None:
             return False
         try:
@@ -1284,6 +1406,30 @@ class BrowserBridgeHub:
                     reloaded.append(cid)
         return {"ok": len(reloaded) > 0, "reloaded_clients": reloaded}
 
+    async def set_max_parallel_tabs(self, max_parallel_tabs: int) -> Dict[str, Any]:
+        parsed = int(max_parallel_tabs)
+        if parsed < 1 or parsed > 200:
+            raise ValueError("席位上限范围应为 1~200")
+        norm = parsed
+        self.max_parallel_tabs = norm
+        notified: List[str] = []
+        for cid, client in list(self._clients.items()):
+            client.client_max_parallel_tabs = norm
+            if client.transport == "websocket" and client.websocket is not None:
+                if await self._safe_ws_send(
+                    client,
+                    {"type": "set_max_parallel_tabs", "max_parallel_tabs": norm},
+                ):
+                    notified.append(cid)
+        self._parallel_limit.wake_waiters()
+        self.add_log("info", f"工作席位上限已调整为：{norm} 席")
+        return {
+            "ok": True,
+            "max_parallel_tabs": norm,
+            "unlimited": False,
+            "notified_clients": notified,
+        }
+
     def get_affinity_slot_key(self, explicit_session_id: Optional[str]) -> Optional[str]:
         if not explicit_session_id:
             return None
@@ -1320,6 +1466,17 @@ class BrowserBridgeHub:
     ) -> bool:
         if now < slot.pending_tool_call_until:
             return True
+        if (
+            self.session_affinity_ttl_seconds > 0
+            and slot.owner_tenant_id
+            and slot.owner_tenant_id != "host"
+            and not slot.is_busy
+            and slot.waiting_count == 0
+            and slot.last_used_at > 0.0
+            and (now - slot.last_used_at) > self.session_affinity_ttl_seconds
+        ):
+            self._evict_slot_binding(slot)
+            return False
         if slot.owner_tenant_id and requester_tenant_id and slot.owner_tenant_id != requester_tenant_id:
             return True
         if slot.pinned_session_id and slot.pinned_session_id != explicit_session_id:
@@ -1338,9 +1495,47 @@ class BrowserBridgeHub:
         preferred_session_url: Optional[str] = None,
         ephemeral_probe: bool = False,
         tenant_id: str = "host",
+        avoid_affinity_slot: bool = False,
+        strict_session_affinity: bool = False,
     ) -> AsyncIterator[WorkerSlot]:
         """Atomically select/spawn and lock an isolated `WorkerSlot` for parallel execution."""
-        queue_deadline = asyncio.get_running_loop().time() + queue_timeout
+        loop = asyncio.get_running_loop()
+        queue_deadline = loop.time() + queue_timeout
+        thread_lock = None
+        if strict_session_affinity and explicit_session_id and not (ephemeral_aux or ephemeral_probe):
+            thread_lock = self._thread_locks.get(explicit_session_id)
+            if thread_lock is None:
+                thread_lock = self._thread_locks[explicit_session_id] = asyncio.Lock()
+            try:
+                await asyncio.wait_for(thread_lock.acquire(), timeout=max(0, queue_deadline - loop.time()))
+            except asyncio.TimeoutError as exc:
+                self._total_errors += 1
+                raise BridgeTimeoutError(f"等待同一 Codex 会话的上一轮执行结束超时（>{queue_timeout:.0f}s）。") from exc
+        try:
+            async with self._acquire_slot(
+                explicit_session_id, matching_slot_keys, queue_deadline, queue_timeout,
+                ephemeral_aux, preferred_session_url, ephemeral_probe, tenant_id,
+                avoid_affinity_slot and thread_lock is None, thread_lock is not None,
+            ) as slot:
+                yield slot
+        finally:
+            if thread_lock is not None:
+                thread_lock.release()
+
+    @contextlib.asynccontextmanager
+    async def _acquire_slot(
+        self,
+        explicit_session_id: Optional[str],
+        matching_slot_keys: Optional[Sequence[str]],
+        queue_deadline: float,
+        queue_timeout: float,
+        ephemeral_aux: bool,
+        preferred_session_url: Optional[str],
+        ephemeral_probe: bool,
+        tenant_id: str,
+        avoid_affinity_slot: bool,
+        strict_session_affinity: bool,
+    ) -> AsyncIterator[WorkerSlot]:
         chosen: Optional[WorkerSlot] = None
         spawn_target: Optional[tuple[BrowserClientState, str]] = None
         is_ephemeral = bool(ephemeral_aux or ephemeral_probe)
@@ -1376,24 +1571,58 @@ class BrowserBridgeHub:
 
             ready_map = {s.slot_key: s for s in ready_slots}
             now = time.time()
+            in_flight_or_waiting = sum(
+                1 for s in ready_slots if s.is_busy or s.waiting_count > 0
+            ) + sum(c.spawning_count for c in self._clients.values())
+            eff_global_cap = self._effective_global_tab_cap()
+            has_parallel_headroom = (eff_global_cap == 0) or (in_flight_or_waiting < eff_global_cap)
+            busy_affinity_cand: Optional[WorkerSlot] = None
+
+            valid_matches = (
+                [
+                    ready_map[k]
+                    for k in matching_slot_keys
+                    if k in ready_map
+                    and (not strict_session_affinity or ready_map[k].pinned_session_id == effective_session_id)
+                    and (
+                        not ready_map[k].owner_tenant_id
+                        or not effective_tenant_id
+                        or ready_map[k].owner_tenant_id == effective_tenant_id
+                    )
+                ]
+                if matching_slot_keys
+                else []
+            )
+            idle_matches = [
+                s for s in valid_matches if not s.is_busy and s.waiting_count == 0
+            ]
 
             # 1) Explicit session_id affinity (`X-Session-Id` / `session_id` / `model@session`)
             aff_key = self.get_affinity_slot_key(effective_session_id)
+            if strict_session_affinity and aff_key and aff_key not in ready_map and self._slots[aff_key].is_busy:
+                raise BridgeUnavailableError("此 Codex 会话的浏览器页面正在工作，但暂时无法连接，请稍后重试。")
             if aff_key in ready_map:
                 cand = ready_map[aff_key]
                 if not cand.owner_tenant_id or not effective_tenant_id or cand.owner_tenant_id == effective_tenant_id:
-                    chosen = cand
-                    reused_existing_session = True
+                    if strict_session_affinity:
+                        chosen = cand
+                        reused_existing_session = True
+                    elif not cand.is_busy and cand.waiting_count == 0 and not avoid_affinity_slot:
+                        chosen = idle_matches[0] if (idle_matches and cand not in idle_matches) else cand
+                        reused_existing_session = True
+                    else:
+                        busy_affinity_cand = cand
 
             # 2) Multi-turn conversation history prefix affinity (`matching_slot_keys`)
-            if chosen is None and matching_slot_keys:
-                valid_matches = [ready_map[k] for k in matching_slot_keys if k in ready_map]
-                if valid_matches:
-                    idle_matches = [
-                        s for s in valid_matches if not s.is_busy and s.waiting_count == 0
-                    ]
-                    chosen = idle_matches[0] if idle_matches else valid_matches[0]
+            if chosen is None and valid_matches:
+                if idle_matches:
+                    chosen = idle_matches[0]
                     reused_existing_session = True
+                elif not has_parallel_headroom:
+                    chosen = valid_matches[0]
+                    reused_existing_session = True
+                elif busy_affinity_cand is None:
+                    busy_affinity_cand = valid_matches[0]
 
             # 2.5) Live tab already sitting on the target archived `/r/session/<id>` URL
             if chosen is None and preferred_vsid:
@@ -1402,13 +1631,18 @@ class BrowserBridgeHub:
                     for s in ready_slots
                     if extract_vertex_session_id(s.tab_url) == preferred_vsid
                     and (not s.owner_tenant_id or not effective_tenant_id or s.owner_tenant_id == effective_tenant_id)
+                    and (not strict_session_affinity or s.pinned_session_id in (None, effective_session_id))
                 ]
                 if url_matches:
                     idle_url_matches = [
                         s for s in url_matches if not s.is_busy and s.waiting_count == 0
                     ]
-                    chosen = idle_url_matches[0] if idle_url_matches else url_matches[0]
-                    reused_existing_session = True
+                    if idle_url_matches:
+                        chosen = idle_url_matches[0]
+                        reused_existing_session = True
+                    elif not has_parallel_headroom:
+                        chosen = url_matches[0]
+                        reused_existing_session = True
 
             # 3) Truly blank/unoccupied idle slot not holding any prior conversation
             if chosen is None:
@@ -1417,6 +1651,7 @@ class BrowserBridgeHub:
                     for s in ready_slots
                     if not s.is_busy
                     and s.waiting_count == 0
+                    and not (avoid_affinity_slot and s.slot_key == aff_key)
                     and not self._is_slot_holding_protected_session(
                         s, effective_session_id, now, requester_tenant_id=effective_tenant_id
                     )
@@ -1450,9 +1685,25 @@ class BrowserBridgeHub:
 
             # 5) Pool at max_parallel_tabs (or spawn unavailable): pick true LRU idle slot, else least-loaded busy slot
             if chosen is None and spawn_target is None:
-                chosen = self._select_fallback_slot(
-                    ready_slots, now, requester_tenant_id=effective_tenant_id or "host"
+                fallback_pool = (
+                    [s for s in ready_slots if s.slot_key != aff_key]
+                    if (avoid_affinity_slot and len(ready_slots) > 1)
+                    else ready_slots
                 )
+                fallback = self._select_fallback_slot(
+                    fallback_pool, now, requester_tenant_id=effective_tenant_id or "host"
+                )
+                if (
+                    busy_affinity_cand is not None
+                    and not avoid_affinity_slot
+                    and (fallback.is_busy or fallback.waiting_count > 0)
+                    and (busy_affinity_cand.waiting_count + (1 if busy_affinity_cand.is_busy else 0))
+                    <= (fallback.waiting_count + (1 if fallback.is_busy else 0))
+                ):
+                    chosen = busy_affinity_cand
+                    reused_existing_session = True
+                else:
+                    chosen = fallback
 
             if chosen is not None:
                 chosen.waiting_count += 1
@@ -1460,7 +1711,9 @@ class BrowserBridgeHub:
                     reused_existing_session
                     or (not chosen.is_busy and chosen.waiting_count == 1 and not self._is_slot_occupied(chosen))
                 ):
-                    self._session_affinity[effective_session_id] = chosen.slot_key
+                    existing_aff = self.get_affinity_slot_key(effective_session_id)
+                    if existing_aff is None or existing_aff == chosen.slot_key or reused_existing_session:
+                        self._session_affinity[effective_session_id] = chosen.slot_key
                     chosen.pinned_session_id = effective_session_id
                     if effective_tenant_id:
                         chosen.owner_tenant_id = effective_tenant_id
@@ -1503,7 +1756,9 @@ class BrowserBridgeHub:
                     reused_existing_session
                     or (not chosen.is_busy and chosen.waiting_count == 1 and not self._is_slot_occupied(chosen))
                 ):
-                    self._session_affinity[effective_session_id] = chosen.slot_key
+                    existing_aff = self.get_affinity_slot_key(effective_session_id)
+                    if existing_aff is None or existing_aff == chosen.slot_key or reused_existing_session:
+                        self._session_affinity[effective_session_id] = chosen.slot_key
                     chosen.pinned_session_id = effective_session_id
                     if effective_tenant_id:
                         chosen.owner_tenant_id = effective_tenant_id
@@ -1553,7 +1808,9 @@ class BrowserBridgeHub:
                 )):
                     self._evict_slot_binding(chosen)
                 if effective_session_id:
-                    self._session_affinity[effective_session_id] = chosen.slot_key
+                    existing_aff = self.get_affinity_slot_key(effective_session_id)
+                    if strict_session_affinity or existing_aff is None or existing_aff == chosen.slot_key or reused_existing_session:
+                        self._session_affinity[effective_session_id] = chosen.slot_key
                     chosen.pinned_session_id = effective_session_id
                 if effective_tenant_id:
                     chosen.owner_tenant_id = effective_tenant_id
@@ -2000,9 +2257,11 @@ class BrowserBridgeHub:
 
     async def _send_command_to_client(self, client: BrowserClientState, command: Dict[str, Any]) -> None:
         if client.transport == "websocket":
+            websocket = client.websocket
             ok = await self._safe_ws_send(client, command)
             if not ok:
-                self.unregister_client(client.client_id, reason="ws_send_failed")
+                if websocket is not None:
+                    self.unregister_client(client.client_id, reason="ws_send_failed", websocket=websocket)
                 raise BridgeUnavailableError("浏览器扩展 WebSocket 发送失败，连接已断开。")
         else:
             await client.command_queue.put(command)

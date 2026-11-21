@@ -29,6 +29,8 @@ def _make_app(tmp_path: Path, **overrides: Any):
         generated_dir=str(tmp_path / "generated"),
         response_store_dir=str(tmp_path / "responses"),
         distribution_path=str(tmp_path / "generated" / "client_distribution.json"),
+        tunnel_state_path=str(tmp_path / "generated" / "tunnel_state.json"),
+        usage_ledger_path=str(tmp_path / "generated" / "usage_ledger.json"),
     )
     defaults.update(overrides)
     return create_app(BridgeSettings(**defaults))
@@ -53,8 +55,11 @@ def test_localhost_keyless_vs_public_tunnel_boundary_and_admin_lockdown(tmp_path
 
         dist_file = tmp_path / "generated" / "client_distribution.json"
         assert dist_file.exists()
-        expected_mode = 0o666 if os.name == "nt" else 0o600
-        assert (dist_file.stat().st_mode & 0o777) == expected_mode
+        dist_mode = dist_file.stat().st_mode & 0o777
+        if os.name == "nt":
+            assert (dist_mode & 0o600) == 0o600
+        else:
+            assert dist_mode == 0o600
 
         # 2) Public tunnel / reverse proxy headers WITHOUT key -> 401 on /v1/*
         for proxy_headers in (
@@ -140,7 +145,7 @@ def test_client_lifecycle_model_whitelist_rotation_and_pause(tmp_path: Path) -> 
         models_resp = client.get("/v1/models", headers=ext_headers)
         assert models_resp.status_code == 200
         model_ids = [m["id"] for m in models_resp.json()["data"]]
-        assert set(model_ids) == {"gemini-4-argon", "gemini-4-argon-newchat"}
+        assert set(model_ids) == {"gemini-4-argon"}
 
         # Calling disallowed model fails immediately with 403 model_not_allowed
         denied = client.post(
@@ -509,3 +514,210 @@ def test_fair_scheduler_rpm_and_daily_quotas(tmp_path: Path) -> None:
     with pytest.raises(Exception) as day_exc:
         asyncio.run(try_over_daily())
     assert getattr(day_exc.value, "code", None) == "daily_quota_exceeded"
+
+
+def test_fine_grained_quotas_expiry_ip_allowlist_and_audit_ledger(tmp_path: Path) -> None:
+    app = _make_app(tmp_path)
+    with TestClient(app) as client:
+        # 1) Create client with IP allowlist, daily USD budget, and total token cap
+        res = client.post(
+            "/api/distribution/clients",
+            json={
+                "name": "受限测试客",
+                "max_concurrency": 2,
+                "rpm_limit": 30,
+                "daily_cost_limit_usd": 0.05,
+                "total_token_limit": 50000,
+                "allowed_ips": ["203.0.113.0/24", "198.51.100.9"],
+            },
+        )
+        assert res.status_code == 200
+        c_obj = res.json()["client"]
+        cid = c_obj["client_id"]
+        ckey = c_obj["api_key"]
+        tid = f"client:{cid}"
+
+        # Disallowed IP -> 403 ip_not_allowed and recorded in audit log
+        bad_ip = client.post(
+            "/v1/chat/completions",
+            headers={
+                "CF-Connecting-IP": "192.0.2.88",
+                "Authorization": f"Bearer {ckey}",
+            },
+            json={"model": "gemini-4-carbon", "messages": [{"role": "user", "content": "测试 IP 拦截"}]},
+        )
+        assert bad_ip.status_code == 403
+        assert bad_ip.json()["error"]["code"] == "ip_not_allowed"
+
+        # Allowed CIDR IP -> passes auth on /v1/models
+        good_ip = client.get(
+            "/v1/models",
+            headers={
+                "CF-Connecting-IP": "203.0.113.42",
+                "Authorization": f"Bearer {ckey}",
+            },
+        )
+        assert good_ip.status_code == 200
+
+        # Simulate exceeding daily_cost_limit_usd ($0.05)
+        p_obj = RequestPrincipal(tenant_id=tid, client_id=cid, name="受限测试客", is_host=False, is_direct_local=False, client_ip="203.0.113.42")
+        app.state.distribution.record_usage(p_obj, prompt_tokens=1000, completion_tokens=500, cost_usd=0.06, model="gemini-4-carbon")
+        app.state.usage_ledger.record_request(
+            requested_model="gemini-4-carbon",
+            prompt_tokens=1000,
+            completion_tokens=500,
+            tenant_id=tid,
+            tenant_name="客户端 · 受限测试客",
+            client_ip="203.0.113.42",
+            prompt_preview="帮我检查接口预算",
+            reply_preview="预算测试完成",
+        )
+
+        over_budget = client.post(
+            "/v1/chat/completions",
+            headers={"CF-Connecting-IP": "203.0.113.42", "Authorization": f"Bearer {ckey}"},
+            json={"model": "gemini-4-carbon", "messages": [{"role": "user", "content": "超预算请求"}]},
+        )
+        assert over_budget.status_code == 429
+        assert over_budget.json()["error"]["code"] == "daily_quota_exceeded"
+
+        # Reset daily quota via admin endpoint -> immediately clears today's counters
+        rst = client.post(f"/api/distribution/clients/{cid}/reset-quota", json={"reset_total": False})
+        assert rst.status_code == 200
+        assert rst.json()["client"]["today_cost_usd"] == 0.0
+        assert rst.json()["client"]["total_tokens"] == 1500
+
+        # Expired key -> 403 client_expired
+        exp_patch = client.patch(
+            f"/api/distribution/clients/{cid}",
+            json={"expires_at": int(time.time()) - 60},
+        )
+        assert exp_patch.status_code == 200
+        assert exp_patch.json()["client"]["expired"] is True
+
+        exp_call = client.get(
+            "/v1/models",
+            headers={"CF-Connecting-IP": "203.0.113.42", "Authorization": f"Bearer {ckey}"},
+        )
+        assert exp_call.status_code == 403
+        assert exp_call.json()["error"]["code"] == "client_expired"
+
+        # Verify per-tenant ledger & rejected request audit records
+        usage_snap = client.get("/api/usage").json()["usage"]
+        assert tid in usage_snap["by_tenant"]
+        ten_stat = usage_snap["by_tenant"][tid]
+        assert ten_stat["summary"]["requests"] == 1
+        assert ten_stat["errors"] >= 2
+        audit_codes = {r.get("error_code") for r in usage_snap["recent_requests"] if r.get("tenant_id") == tid}
+        assert "ip_not_allowed" in audit_codes
+        assert "daily_quota_exceeded" in audit_codes
+
+
+def test_cross_tenant_generated_image_isolation_sessions_and_disconnect(tmp_path: Path) -> None:
+    import base64
+    from media_outputs import persist_browser_outputs
+
+    app = _make_app(tmp_path)
+    with TestClient(app) as client:
+        ca = client.post("/api/distribution/clients", json={"name": "客户甲"}).json()["client"]
+        cb = client.post("/api/distribution/clients", json={"name": "客户乙"}).json()["client"]
+        tid_a = f"client:{ca['client_id']}"
+
+        # 1) Persist a generated PNG owned by Client A
+        tiny_png = (
+            b"\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR\x00\x00\x00\x01\x00\x00\x00\x01"
+            b"\x08\x06\x00\x00\x00\x1f\x15\xc4\x89\x00\x00\x00\nIDATx\x9cc\x00\x01"
+            b"\x00\x00\x05\x00\x01\r\n-\xb4\x00\x00\x00\x00IEND\xaeB`\x82"
+        )
+        img_out_dir = Path(app.state.image_output_dir)
+        b64_url = "data:image/png;base64," + base64.b64encode(tiny_png).decode("ascii")
+        saved_list = persist_browser_outputs(
+            [{"data_url": b64_url, "mime_type": "image/png", "name": "chart.png"}],
+            None,
+            img_out_dir,
+            app.state.file_store,
+            "http://127.0.0.1:8000",
+            tenant_id=tid_a,
+        )
+        assert len(saved_list) == 1
+        fname = saved_list[0]["image_url"].rsplit("/", 1)[-1]
+
+        # Client A can download its own image; Host can download; Client B is blocked with 404
+        assert client.get(f"/v1/images/files/{fname}", headers={"Authorization": f"Bearer {ca['api_key']}"}).status_code == 200
+        assert client.get(f"/v1/images/files/{fname}").status_code == 200
+        assert client.get(f"/v1/images/files/{fname}", headers={"Authorization": f"Bearer {cb['api_key']}"}).status_code == 404
+
+        # 2) Sessions overview & tenant purge
+        ctx_b = app.state.context_builder
+        ctx_b.record_completed_turn(
+            session_key="ext:701",
+            sent_history=[("user", "客户甲的专属项目方案")],
+            assistant_reply="已收到方案",
+            last_strategy="full_bootstrap",
+            session_url="https://vertexaisearch.cloud.google.com/u/0/home/cid/x/r/session/s701",
+            explicit_session_id=f"{tid_a}::sess-alpha",
+            tenant_id=tid_a,
+        )
+        ctx_b.evict_slot_to_archive("ext:701")
+
+        sess_res = client.get(f"/api/sessions?tenant_id={tid_a}").json()
+        assert sess_res["ok"] is True
+        assert len(sess_res["sessions"]) == 1
+        assert sess_res["sessions"][0]["session_id"] == "sess-alpha"
+
+        # Disconnect endpoint clears client sessions/slots cleanly
+        disc_res = client.post(f"/api/distribution/clients/{ca['client_id']}/disconnect", json={"purge_archive": True})
+        assert disc_res.status_code == 200
+        assert client.get(f"/api/sessions?tenant_id={tid_a}").json()["sessions"] == []
+
+
+def test_public_tunnel_admin_endpoints_and_lockdown(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    app = _make_app(tmp_path)
+    tm = app.state.tunnel_manager
+
+    async def fake_start(**kwargs: Any) -> Dict[str, Any]:
+        tm._active_url = "https://demo-free-gateway.trycloudflare.com"
+        tm._pid = 99999
+        if tm._on_url_changed:
+            tm._on_url_changed(tm._active_url)
+        return {
+            "cloudflared_installed": True,
+            "running": True,
+            "mode": kwargs.get("mode") or "quick",
+            "active_url": tm._active_url,
+            "api_base_url": tm._active_url + "/v1",
+        }
+
+    async def fake_probe(public_url: Any = None, *, sample_api_key: Any = None) -> Dict[str, Any]:
+        return {
+            "ok": True,
+            "public_url": public_url or "https://demo-free-gateway.trycloudflare.com",
+            "health_ok": True,
+            "auth_lock_verified": True,
+            "admin_lock_verified": True,
+            "client_key_verified": bool(sample_api_key),
+            "detail": "公网连通正常",
+        }
+
+    monkeypatch.setattr(tm, "start", fake_start)
+    monkeypatch.setattr(tm, "probe_public_reachability", fake_probe)
+
+    with TestClient(app) as client:
+        # Public / proxied callers cannot access tunnel or session admin endpoints
+        for path in ("/api/tunnel", "/api/sessions"):
+            blocked = client.get(path, headers={"CF-Connecting-IP": "198.51.100.25"})
+            assert blocked.status_code == 403
+            assert blocked.json()["error"]["code"] == "local_admin_only"
+
+        # Local admin starts tunnel -> syncs public_base_url automatically
+        st = client.post("/api/tunnel/start", json={"mode": "quick"})
+        assert st.status_code == 200
+        assert st.json()["distribution"]["policy"]["public_base_url"] == "https://demo-free-gateway.trycloudflare.com"
+
+        pr = client.post("/api/tunnel/probe", json={})
+        assert pr.status_code == 200
+        assert pr.json()["ok"] is True
+
+        sp = client.post("/api/tunnel/stop", json={"clear_public_url": True})
+        assert sp.status_code == 200
+        assert sp.json()["distribution"]["policy"]["public_base_url"] == ""

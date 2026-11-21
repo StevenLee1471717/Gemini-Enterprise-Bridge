@@ -6,10 +6,12 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 from pathlib import Path
 import re
 import shutil
 import sqlite3
+import sys
 import tomllib
 
 from agent_policy import (
@@ -17,13 +19,69 @@ from agent_policy import (
     CARBON_EFFECTIVE_CONTEXT_PERCENT, CODING_WORKFLOW,
     GEMINI_DESKTOP_BASE_INSTRUCTIONS, upgrade_desktop_agent_instructions,
 )
+from platform_compat import best_effort_chmod, reconfigure_stdio_utf8, sqlite_file_uri
+
+
+def _safe_backup_relpath(path: Path) -> Path:
+    """Convert an absolute POSIX or Windows drive/UNC path into a safe relative subpath."""
+    resolved = path.resolve()
+    drive = resolved.drive.rstrip(":").lstrip("\\/").replace("\\", "/")
+    parts = [p for p in resolved.parts if p not in {resolved.anchor, "/", "\\", ""}]
+    if drive:
+        return Path(drive, *parts)
+    return Path(*parts) if parts else Path(resolved.name)
+
+
+def render_local_bridge_profile(
+    repo_dir: Path,
+    python_executable: str | Path | None = None,
+    port: int = 8000,
+) -> str:
+    """Render a cross-platform `gemini-bridge.config.toml` with properly escaped paths."""
+    repo_resolved = repo_dir.resolve()
+    py_exec = str(Path(python_executable).resolve()) if python_executable else str(Path(sys.executable).resolve())
+    catalog_path = str(repo_resolved / "codex-models.json")
+    mcp_script = str(repo_resolved / "imagegen_mcp.py")
+    return (
+        "# Gemini Enterprise Bridge - dedicated Codex profile\n"
+        'model = "gemini-4-carbon"\n'
+        'model_provider = "gemini_bridge"\n'
+        'model_reasoning_effort = "none"\n'
+        'model_reasoning_summary = "none"\n'
+        f"model_context_window = {CARBON_CONTEXT_WINDOW}\n"
+        f"model_auto_compact_token_limit = {CARBON_AUTO_COMPACT_TOKENS}\n"
+        'web_search = "disabled"\n'
+        f"model_catalog_json = {json.dumps(catalog_path, ensure_ascii=False)}\n\n"
+        "[model_providers.gemini_bridge]\n"
+        'name = "Gemini Enterprise Bridge"\n'
+        f'base_url = "http://127.0.0.1:{int(port)}/v1"\n'
+        'wire_api = "responses"\n'
+        "requires_openai_auth = false\n"
+        "supports_websockets = false\n"
+        "request_max_retries = 1\n"
+        "stream_max_retries = 1\n"
+        "stream_idle_timeout_ms = 660000\n\n"
+        "[mcp_servers.gemini_bridge_images]\n"
+        f"command = {json.dumps(py_exec, ensure_ascii=False)}\n"
+        f"args = [{json.dumps(mcp_script, ensure_ascii=False)}]\n"
+        "tool_timeout_sec = 1250\n"
+        'default_tools_approval_mode = "approve"\n\n'
+        "# Local multimodal bridge tools are pre-approved without per-call confirmation.\n"
+        "[mcp_servers.gemini_bridge_images.tools.generate_image]\n"
+        'approval_mode = "approve"\n\n'
+        "[mcp_servers.gemini_bridge_images.tools.generate_video]\n"
+        'approval_mode = "approve"\n\n'
+        "[mcp_servers.gemini_bridge_images.tools.analyze_media]\n"
+        'approval_mode = "approve"\n'
+    )
 
 
 def update_catalog(text: str) -> str:
     document = json.loads(text)
     changed = False
     for model in document.get('models', []):
-        if model.get('slug') not in {'gemini-4-carbon', 'gemini-4-argon'}:
+        slug = str(model.get('slug') or '')
+        if not slug.startswith('gemini-'):
             continue
         model.update(context_window=CARBON_CONTEXT_WINDOW, max_context_window=CARBON_CONTEXT_WINDOW,
                      auto_compact_token_limit=CARBON_AUTO_COMPACT_TOKENS,
@@ -42,6 +100,8 @@ def update_catalog(text: str) -> str:
         if isinstance(mm, dict):
             for incompatible_key in ('persistent_instructions', 'token_budget', 'guardian_v2', 'confirmation_policies'):
                 mm.pop(incompatible_key, None)
+            if isinstance(mm.get('multi_agent'), dict):
+                mm['multi_agent'] = None
             if not isinstance(mm.get('instructions_template'), str) or not mm['instructions_template'].strip():
                 mm['instructions_template'] = GEMINI_DESKTOP_BASE_INSTRUCTIONS
         for container, key in [(model, 'base_instructions'), (model.get('model_messages') or {}, 'instructions_template')]:
@@ -78,7 +138,7 @@ def update_stream_timeouts(text: str) -> str:
 
 def update_profile(text: str) -> str:
     document = tomllib.loads(text)
-    if document.get('model') not in {'gemini-4-carbon', 'gemini-4-argon'}:
+    if not str(document.get('model') or '').startswith('gemini-'):
         return text
     # Restrict replacements to the root table, preserving providers, plugins, and unrelated preferences.
     split = re.search(r'^\[', text, re.M)
@@ -97,7 +157,7 @@ def update_profile(text: str) -> str:
 def update_ccswitch(database: Path, apply: bool, backup_dir: Path | None) -> list[str]:
     if not database.is_file():
         return []
-    connection = sqlite3.connect('file:' + str(database) + '?mode=' + ('rw' if apply else 'ro'), uri=True, timeout=3)
+    connection = sqlite3.connect(sqlite_file_uri(database, 'rw' if apply else 'ro'), uri=True, timeout=3)
     try:
         changes = []
         for identifier, raw in connection.execute("SELECT id,settings_config FROM providers WHERE app_type='codex'").fetchall():
@@ -116,7 +176,7 @@ def update_ccswitch(database: Path, apply: bool, backup_dir: Path | None) -> lis
             backup.parent.mkdir(parents=True, exist_ok=True)
             with sqlite3.connect(backup) as destination:
                 connection.backup(destination)
-            backup.chmod(0o600)
+            best_effort_chmod(backup, 0o600)
             with connection:
                 for identifier, raw, updated in changes:
                     count = connection.execute("UPDATE providers SET settings_config=? WHERE id=? AND app_type='codex' AND settings_config=?", (updated, identifier, raw)).rowcount
@@ -127,51 +187,79 @@ def update_ccswitch(database: Path, apply: bool, backup_dir: Path | None) -> lis
         connection.close()
 
 def main():
+    reconfigure_stdio_utf8()
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--codex-home', type=Path, default=Path.home() / '.codex')
-    parser.add_argument('--outputs', type=Path, required=True)
+    parser.add_argument('--outputs', type=Path, default=None)
     parser.add_argument('--backup-dir', type=Path)
     parser.add_argument('--apply', action='store_true')
+    parser.add_argument('--ensure-bridge-profile', action='store_true',
+                        help='Create or update <codex-home>/gemini-bridge.config.toml with current OS paths.')
+    parser.add_argument('--port', type=int, default=8000)
     args = parser.parse_args()
     if args.apply and not args.backup_dir:
         parser.error('--apply requires --backup-dir')
-    catalogs = [Path(__file__).with_name('codex-models.json'), args.codex_home / 'model-router/models.json',
+    repo_dir = Path(__file__).resolve().parent
+    catalogs = [repo_dir / 'codex-models.json', args.codex_home / 'model-router/models.json',
                 args.codex_home / 'gemini-ccswitch-models.json']
     profiles = [args.codex_home / 'gemini-bridge.config.toml', args.codex_home / 'gemini-4-carbon.config.toml',
-                args.codex_home / 'gemini-4-argon.config.toml',
-                args.outputs / 'gemini-bridge.config.toml', args.outputs / 'ccswitch-gemini.config.toml']
+                args.codex_home / 'gemini-4-argon.config.toml']
+    if args.outputs is not None:
+        profiles.extend([args.outputs / 'gemini-bridge.config.toml', args.outputs / 'ccswitch-gemini.config.toml'])
     # The shared desktop config switches providers; per-model catalogs own its budgets.
     if args.apply:
         args.backup_dir.mkdir(parents=True, exist_ok=True)
-        args.backup_dir.chmod(0o700)
+        best_effort_chmod(args.backup_dir, 0o700)
     changes = []
+    if args.ensure_bridge_profile:
+        bridge_prof = args.codex_home / 'gemini-bridge.config.toml'
+        desired_prof = render_local_bridge_profile(repo_dir, sys.executable, port=args.port)
+        existing_prof = bridge_prof.read_text(encoding='utf-8') if bridge_prof.is_file() else None
+        if existing_prof != desired_prof:
+            if args.apply:
+                args.codex_home.mkdir(parents=True, exist_ok=True)
+                if existing_prof is not None:
+                    backup = args.backup_dir / _safe_backup_relpath(bridge_prof)
+                    backup.parent.mkdir(parents=True, exist_ok=True)
+                    if not backup.exists():
+                        shutil.copy2(bridge_prof, backup)
+                bridge_prof.write_text(desired_prof, encoding='utf-8')
+            changes.append(str(bridge_prof))
     targets = ([(p, update_catalog) for p in catalogs] + [(p, update_profile) for p in profiles]
                + [(args.codex_home / 'config.toml', update_stream_timeouts)])
     for path, transform in targets:
         if not path.is_file():
             continue
-        original = path.read_text()
+        original = path.read_text(encoding='utf-8')
         updated = transform(original)
         if original == updated:
             continue
         if args.apply:
             # Re-read before replacing so a concurrent configuration edit is never overwritten.
-            if path.read_text() != original:
+            if path.read_text(encoding='utf-8') != original:
                 raise RuntimeError(f'File changed during configuration update: {path}')
-            backup = args.backup_dir / (str(path).lstrip('/'))
+            backup = args.backup_dir / _safe_backup_relpath(path)
             backup.parent.mkdir(parents=True, exist_ok=True)
             if backup.exists():
                 raise RuntimeError(f'Backup already exists: {backup}')
             shutil.copy2(path, backup)
             temp = path.with_name(path.name + '.context-update.tmp')
             try:
-                temp.write_text(updated)
+                temp.write_text(updated, encoding='utf-8')
                 shutil.copymode(path, temp)
                 temp.replace(path)
             finally:
                 temp.unlink(missing_ok=True)
         changes.append(str(path))
-    changes.extend(update_ccswitch(args.codex_home.parent / '.cc-switch/cc-switch.db', args.apply, args.backup_dir))
+    ccswitch_candidates = [args.codex_home.parent / '.cc-switch/cc-switch.db']
+    appdata = os.environ.get('APPDATA', '').strip()
+    if appdata:
+        ccswitch_candidates.append(Path(appdata) / 'cc-switch/cc-switch.db')
+    seen_dbs: set[Path] = set()
+    for db_cand in ccswitch_candidates:
+        if db_cand.is_file() and db_cand.resolve() not in seen_dbs:
+            seen_dbs.add(db_cand.resolve())
+            changes.extend(update_ccswitch(db_cand, args.apply, args.backup_dir))
     print(json.dumps({'applied': args.apply, 'files': changes,
                       'carbon_context_window': CARBON_CONTEXT_WINDOW,
                       'checkpoint_tokens': CARBON_AUTO_COMPACT_TOKENS,

@@ -7,7 +7,7 @@ let runtimeListener, windowListener;
 const sandbox = {
   window: null, globalThis: null,
   location: {origin:'https://vertexaisearch.cloud.google.com'},
-  document: {readyState:'complete', hidden:false, addEventListener(){}, removeEventListener(){}},
+  document: {readyState:'loading', hidden:false, addEventListener(){}, removeEventListener(){}},
   addEventListener(type, callback) { if (type === 'message') windowListener = callback; },
   removeEventListener(){}, postMessage(message) { posted.push(message); },
   chrome: {runtime: {id:'test', onMessage:{addListener(callback){runtimeListener=callback;}},
@@ -21,6 +21,12 @@ vm.runInContext(fs.readFileSync('content-bridge.js','utf8'),ctx);
 const vmWindow=vm.runInContext('window',ctx);
 const send = message => new Promise(resolve => runtimeListener(message,{},resolve));
 const fromMain = payload => windowListener({source:vmWindow,origin:sandbox.location.origin,data:{channel:'GEB_MAIN_TO_ISOLATED',payload}});
+const queued = await send({type:'GEB_EXECUTE_PROMPT',request_id:'cancel-before-ready',prompt:'cancel me'});
+assert.equal(queued.queued,true);
+await send({type:'GEB_CANCEL_REQUEST',request_id:'cancel-before-ready'});
+fromMain({type:'driver_ready'});
+assert.ok(!posted.some(m=>m.action==='execute_prompt' && m.payload.request_id==='cancel-before-ready'));
+sandbox.document.readyState = 'complete';
 for (let index=0;index<2;index++) await send({type:'GEB_PROMPT_CHUNK',request_id:'valid',chunk_index:index,total_chunks:2,data:['first','second'][index]});
 await send({type:'GEB_EXECUTE_PROMPT',request_id:'valid',chunked:true,total_chunks:2});
 assert.equal(posted.find(m=>m.action==='execute_prompt' && m.payload.request_id==='valid').payload.prompt,'firstsecond');

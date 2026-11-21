@@ -854,7 +854,9 @@ fileInput._listeners.set("change", [() => {
   for (let i = 0; i < 7; i += 1) {
     const wrapper = new MockElement("ucs-file-chip");
     wrapper.appendChild(new MockElement("mat-chip"));
-    wrapper.appendChild(new MockElement("button", {attrs: {"aria-label": "Remove file"}}));
+    const btn = new MockElement("button", {attrs: {"aria-label": "Remove file"}});
+    btn.addEventListener("click", () => wrapper.remove());
+    wrapper.appendChild(btn);
     searchShadow.appendChild(wrapper);
   }
   // An unrelated old conversation button must not count as a composer attachment.
@@ -862,16 +864,54 @@ fileInput._listeners.set("change", [() => {
   chatShadow.appendChild(oldRemove);
   setTimeout(() => {
     finalAttachmentArrived = true;
-    searchShadow.appendChild(new MockElement("button", {attrs: {"aria-label": "Remove file"}}));
+    const finalBtn = new MockElement("button", {attrs: {"aria-label": "Remove file"}});
+    finalBtn.addEventListener("click", () => finalBtn.remove());
+    searchShadow.appendChild(finalBtn);
     oldRemove.remove();
   }, 2200);
 }]);
 await api.attachFilesToComposer(Array.from({length:8}, (_, i) => ({data_url: "data:image/png;base64,iVBORw0KGgo=", name: `image-${i}.png`, mime_type: "image/png"})));
 assert.ok(finalAttachmentArrived, "nested chips or old conversation controls must not masquerade as complete uploads");
-await assert.rejects(api.attachFilesToComposer([]), /残留/);
-for (const el of searchShadow.querySelectorAll('ucs-file-chip, button')) {
-  if (el.tagName.toLowerCase() === "ucs-file-chip" || el.getAttribute("aria-label") === "Remove file") el.remove();
-}
+assert.equal(api.composerAttachmentControls().length, 8);
+// Leftover unsubmitted attachments must be automatically cleared instead of blocking subsequent text turns.
+await api.attachFilesToComposer([]);
+assert.equal(api.composerAttachmentControls().length, 0, "attachFilesToComposer([]) must auto-clean leftover attachments");
+
+// Leftover shadow-wrapped attachment controls must also be auto-cleaned before mounting a new turn's file.
+const staleHost = new MockElement("md-icon-button", {attrs: {"aria-label": "Remove file"}});
+const staleHostShadow = staleHost.attachShadow();
+const staleInnerBtn = new MockElement("button");
+staleInnerBtn.addEventListener("click", () => staleHost.remove());
+staleHostShadow.appendChild(staleInnerBtn);
+searchShadow.appendChild(staleHost);
+assert.equal(api.composerAttachmentControls().length, 1);
+fileInput._listeners.set("change", [() => {
+  const freshChip = new MockElement("ucs-file-chip");
+  const freshRemove = new MockElement("button", {attrs: {"aria-label": "Remove file"}});
+  freshRemove.addEventListener("click", () => freshChip.remove());
+  freshChip.appendChild(freshRemove);
+  searchShadow.appendChild(freshChip);
+}]);
+await api.attachFilesToComposer([{data_url: "data:image/png;base64,iVBORw0KGgo=", name: "fresh-only.png", mime_type: "image/png"}]);
+assert.equal(api.composerAttachmentControls().length, 1, "stale attachment must be auto-cleaned before fresh file upload");
+assert.ok(!staleHost.parentNode, "stale shadow-wrapped attachment must be removed");
+
+// If an execution job aborts before submitting, pre-existing or newly uploaded composer attachments must still be cleaned up.
+await api.executePromptJob({
+  request_id: "req-abort-cleans-stale-attachment",
+  prompt: "   ",
+  attachments: [],
+  target_model: null,
+  reset_chat: false,
+  timeout_ms: 2000
+});
+assert.equal(api.composerAttachmentControls().length, 0, "aborted job finally block must clean leftover composer attachments");
+
+// Safety fallback: if a broken page control refuses to disappear after all cleanup retries, stop rather than sending wrong files.
+const stuckRemove = new MockElement("button", {attrs: {"aria-label": "Remove file"}});
+searchShadow.appendChild(stuckRemove);
+await assert.rejects(api.attachFilesToComposer([]), /残留.*自动清理失败/);
+stuckRemove.remove();
 
 searchBox.tagName = "UCS-SEARCH-BOX";
 pmHost.remove();
@@ -905,6 +945,21 @@ await api.executePromptJob({request_id: "req-network-failure", prompt: "must fai
 assert.ok(emittedEvents.some(e => e.type === "request_error" && e.request_id === "req-network-failure" && /dropped/.test(e.error)));
 assert.ok(!emittedEvents.some(e => e.type === "request_complete" && e.request_id === "req-network-failure"));
 assert.equal(stopClicks, 1, "an error must stop the actual page generation");
+
+// Another browser command cannot stop or replace a working page job.
+const firstJob = api.executePromptJob({request_id: "req-original", prompt: "original prompt", reset_chat: false});
+const firstJobState = sandbox.__GEB_MAIN_STATE__.getActiveJob();
+assert.ok(firstJobState);
+await api.executePromptJob({request_id: "req-original", prompt: "original prompt", reset_chat: false});
+await api.executePromptJob({request_id: "req-overlap", prompt: "different request", reset_chat: false});
+assert.equal(sandbox.__GEB_MAIN_STATE__.getActiveJob(), firstJobState);
+assert.equal(firstJobState.cancelled, false);
+assert.ok(emittedEvents.some(e => e.type === "request_error" && e.request_id === "req-overlap" && e.submitted === false));
+doc.dispatchEvent(Object.assign(new MockEvent("message"), {
+  source: vmWindow, origin: mockLocation.origin,
+  data: {channel:"GEB_ISOLATED_TO_MAIN", action:"cancel_request", payload:{request_id:"req-original"}}
+}));
+await firstJob;
 
 // Cancel while the page is generating: click Stop and emit no completion.
 sendBtn._listeners.set("click", [() => {

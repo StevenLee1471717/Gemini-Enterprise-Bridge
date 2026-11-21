@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import base64
+import json
 from pathlib import Path
 import time
 from typing import Any, Dict, List, Optional
@@ -80,6 +81,12 @@ def persist_browser_outputs(
             img_name = f"{uuid.uuid4().hex}.{ext}"
             img_path = output_dir / img_name
             img_path.write_bytes(norm_raw)
+            owners_dir = output_dir / ".img_owners"
+            owners_dir.mkdir(parents=True, exist_ok=True)
+            (owners_dir / f"{img_name}.json").write_text(
+                json.dumps({"tenant_id": eff_tenant, "file_id": meta["id"]}, ensure_ascii=False),
+                encoding="utf-8",
+            )
             record["image_url"] = f"{root_url}/v1/images/files/{img_name}"
             if eff_tenant == "host":
                 record["image_path"] = str(img_path)

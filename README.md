@@ -1,6 +1,6 @@
 # Gemini Enterprise Web-to-API Bridge
 
-将已登录的 **Google Cloud Gemini Enterprise（Vertex AI Search / Agentspace，`vertexaisearch.cloud.google.com`）** 安全、稳定地包装为标准本地 **OpenAI 兼容接口（`/v1/chat/completions` & `/v1/models`）**，无缝接入 **ChatBox、NextChat、Cursor、Cherry Studio、Open WebUI** 及 OpenAI Python/JS SDK。
+将已登录的 **Google Cloud Gemini Enterprise（Vertex AI Search / Agentspace，`vertexaisearch.cloud.google.com`）** 安全、稳定地包装为标准本地 **OpenAI 兼容接口（`/v1/chat/completions`、`/v1/responses` & `/v1/models`）**，专为 **GitHub Copilot（App / CLI / VS Code BYOK）** 深度优化，同时无缝兼容 **Cursor、Cline、ChatBox、NextChat、Cherry Studio、Open WebUI** 及 OpenAI Python/JS SDK。
 
 > **⚠️ 免责声明 (Unofficial / Disclaimer)**：本项目为非官方开源技术研究与个人本地开发工具桥接方案，与 Google LLC / Google Cloud 无任何隶属、合作或官方背书关系。使用者须严格遵守所在企业/机构的 IT 安全与数据合规制度以及 Google 服务条款（Terms of Service）。如拥有企业 GCP 项目 IAM 权限，建议优先启用内置的 **方案一（GCloud 官方 ADC 模式）**。
 >
@@ -29,17 +29,18 @@ flowchart LR
 
 ---
 
-## v1.2.x 架构与核心能力速览
+## v1.4.x 架构与核心能力速览
 
-当前版本（`v1.2.0`）在本地 OpenAI 兼容网关基础上构建了完整的生产级多模态、多会话与自动化运维闭环：
+当前版本在本地 OpenAI 兼容网关基础上，面向 **GitHub Copilot** 与多并发编程工作流构建了完整的生产级多模态、高并发池、工具批处理与运维闭环：
 
 | 能力模块 | 核心实现与运行机制 |
 |---|---|
-| **全链路多模态文件与媒体支持 (`multimodal.py`)** | 原生兼容图片、视频、音频、PDF、Office 文档（`.docx`/`.xlsx`/`.pptx`）、代码与任意二进制文件（支持 Data URI、Base64、HTTP URL 与本地路径）；多轮对话按 `SHA-256` 增量去重免重复上传；通过令牌保护的 `/api/bridge/attachments/{id}` 与零 `.innerHTML` 三级 Shadow DOM 注入安全上传至网页输入框，同时支持官方 GCloud `inlineData`/`fileData` |
-| **1M 上下文窗口与客户端上限同步** | `/v1/models` 与 `/v1/models/{model_id}` 全量声明 **`1,048,576` 输入 / `65,536` 输出** Token 上限（覆盖 **Gemini 4 Carbon**、**4 Argon**、**3.1 Pro**、**3.8 Flash** 及 `@会话名` 别名）；启动时自动运行 `sync_client_limits.py` 同步修复本地 GitHub Copilot App (`~/.copilot/data.db`) BYOK 模型的 `128K` 默认回退限制 |
-| **上下文水位监控与官方 API 等价账本 (`6.8` 汇率)** | 实时计算各并行会话在 `1M` 窗口中的占用水位（历史消息 / 工具 Schema / 增量输入），并通过 `usage_stats.py` 按 Google 官方分段定价持久化累计输入/输出 Token 与等价节省费用（默认按 **`1 USD = 6.8 CNY`** 折算，可通过 `BRIDGE_USD_TO_CNY_RATE` 自定义，支持扩展弹窗、Web 控制台与 `/api/usage` 实时查看及重置） |
-| **多标签页真并行池 (`WorkerSlot` Pool)** | 每个已打开的 Gemini Enterprise 标签页作为独立并发工作槽位，支持多客户端同时流式请求、对话前缀自动粘性路由、`@会话名` 显式固定绑定，以及并发繁忙时后台静默新建标签页扩容（`BRIDGE_AUTO_SPAWN_TABS=true`） |
-| **GitHub Releases 双向自动更新** | `.github/workflows/ci-release.yml` 自动测试并发布带 `SHA-256` 清单的插件与后端产物；后端每次启动自动检查更新并保留 `.env` / `usage_stats.json`；MV3 扩展内置 `/health` 静默预检、bfcache 保活端口清理、后台空闲自动重载（`chrome.runtime.reload()`）及跨端版本不一致一键升级提示 |
+| **选择性批量工具调用 (`tool_calling.py`)** | 原生适配 **GitHub Copilot** 工具集（`view` / `grep` / `glob` / `lsp` / `edit` / `create` / `powershell` / `bash` / `task` 等）与通用编程工具：支持同轮并行批处理只读查询、非冲突文件的并行编辑及独立子代理派发；自动拦截同文件编辑冲突及写命令与读工具混批，确保执行安全与速度兼得 |
+| **实时并发席位调控与严格会话亲和 (`bridge_hub.py`)** | 支持在 Web 控制台与扩展弹窗中实时动态调整最大并行席位上限（`_DynamicParallelLimiter` + `set_max_parallel_tabs`，热生效不断流）；引入每会话独立串行锁（`_thread_locks`）与严格会话亲和，并支持浏览器重进续聊与残留附件自动清理（`clearComposerAttachments`） |
+| **1M 上下文窗口与 GitHub Copilot 上限自动同步** | `/v1/models` 默认提供精简去重的核心模型（**Gemini 4 Carbon**、**4 Argon**、**3.1 Pro**、**3.8 Flash**），同时 `/v1/models/{model_id}` 兼容所有别名与 `@会话名`，全量声明 **`1,048,576` 输入 / `65,536` 输出**；启动时自动运行 `sync_client_limits.py` 修复本地 GitHub Copilot App (`~/.copilot/data.db`) BYOK 模型的 `128K` 默认回退限制 |
+| **全链路多模态与跨平台格式归一化 (`multimodal.py` / `media_inputs.py`)** | 原生支持图片、视频、音频、PDF、Office 文档与代码文件；内置纯标准库跨平台 BMP/ICO→PNG 与 RTF→DOCX 转换、多轮 SHA-256 增量去重、以及网页输入框剪贴板粘贴/拖放兜底与重复附件清理 |
+| **多租户分发配额、公网隧道与公开状态页** | 支持基于 `cloudflared` 的一键公网隧道与休眠唤醒自动恢复（`tunnel_manager.py`）、按客户端细粒度配额管理（RPM/RPD/TPD/消费限额/允许模型与中英双语凭证分享）、公开状态监控页（`public_status.py`）以及带等价 API 账本（默认 `1 USD = 6.8 CNY`）的全新控制面板 |
+| **Windows 10/11 原生兼容与 GitHub Releases 自动更新** | 全链路适配 Windows 路径/编码/防杀毒锁原子写/PowerShell 启停与开机自启（`platform_compat.py`、`start.ps1`、`stop.bat`），并保留 `.github/workflows/ci-release.yml` 与 `updater.py` 双向自动更新 |
 
 ---
 

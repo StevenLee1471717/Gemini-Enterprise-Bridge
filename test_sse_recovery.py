@@ -7,9 +7,11 @@ import pytest
 from fastapi.responses import StreamingResponse
 
 import responses_api
+from config import BridgeSettings
 from configure_codex_context import update_stream_timeouts
 from context_builder import ConversationContextBuilder
 from schemas import ChatMessage
+from server import create_app
 from streaming_utils import with_keepalive
 from test_responses import browser, packets
 
@@ -48,6 +50,74 @@ def test_keepalive_is_valid_small_json_with_ordered_sequence(monkeypatch):
     assert len(progress) >= 2
     assert all(len(json.dumps(e)) < 600 and e['response']['output'] == [] for e in progress)
     assert [e['sequence_number'] for e in events] == list(range(len(events)))
+
+
+@pytest.mark.parametrize("disconnect_after", [b"response.created", b"partial reply"])
+def test_responses_disconnect_releases_worker_and_live_task(tmp_path, monkeypatch, disconnect_after):
+    async def run():
+        app = create_app(BridgeSettings(
+            auto_export_extension=False, auto_spawn_tabs=False,
+            generated_dir=str(tmp_path), response_store_dir=str(tmp_path / "responses"),
+        ))
+        hub = app.state.hub
+        worker = hub.register_http_client("test", tab_id=7, tab_url="https://vertexaisearch.cloud.google.com/home")
+        request_body = json.dumps({"input": "test", "stream": True, "store": False}).encode()
+        sent_body = False
+        disconnect = asyncio.Event()
+        first_command = None
+        cancel_while_reserved = []
+        send_cancel = hub._send_cancel_safely
+
+        async def record_cancel(client, request_id, tab_id=None):
+            cancel_while_reserved.append(hub._slots["test:7"].lock.locked())
+            await send_cancel(client, request_id, tab_id=tab_id)
+
+        monkeypatch.setattr(hub, "_send_cancel_safely", record_cancel)
+
+        async def receive():
+            nonlocal sent_body
+            if not sent_body:
+                sent_body = True
+                return {"type": "http.request", "body": request_body}
+            await disconnect.wait()
+            return {"type": "http.disconnect"}
+
+        async def send(message):
+            if disconnect_after in message.get("body", b""):
+                disconnect.set()
+
+        async def provide_partial_reply():
+            nonlocal first_command
+            first_command = await worker.command_queue.get()
+            assert first_command["type"] == "execute_prompt"
+            await hub.handle_browser_event("test", {
+                "type": "stream_chunk", "request_id": first_command["request_id"],
+                "tab_id": 7, "delta": "partial reply\n\n",
+            })
+
+        scope = {
+            "type": "http", "asgi": {"version": "3.0", "spec_version": "2.3"},
+            "method": "POST", "path": "/v1/responses", "query_string": b"",
+            "scheme": "http", "client": ("127.0.0.1", 1234), "server": ("127.0.0.1", 8000),
+            "headers": [(b"content-type", b"application/json")],
+        }
+        if disconnect_after == b"partial reply":
+            await asyncio.wait_for(asyncio.gather(app(scope, receive, send), provide_partial_reply()), timeout=1)
+            cancel = worker.command_queue.get_nowait()
+            assert cancel["type"] == "cancel_request"
+            assert cancel["request_id"] == first_command["request_id"]
+            assert cancel["tab_id"] == first_command["tab_id"]
+            assert cancel_while_reserved == [True]
+        else:
+            await asyncio.wait_for(app(scope, receive, send), timeout=1)
+            assert worker.command_queue.empty()
+        assert disconnect.is_set()
+        assert not app.state.distribution._live_tasks
+        assert app.state.distribution._host_in_flight == 0
+        assert not hub._pending
+        assert all(not s.is_busy for s in hub._slots.values())
+
+    asyncio.run(run())
 
 
 def completed_large_history():

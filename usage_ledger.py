@@ -20,8 +20,8 @@ from dataclasses import dataclass
 from datetime import date, datetime, timedelta
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Union
-from zoneinfo import ZoneInfo
 
+from platform_compat import atomic_write_json, resolve_timezone
 from schemas import resolve_target_web_model
 
 logger = logging.getLogger("gemini_bridge.ledger")
@@ -32,7 +32,7 @@ DEFAULT_USD_TO_CNY = 6.8
 DEFAULT_TIMEZONE = "Asia/Shanghai"
 DEFAULT_IMAGE_UNIT_USD = 0.04
 DEFAULT_VIDEO_UNIT_USD = 0.35
-MAX_RECENT_REQUESTS = 30
+MAX_RECENT_REQUESTS = 300
 MAX_STORED_DAYS = 180
 
 TASK_LABELS: Dict[str, str] = {
@@ -125,7 +125,7 @@ def resolve_canonical_billing_model(
     if from_fuzzy:
         return from_fuzzy
 
-    return "gemini-enterprise-auto"
+    return "gemini-4-carbon"
 
 
 def get_model_pricing(
@@ -253,9 +253,6 @@ def list_pricing_catalog(
         "gemini-4-argon",
         "gemini-3.1-pro",
         "gemini-3.8-flash",
-        "gemini-2.5-pro",
-        "gemini-2.5-flash",
-        "gemini-enterprise-auto",
     ]
     return [get_model_pricing(m, prompt_tokens=0, overrides=overrides).to_dict() for m in ordered]
 
@@ -335,8 +332,52 @@ def empty_group() -> Dict[str, Any]:
         "summary": empty_bucket(),
         "by_model": {},
         "by_task": {},
+        "by_tenant": {},
     }
 
+
+def empty_tenant_group(tenant_name: str = "") -> Dict[str, Any]:
+    return {
+        "tenant_name": tenant_name,
+        "errors": 0,
+        "summary": empty_bucket(),
+        "by_model": {},
+        "by_task": {},
+    }
+
+
+def sanitize_tenant_group(raw: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+    tg = empty_tenant_group()
+    if not isinstance(raw, dict):
+        return tg
+    tg["tenant_name"] = str(raw.get("tenant_name") or "")
+    try:
+        tg["errors"] = max(0, int(raw.get("errors") or 0))
+    except (TypeError, ValueError):
+        tg["errors"] = 0
+    tg["summary"] = sanitize_bucket(raw.get("summary"))
+    if isinstance(raw.get("by_model"), dict):
+        for mk, mv in raw["by_model"].items():
+            if isinstance(mv, dict):
+                tg["by_model"][str(mk)] = sanitize_bucket(mv)
+    if isinstance(raw.get("by_task"), dict):
+        for tk, tv in raw["by_task"].items():
+            if isinstance(tv, dict):
+                tg["by_task"][str(tk)] = sanitize_bucket(tv)
+    return tg
+
+
+def merge_tenant_group_into(dst: Dict[str, Any], src: Dict[str, Any]) -> None:
+    if src.get("tenant_name"):
+        dst["tenant_name"] = str(src["tenant_name"])
+    dst["errors"] = int(dst.get("errors") or 0) + int(src.get("errors") or 0)
+    merge_bucket_into(dst["summary"], src.get("summary") or empty_bucket())
+    for mk, mb in (src.get("by_model") or {}).items():
+        target_m = dst["by_model"].setdefault(mk, empty_bucket())
+        merge_bucket_into(target_m, mb)
+    for tk, tb in (src.get("by_task") or {}).items():
+        target_t = dst["by_task"].setdefault(tk, empty_bucket())
+        merge_bucket_into(target_t, tb)
 
 def sanitize_group(raw: Optional[Dict[str, Any]]) -> Dict[str, Any]:
     g = empty_group()
@@ -351,6 +392,10 @@ def sanitize_group(raw: Optional[Dict[str, Any]]) -> Dict[str, Any]:
         for tk, tv in raw["by_task"].items():
             if isinstance(tv, dict):
                 g["by_task"][str(tk)] = sanitize_bucket(tv)
+    if isinstance(raw.get("by_tenant"), dict):
+        for tid, tv in raw["by_tenant"].items():
+            if isinstance(tv, dict):
+                g["by_tenant"][str(tid)] = sanitize_tenant_group(tv)
     return g
 
 
@@ -362,6 +407,10 @@ def merge_group_into(dst: Dict[str, Any], src: Dict[str, Any]) -> None:
     for tk, tb in (src.get("by_task") or {}).items():
         target_t = dst["by_task"].setdefault(tk, empty_bucket())
         merge_bucket_into(target_t, tb)
+    dst_tenants = dst.setdefault("by_tenant", {})
+    for tid, tgroup in (src.get("by_tenant") or {}).items():
+        target_ten = dst_tenants.setdefault(tid, empty_tenant_group(str(tgroup.get("tenant_name") or "")))
+        merge_tenant_group_into(target_ten, tgroup)
 
 
 def enrich_bucket(bucket: Dict[str, Any], usd_to_cny: float) -> Dict[str, Any]:
@@ -424,7 +473,7 @@ class UsageLedger:
             except ValueError:
                 pass
         try:
-            return datetime.now(ZoneInfo(self.timezone_name)).date().isoformat()
+            return datetime.now(resolve_timezone(self.timezone_name)).date().isoformat()
         except Exception:
             return datetime.now().date().isoformat()
 
@@ -466,12 +515,7 @@ class UsageLedger:
                 "days": self._days,
                 "recent_requests": self._recent_requests[-MAX_RECENT_REQUESTS:],
             }
-            tmp_path = self.storage_path.with_name(self.storage_path.name + ".tmp")
-            tmp_path.write_text(
-                json.dumps(payload, ensure_ascii=False, indent=2) + "\n",
-                encoding="utf-8",
-            )
-            tmp_path.replace(self.storage_path)
+            atomic_write_json(self.storage_path, payload, mode=0o600, dir_mode=0o755)
         except Exception as exc:
             logger.warning("写入本地账本 %s 失败: %s", self.storage_path, exc)
 
@@ -497,6 +541,13 @@ class UsageLedger:
         as_of_date: Optional[Union[date, datetime, str]] = None,
         tenant_id: str = "host",
         tenant_name: str = "本机直连",
+        request_id: str = "",
+        session_id: str = "",
+        session_title: str = "",
+        prompt_preview: str = "",
+        reply_preview: str = "",
+        client_ip: str = "",
+        tool_calls_count: int = 0,
     ) -> Dict[str, Any]:
         """Record one completed task into daily, session, model, and task ledgers."""
         p_tokens = max(0, int(prompt_tokens or 0))
@@ -549,6 +600,8 @@ class UsageLedger:
         util_pct = round(min(100.0, (ctx_tokens / max(ctx_limit, 1)) * 100.0), 2)
         day_key = self._day_key(as_of_date)
         now_ts = int(time.time())
+        eff_tid = (tenant_id or "host").strip() or "host"
+        eff_tname = (tenant_name or "本机直连").strip() or "本机直连"
 
         entry_delta: Dict[str, Any] = {
             "requests": 1,
@@ -564,19 +617,36 @@ class UsageLedger:
             "equivalent_cost_usd": round(uncached_usd, 8),
             "cached_equivalent_cost_usd": round(cached_usd, 8),
         }
+        single_tenant_group = {
+            "tenant_name": eff_tname,
+            "errors": 0,
+            "summary": dict(entry_delta),
+            "by_model": {canonical_model: dict(entry_delta)},
+            "by_task": {norm_task: dict(entry_delta)},
+        }
         single_group = {
             "summary": entry_delta,
             "by_model": {canonical_model: dict(entry_delta)},
             "by_task": {norm_task: dict(entry_delta)},
+            "by_tenant": {eff_tid: single_tenant_group},
         }
 
         record = {
+            "request_id": (request_id or "").strip(),
             "ts": now_ts,
             "day": day_key,
+            "status": "ok",
+            "status_code": 200,
             "slot_key": slot_key,
             "tab_id": tab_id,
-            "tenant_id": (tenant_id or "host").strip() or "host",
-            "tenant_name": (tenant_name or "本机直连").strip() or "本机直连",
+            "tenant_id": eff_tid,
+            "tenant_name": eff_tname,
+            "client_ip": (client_ip or "").strip(),
+            "session_id": (session_id or "").strip()[:100],
+            "session_title": (session_title or "").strip()[:120],
+            "prompt_preview": (prompt_preview or "").strip()[:160],
+            "reply_preview": (reply_preview or "").strip()[:180],
+            "tool_calls_count": max(0, int(tool_calls_count or 0)),
             "task_type": norm_task,
             "task_label": TASK_LABELS.get(norm_task, norm_task),
             "requested_model": requested_model,
@@ -655,11 +725,136 @@ class UsageLedger:
                 enriched_t["label"] = TASK_LABELS.get(t_key, t_key)
                 by_task_out[t_key] = enriched_t
 
+        by_tenant_out: Dict[str, Dict[str, Any]] = {}
+        sorted_tenants = sorted(
+            (group.get("by_tenant") or {}).items(),
+            key=lambda kv: (
+                float((kv[1].get("summary") or {}).get("cached_equivalent_cost_usd") or 0.0),
+                int((kv[1].get("summary") or {}).get("requests") or 0),
+                int(kv[1].get("errors") or 0),
+            ),
+            reverse=True,
+        )
+        for tid, t_raw in sorted_tenants:
+            tm_out: Dict[str, Dict[str, Any]] = {}
+            for m_key, m_bucket in (t_raw.get("by_model") or {}).items():
+                m_rate = get_model_pricing(m_key, prompt_tokens=0, overrides=self.price_overrides)
+                en_m = enrich_bucket(m_bucket, self.usd_to_cny_rate)
+                en_m["display_name"] = m_rate.display_name
+                en_m["input_rate_per_1m"] = m_rate.input_per_1m
+                en_m["cached_input_rate_per_1m"] = m_rate.cached_input_per_1m
+                en_m["output_rate_per_1m"] = m_rate.output_per_1m
+                en_m["rate_note"] = m_rate.rate_note
+                tm_out[m_key] = en_m
+            tt_out: Dict[str, Dict[str, Any]] = {}
+            for t_key, t_bucket in (t_raw.get("by_task") or {}).items():
+                en_t = enrich_bucket(t_bucket, self.usd_to_cny_rate)
+                en_t["label"] = TASK_LABELS.get(t_key, t_key)
+                tt_out[t_key] = en_t
+            t_sum = enrich_bucket(t_raw.get("summary") or empty_bucket(), self.usd_to_cny_rate)
+            t_sum["errors"] = int(t_raw.get("errors") or 0)
+            by_tenant_out[tid] = {
+                "tenant_id": tid,
+                "tenant_name": str(t_raw.get("tenant_name") or ("本机直连" if tid == "host" else tid)),
+                "errors": int(t_raw.get("errors") or 0),
+                "summary": t_sum,
+                "by_model": tm_out,
+                "by_task": tt_out,
+            }
+
         return {
             "summary": enrich_bucket(group.get("summary") or empty_bucket(), self.usd_to_cny_rate),
             "by_model": by_model_out,
             "by_task": by_task_out,
+            "by_tenant": by_tenant_out,
         }
+
+    def record_failed_request(
+        self,
+        *,
+        requested_model: str = "",
+        task_type: str = "chat",
+        tenant_id: str = "host",
+        tenant_name: str = "本机直连",
+        client_ip: str = "",
+        session_id: str = "",
+        prompt_preview: str = "",
+        status: str = "error",
+        status_code: int = 500,
+        error_code: str = "",
+        error_message: str = "",
+        slot_key: str = "",
+        tab_id: Optional[int] = None,
+        duration_ms: int = 0,
+        as_of_date: Optional[Union[date, datetime, str]] = None,
+        request_id: str = "",
+    ) -> Dict[str, Any]:
+        """Record a blocked, rate-limited, or failed request into the task audit log without billing tokens."""
+        norm_task = task_type if task_type in TASK_LABELS else "chat"
+        day_key = self._day_key(as_of_date)
+        now_ts = int(time.time())
+        eff_tid = (tenant_id or "host").strip() or "host"
+        eff_tname = (tenant_name or "本机直连").strip() or "本机直连"
+        canonical_model = resolve_canonical_billing_model(requested_model=requested_model)
+        rate = get_model_pricing(canonical_model=canonical_model, prompt_tokens=0, overrides=self.price_overrides)
+        record = {
+            "request_id": (request_id or "").strip(),
+            "ts": now_ts,
+            "day": day_key,
+            "status": status or "error",
+            "status_code": int(status_code or 500),
+            "error_code": (error_code or "").strip(),
+            "error_message": (error_message or "").strip()[:220],
+            "slot_key": slot_key,
+            "tab_id": tab_id,
+            "tenant_id": eff_tid,
+            "tenant_name": eff_tname,
+            "client_ip": (client_ip or "").strip(),
+            "session_id": (session_id or "").strip()[:100],
+            "session_title": "",
+            "prompt_preview": (prompt_preview or "").strip()[:160],
+            "reply_preview": (error_message or "").strip()[:180],
+            "tool_calls_count": 0,
+            "task_type": norm_task,
+            "task_label": TASK_LABELS.get(norm_task, norm_task),
+            "requested_model": requested_model,
+            "model": canonical_model,
+            "display_name": rate.display_name,
+            "strategy": "rejected" if int(status_code or 500) in {401, 403, 429} else "failed",
+            "prompt_tokens": 0,
+            "cached_tokens": 0,
+            "delta_prompt_tokens": 0,
+            "completion_tokens": 0,
+            "total_tokens": 0,
+            "images_generated": 0,
+            "videos_generated": 0,
+            "audio_requests": 0,
+            "compactions": 0,
+            "context_tokens": 0,
+            "context_limit": rate.context_window,
+            "context_utilization_pct": 0.0,
+            "equivalent_cost_usd": 0.0,
+            "cached_equivalent_cost_usd": 0.0,
+            "saved_cost_usd": 0.0,
+            "equivalent_cost_cny": 0.0,
+            "cached_equivalent_cost_cny": 0.0,
+            "saved_cost_cny": 0.0,
+            "duration_ms": max(0, int(duration_ms or 0)),
+        }
+        with self._lock:
+            day_group = self._days.setdefault(day_key, empty_group())
+            t_dst = day_group.setdefault("by_tenant", {}).setdefault(eff_tid, empty_tenant_group(eff_tname))
+            t_dst["tenant_name"] = eff_tname
+            t_dst["errors"] = int(t_dst.get("errors") or 0) + 1
+            sess_day_group = self._session_days.setdefault(day_key, empty_group())
+            st_dst = sess_day_group.setdefault("by_tenant", {}).setdefault(eff_tid, empty_tenant_group(eff_tname))
+            st_dst["tenant_name"] = eff_tname
+            st_dst["errors"] = int(st_dst.get("errors") or 0) + 1
+            self._recent_requests.append(record)
+            if len(self._recent_requests) > MAX_RECENT_REQUESTS:
+                self._recent_requests = self._recent_requests[-MAX_RECENT_REQUESTS:]
+            self._save_to_disk_unlocked()
+        return record
 
     def snapshot(
         self,
@@ -742,6 +937,7 @@ class UsageLedger:
                 "current_session": session_enriched["summary"],
                 "by_model": all_enriched["by_model"],
                 "by_task": all_enriched["by_task"],
+                "by_tenant": all_enriched["by_tenant"],
                 "periods": {
                     "all": all_enriched,
                     "today": today_enriched,

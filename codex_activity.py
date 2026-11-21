@@ -17,6 +17,8 @@ from pathlib import Path
 from threading import RLock
 from typing import Any, Dict, Optional, Tuple
 
+from platform_compat import sqlite_file_uri
+
 _UUID_RE = re.compile(
     r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$"
 )
@@ -103,7 +105,7 @@ def _resolve_rollout_path(
     db_path = codex_home / "state_5.sqlite"
     try:
         if db_path.is_file():
-            con = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True, timeout=0.05)
+            con = sqlite3.connect(sqlite_file_uri(db_path, "ro"), uri=True, timeout=0.05)
             try:
                 row = con.execute(
                     "SELECT rollout_path FROM threads WHERE id = ? LIMIT 1",
@@ -168,7 +170,7 @@ def _scan_rollout_tail(
     Returns `(raw_active, phase, tool_name, last_lifecycle)`.
     """
     try:
-        fd = os.open(path, os.O_RDONLY)
+        fd = os.open(path, os.O_RDONLY | getattr(os, "O_BINARY", 0))
     except OSError:
         return (False, "idle", "", "")
 
@@ -217,6 +219,7 @@ def _scan_rollout_tail(
                     parts.pop(0)
 
             for raw_line in reversed(parts):
+                raw_line = raw_line.rstrip(b"\r")
                 if not raw_line or len(raw_line) > max_line_bytes:
                     continue
                 probe = raw_line[:360]
@@ -290,7 +293,7 @@ def _count_rollout_compactions(path: str, file_size: int) -> int:
         offset, cnt_top, max_win, cnt_ev = (0, 0, 0, 0)
 
     try:
-        fd = os.open(path, os.O_RDONLY)
+        fd = os.open(path, os.O_RDONLY | getattr(os, "O_BINARY", 0))
     except OSError:
         return max(cnt_top, max_win) if (cnt_top or max_win) else cnt_ev
 
@@ -315,6 +318,7 @@ def _count_rollout_compactions(path: str, file_size: int) -> int:
             if b'"compacted"' not in process_part and b'"context_compacted"' not in process_part:
                 continue
             for raw_line in process_part.split(b"\n"):
+                raw_line = raw_line.rstrip(b"\r")
                 head = raw_line[:260]
                 if b'"compacted"' not in head and b'"context_compacted"' not in head:
                     continue
@@ -445,7 +449,11 @@ def resolve_slot_activity(
     http_busy = bool(ws.get("busy"))
     waiting_count = int(ws.get("waiting_count") or 0)
     pending_tool_until = float(ws.get("pending_tool_call_until") or 0.0)
-    pinned_sid = str(ws.get("pinned_session_id") or fallback_session_id or "").strip()
+    pinned_sid = (
+        str(ws.get("pinned_session_id") or fallback_session_id or "").strip()
+        if ws.get("codex_activity_owner", True)
+        else ""
+    )
 
     codex_info = lookup_codex_thread_activity(
         pinned_sid,

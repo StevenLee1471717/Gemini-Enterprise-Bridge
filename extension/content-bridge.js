@@ -219,7 +219,8 @@
       indicatorUi.actionBtn.hidden = false;
       indicatorUi.pill.title = "Bridge 正在此标签页执行任务；点击“设为自用”可将该页移出接管池";
     } else if (mode === "overflow") {
-      indicatorUi.label.textContent = `超出上限 (${state.maxTabs || 10}页) · 未接管`;
+      indicatorUi.label.textContent =
+        state.maxTabs > 0 ? `超出上限 (${state.maxTabs}页) · 未接管` : "超出上限 · 未接管";
       indicatorUi.actionBtn.textContent = "锁定自用";
       indicatorUi.sep.hidden = false;
       indicatorUi.actionBtn.hidden = false;
@@ -768,6 +769,10 @@
       }
 
       if (msgType === "GEB_CANCEL_REQUEST") {
+        const queuedIndex = msgQueue.findIndex((queued) => queued.request_id === message.request_id);
+        if (queuedIndex !== -1) {
+          msgQueue.splice(queuedIndex, 1);
+        }
         postToMain("cancel_request", { request_id: message.request_id });
         sendResponse({ cancelled: true });
         return;

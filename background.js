@@ -7,7 +7,7 @@ const DEFAULT_SETTINGS = {
   enabled: true,
   driverMode: "auto", // auto | dom | replay
   autoSpawnTabs: true,
-  maxParallelTabs: 6,
+  maxParallelTabs: 10,
   customModelSelector: "",
   customInputSelector: "",
   customSendSelector: "",
@@ -17,6 +17,8 @@ const DEFAULT_SETTINGS = {
 const ALARM_NAME = "geb-keepalive-alarm";
 const UPDATE_CHECK_ALARM_NAME = "geb-update-check-alarm";
 const VERTEX_MATCH_PATTERN = "https://vertexaisearch.cloud.google.com/*";
+const DEFAULT_VERTEX_HOME_URL =
+  "https://vertexaisearch.cloud.google.com/home/cid/f8a26a7c-0f51-4098-bf58-52506661472b?hl=en_US";
 const EXPECTED_DRIVER_VERSION = "2.8.6";
 const DEFAULT_GITHUB_REPO = "StevenLee1471717/Gemini-Enterprise-Bridge";
 
@@ -32,8 +34,43 @@ const socketRuntime = {
 const runtimeTabMeta = new Map(); // tabId -> { activeModel, capturedRpc }
 const injectedTabVersions = new Map(); // tabId -> driverVersion
 const busyRequestsByTab = new Map(); // requestId -> tabId
+const preparingRequests = new Map(); // requestId -> { cancelled }
 let backendBusyTabIds = new Set(); // session-level active tabIds pushed by Bridge
 let managedTabOrder = new Set(); // stable admitted tabIds within maxParallelTabs
+const pendingManualTabIds = new Set(); // immediate guard while new manual tab persists
+let lastSavedVertexHomeUrl = "";
+let pendingIdleExtensionReload = false;
+
+function maybePerformIdleExtensionReload() {
+  if (!pendingIdleExtensionReload) return;
+  if (busyRequestsByTab.size > 0) return;
+  pendingIdleExtensionReload = false;
+  if (typeof chrome.runtime?.reload === "function") {
+    setTimeout(() => {
+      if (busyRequestsByTab.size === 0) {
+        try {
+          chrome.runtime.reload();
+        } catch (_) {}
+      }
+    }, 150);
+  }
+}
+
+function normalizeMaxParallelTabs(val, fallback = 10) {
+  let parsed = NaN;
+  if (typeof val === "string") {
+    const trimmed = val.trim();
+    if (!trimmed) return fallback;
+    if (!/^\d+$/.test(trimmed)) return fallback;
+    parsed = Number(trimmed);
+  } else if (typeof val === "number") {
+    parsed = val;
+  } else {
+    return fallback;
+  }
+  if (!Number.isInteger(parsed) || parsed < 1) return fallback;
+  return Math.min(200, parsed);
+}
 
 function extractVertexSessionKey(rawUrl) {
   if (!rawUrl || typeof rawUrl !== "string") return "";
@@ -117,6 +154,7 @@ async function setTabManualState(tabId, explicitManual = null) {
     if (skey) manualSessionKeys.add(skey);
     managedTabOrder.delete(numId);
   } else {
+    pendingManualTabIds.delete(numId);
     manualTabIds.delete(numId);
     if (skey) manualSessionKeys.delete(skey);
   }
@@ -126,6 +164,9 @@ async function setTabManualState(tabId, explicitManual = null) {
     manualTabIds: Array.from(manualTabIds),
     manualSessionKeys: cappedSessions
   });
+  if (targetManual) {
+    pendingManualTabIds.delete(numId);
+  }
   await appendLog(
     "info",
     targetManual
@@ -138,17 +179,24 @@ async function setTabManualState(tabId, explicitManual = null) {
 
 async function classifyAllVertexTabs() {
   const settings = await getSettings();
-  const maxTabs = Math.max(1, Number(settings.maxParallelTabs) || 6);
+  const maxTabs = normalizeMaxParallelTabs(settings.maxParallelTabs, 10);
   const wsConnected = Boolean(socketRuntime.ws && socketRuntime.ws.readyState === WebSocket.OPEN);
   const rawTabs = (await chrome.tabs.query({ url: VERTEX_MATCH_PATTERN })) || [];
-  const allTabs = rawTabs.filter((t) => Boolean(t && t.id));
+  const allTabs = rawTabs.filter((t) => Boolean(t && t.id && isUsableVertexTabUrl(t.url || "")));
+  for (const t of allTabs) {
+    const normalizedHome = normalizeVertexHomeUrl(t.url || "");
+    if (normalizedHome && hasVertexWorkspacePath(normalizedHome)) {
+      void rememberVertexHomeUrl(normalizedHome);
+      break;
+    }
+  }
   const { manualTabIds, manualSessionKeys } = await getManualExclusions();
 
   let sessionKeysDirty = false;
   const manualSet = new Set();
   for (const t of allTabs) {
     const skey = extractVertexSessionKey(t.url || "");
-    const byTab = manualTabIds.has(t.id);
+    const byTab = manualTabIds.has(t.id) || pendingManualTabIds.has(t.id);
     const bySession = Boolean(skey && manualSessionKeys.has(skey));
     if (byTab || bySession) {
       manualSet.add(t.id);
@@ -176,7 +224,8 @@ async function classifyAllVertexTabs() {
     if (aKnown !== bKnown) return aKnown - bKnown;
     return 0;
   });
-  const admittedIds = new Set(prioritized.slice(0, maxTabs).map((t) => t.id));
+  const admittedList = prioritized.slice(0, maxTabs);
+  const admittedIds = new Set(admittedList.map((t) => t.id));
   managedTabOrder = new Set(admittedIds);
 
   const managedTabs = allTabs.filter((t) => admittedIds.has(t.id));
@@ -250,7 +299,13 @@ async function broadcastTabTakeoverStates(precomputed = null) {
 
 async function getSettings() {
   const stored = await chrome.storage.local.get(Object.keys(DEFAULT_SETTINGS));
-  return { ...DEFAULT_SETTINGS, ...stored };
+  const merged = { ...DEFAULT_SETTINGS, ...stored };
+  const normCap = normalizeMaxParallelTabs(merged.maxParallelTabs, DEFAULT_SETTINGS.maxParallelTabs);
+  if (merged.maxParallelTabs !== normCap) {
+    merged.maxParallelTabs = normCap;
+    chrome.storage.local.set({ maxParallelTabs: normCap }).catch(() => {});
+  }
+  return merged;
 }
 
 async function getClientId() {
@@ -470,7 +525,7 @@ async function reportTabStatusToBackend() {
     captured_rpc: tabsSnapshot.some((t) => t.captured_rpc),
     active_model: primary ? primary.active_model : "",
     capabilities,
-    max_parallel_tabs: Math.max(1, Number(settings.maxParallelTabs) || 4),
+    max_parallel_tabs: normalizeMaxParallelTabs(settings.maxParallelTabs, 10),
     tabs: tabsSnapshot,
     user_agent: navigator.userAgent
   });
@@ -521,7 +576,7 @@ function startHeartbeatInterval() {
         driver_mode: settings.driverMode,
         captured_rpc: tabsSnapshot.some((t) => t.captured_rpc),
         capabilities,
-        max_parallel_tabs: Math.max(1, Number(settings.maxParallelTabs) || 4),
+        max_parallel_tabs: normalizeMaxParallelTabs(settings.maxParallelTabs, 10),
         tabs: tabsSnapshot
       });
     })();
@@ -670,16 +725,108 @@ async function ensureWebSocketConnected(forceReconnect = false, fromBackoffTimer
   }
 }
 
+function hasVertexWorkspacePath(rawOrPath) {
+  return /\/(?:cid|app)\/[^/?#]+/i.test(String(rawOrPath || ""));
+}
+
+function isUsableVertexTabUrl(rawUrl) {
+  if (!rawUrl || typeof rawUrl !== "string") return false;
+  try {
+    const u = new URL(rawUrl.trim());
+    if (!u.hostname.toLowerCase().endsWith("vertexaisearch.cloud.google.com")) {
+      return false;
+    }
+    const cleanPath = (u.pathname || "").replace(/\/+$/, "");
+    return Boolean(cleanPath);
+  } catch (_) {
+    return false;
+  }
+}
+
+function normalizeVertexHomeUrl(rawUrl) {
+  if (!rawUrl || typeof rawUrl !== "string") return "";
+  try {
+    const u = new URL(rawUrl.trim());
+    if (!u.hostname.toLowerCase().endsWith("vertexaisearch.cloud.google.com")) {
+      return "";
+    }
+    const nextPath = (u.pathname || "")
+      .replace(/\/r\/session\/[^/?#]+.*$/i, "")
+      .replace(/\/session\/[^/?#]+.*$/i, "")
+      .replace(/\/c\/[^/?#]+.*$/i, "")
+      .replace(/\/+$/, "");
+    if (!nextPath) {
+      return "";
+    }
+    u.pathname = nextPath;
+    u.hash = "";
+    return u.toString();
+  } catch (_) {
+    return "";
+  }
+}
+
+async function rememberVertexHomeUrl(cleanUrl) {
+  if (!cleanUrl || !hasVertexWorkspacePath(cleanUrl)) return;
+  if (cleanUrl === lastSavedVertexHomeUrl) return;
+  lastSavedVertexHomeUrl = cleanUrl;
+  try {
+    await chrome.storage.local.set({ lastVertexHomeUrl: cleanUrl });
+  } catch (_) {}
+}
+
+async function resolvePreferredVertexHomeUrl(tabs = [], baseUrlHint = "") {
+  const hintClean = normalizeVertexHomeUrl(baseUrlHint);
+  if (hintClean && hasVertexWorkspacePath(hintClean)) {
+    await rememberVertexHomeUrl(hintClean);
+    return hintClean;
+  }
+
+  const orderedTabs = Array.isArray(tabs)
+    ? tabs.filter((t) => t && t.active).concat(tabs.filter((t) => t && !t.active))
+    : [];
+  for (const t of orderedTabs) {
+    const clean = normalizeVertexHomeUrl((t && t.url) || "");
+    if (clean && hasVertexWorkspacePath(clean)) {
+      await rememberVertexHomeUrl(clean);
+      return clean;
+    }
+  }
+
+  let storedClean = "";
+  try {
+    const data = await chrome.storage.local.get("lastVertexHomeUrl");
+    storedClean = normalizeVertexHomeUrl(data && data.lastVertexHomeUrl ? data.lastVertexHomeUrl : "");
+    if (storedClean && hasVertexWorkspacePath(storedClean)) {
+      lastSavedVertexHomeUrl = storedClean;
+      return storedClean;
+    }
+  } catch (_) {}
+
+  if (hintClean) return hintClean;
+  for (const t of orderedTabs) {
+    const clean = normalizeVertexHomeUrl((t && t.url) || "");
+    if (clean) return clean;
+  }
+  if (storedClean) return storedClean;
+  return DEFAULT_VERTEX_HOME_URL;
+}
+
 function computeCleanVertexHomeUrl(rawUrl) {
   if (!rawUrl) return "";
   try {
     const u = new URL(rawUrl);
+    if (!u.hostname.toLowerCase().endsWith("vertexaisearch.cloud.google.com")) {
+      return "";
+    }
     const nextPath = u.pathname
       .replace(/\/r\/session\/[^/?#]+.*$/i, "")
       .replace(/\/session\/[^/?#]+.*$/i, "")
-      .replace(/\/c\/[^/?#]+.*$/i, "");
+      .replace(/\/c\/[^/?#]+.*$/i, "")
+      .replace(/\/+$/, "");
     if (nextPath && nextPath !== u.pathname) {
       u.pathname = nextPath;
+      u.hash = "";
       return u.toString();
     }
   } catch (_) {}
@@ -825,17 +972,10 @@ async function spawnParallelWorkerTab(baseUrlHint = "", preserveSessionUrl = fal
   }
 
   let targetUrl = "";
-  if (baseUrlHint && baseUrlHint.startsWith("https://vertexaisearch.cloud.google.com")) {
-    targetUrl = preserveSessionUrl
-      ? baseUrlHint
-      : (computeCleanVertexHomeUrl(baseUrlHint) || baseUrlHint);
-  }
-  if (!targetUrl && allVertexTabs.length > 0) {
-    const refUrl = allVertexTabs[0].url || "";
-    targetUrl = computeCleanVertexHomeUrl(refUrl) || refUrl;
-  }
-  if (!targetUrl) {
-    targetUrl = "https://vertexaisearch.cloud.google.com/";
+  if (preserveSessionUrl && isUsableVertexTabUrl(baseUrlHint)) {
+    targetUrl = baseUrlHint.trim();
+  } else {
+    targetUrl = await resolvePreferredVertexHomeUrl(allVertexTabs, baseUrlHint);
   }
 
   const createOpts = { url: targetUrl, active: false };
@@ -1146,6 +1286,7 @@ async function deliverResultToBackend(eventData) {
         })
       });
       if (resp.ok) {
+        maybePerformIdleExtensionReload();
         return;
       }
     } catch (_) {
@@ -1172,6 +1313,7 @@ async function deliverResultToBackend(eventData) {
       chunked: true,
       total_chunks: totalChunks
     });
+    maybePerformIdleExtensionReload();
     return;
   }
 
@@ -1179,6 +1321,7 @@ async function deliverResultToBackend(eventData) {
     await ensureWebSocketConnected(false);
   }
   sendWsJson(eventData);
+  maybePerformIdleExtensionReload();
 }
 
 async function handleBackendCommand(msg) {
@@ -1194,11 +1337,34 @@ async function handleBackendCommand(msg) {
     return;
   }
 
+  if (type === "set_max_parallel_tabs") {
+    const nextMax = normalizeMaxParallelTabs(msg.max_parallel_tabs, 10);
+    const patch = { maxParallelTabs: nextMax };
+    if (typeof msg.auto_spawn_tabs === "boolean") {
+      patch.autoSpawnTabs = msg.auto_spawn_tabs;
+    }
+    await chrome.storage.local.set(patch);
+    await reportTabStatusToBackend();
+    sendWsJson({
+      type: "set_max_parallel_tabs_ack",
+      ok: true,
+      max_parallel_tabs: nextMax
+    });
+    return;
+  }
+
   if (type === "extension_reload_available" || type === "reload_extension") {
+    if (msg.when_idle && busyRequestsByTab.size > 0) {
+      pendingIdleExtensionReload = true;
+      if (type === "reload_extension") {
+        sendWsJson({ type: "reload_extension_ack", ok: true, deferred: true });
+      }
+      return;
+    }
     if (type === "reload_extension") {
       sendWsJson({ type: "reload_extension_ack", ok: true });
-    }
-    if (busyRequestsByTab.size > 0) {
+    } else if (busyRequestsByTab.size > 0) {
+      pendingIdleExtensionReload = true;
       return;
     }
     if (typeof chrome.runtime?.reload === "function") {
@@ -1327,6 +1493,9 @@ async function handleBackendCommand(msg) {
 
   if (type === "execute_prompt") {
     const requestId = msg.request_id;
+    if (preparingRequests.has(requestId) || busyRequestsByTab.has(requestId)) return;
+    const preparation = { cancelled: false };
+    preparingRequests.set(requestId, preparation);
     let tabResetDone = false;
     try {
       let assembledPrompt = String(msg.prompt || "");
@@ -1338,6 +1507,7 @@ async function handleBackendCommand(msg) {
       }
 
       const rawTab = await findTargetVertexTab(msg.tab_id);
+      if (preparation.cancelled) return;
       if (!rawTab || !rawTab.id) {
         sendWsJson({
           type: "request_error",
@@ -1348,9 +1518,12 @@ async function handleBackendCommand(msg) {
         });
         return;
       }
+      if (Array.from(busyRequestsByTab.values()).includes(rawTab.id)) {
+        throw new Error("该 Google 标签页仍在处理上一项请求");
+      }
 
-      sendWsJson({ type: "request_ack", request_id: requestId, tab_id: rawTab.id });
       busyRequestsByTab.set(requestId, rawTab.id);
+      sendWsJson({ type: "request_ack", request_id: requestId, tab_id: rawTab.id });
       void broadcastTabTakeoverStates();
 
       const tab = await prepareTabForBackgroundExecution(rawTab);
@@ -1364,7 +1537,9 @@ async function handleBackendCommand(msg) {
           (msg.reset_chat ? " [new_chat]" : "")
       );
 
+      if (preparation.cancelled) return;
       await ensureTabBridgeReady(tab.id);
+      if (preparation.cancelled) return;
 
       let remainingResetChat = Boolean(msg.reset_chat);
       if (remainingResetChat) {
@@ -1375,8 +1550,10 @@ async function handleBackendCommand(msg) {
         }
       }
 
+      if (preparation.cancelled) return;
       await ensureTabBridgeReady(tab.id);
       const settings = await getSettings();
+      if (preparation.cancelled) return;
       const callbackUrl = msg.callback_url || deriveCallbackUrlFromWs(settings.wsUrl);
 
       const dispatchToReadyTab = async () => {
@@ -1384,6 +1561,7 @@ async function handleBackendCommand(msg) {
         if (assembledPrompt.length > TAB_IPC_CHUNK_SIZE) {
           const totalChunks = Math.ceil(assembledPrompt.length / TAB_IPC_CHUNK_SIZE);
           for (let i = 0; i < totalChunks; i += 1) {
+            if (preparation.cancelled) return;
             await chrome.tabs.sendMessage(tab.id, {
               type: "GEB_PROMPT_CHUNK",
               request_id: requestId,
@@ -1392,6 +1570,7 @@ async function handleBackendCommand(msg) {
               data: assembledPrompt.slice(i * TAB_IPC_CHUNK_SIZE, (i + 1) * TAB_IPC_CHUNK_SIZE)
             });
           }
+          if (preparation.cancelled) return;
           await chrome.tabs.sendMessage(tab.id, {
             type: "GEB_EXECUTE_PROMPT",
             request_id: requestId,
@@ -1414,6 +1593,7 @@ async function handleBackendCommand(msg) {
             }
           });
         } else {
+          if (preparation.cancelled) return;
           await chrome.tabs.sendMessage(tab.id, {
             type: "GEB_EXECUTE_PROMPT",
             request_id: requestId,
@@ -1443,30 +1623,45 @@ async function handleBackendCommand(msg) {
       if (busyRequestsByTab.delete(requestId)) {
         void broadcastTabTakeoverStates();
       }
-      sendWsJson({
-        type: "request_error",
-        request_id: requestId,
-        submitted: false,
-        tab_reset: tabResetDone,
-        error: "Gemini 工作页面恢复或发送失败: " + err.message
-      });
+      if (!preparation.cancelled) {
+        sendWsJson({
+          type: "request_error",
+          request_id: requestId,
+          submitted: false,
+          tab_reset: tabResetDone,
+          error: "Gemini 工作页面恢复或发送失败: " + err.message
+        });
+      }
+      maybePerformIdleExtensionReload();
+    } finally {
+      preparingRequests.delete(requestId);
+      if (preparation.cancelled && busyRequestsByTab.delete(requestId)) {
+        void broadcastTabTakeoverStates();
+        maybePerformIdleExtensionReload();
+      }
     }
     return;
   }
 
   if (type === "cancel_request") {
-    if (msg.request_id && busyRequestsByTab.delete(msg.request_id)) {
-      void broadcastTabTakeoverStates();
-    }
-    const tab = await findTargetVertexTab(msg.tab_id);
-    if (tab && tab.id) {
+    const requestId = msg.request_id;
+    if (!requestId) return;
+    swPromptReassembly.delete(requestId);
+    const preparation = preparingRequests.get(requestId);
+    if (preparation) preparation.cancelled = true;
+    const tabId = busyRequestsByTab.get(requestId) || Number(msg.tab_id);
+    if (tabId) {
       try {
-        await chrome.tabs.sendMessage(tab.id, {
+        await chrome.tabs.sendMessage(tabId, {
           type: "GEB_CANCEL_REQUEST",
-          request_id: msg.request_id
+          request_id: requestId
         });
       } catch (_) {}
     }
+    if (!preparation && busyRequestsByTab.delete(requestId)) {
+      void broadcastTabTakeoverStates();
+    }
+    maybePerformIdleExtensionReload();
   }
 }
 
@@ -1501,7 +1696,7 @@ chrome.alarms.onAlarm.addListener((alarm) => {
 
 chrome.tabs.onUpdated.addListener((tabId, changeInfo, tab) => {
   if (changeInfo.status === "loading") injectedTabVersions.delete(tabId);
-  if (changeInfo.status === "complete" && tab.url && tab.url.startsWith("https://vertexaisearch.cloud.google.com/")) {
+  if (changeInfo.status === "complete" && tab.url && isUsableVertexTabUrl(tab.url)) {
     void (async () => {
       await protectTabFromFreeze(tabId);
       await ensureWebSocketConnected(false);
@@ -1514,6 +1709,7 @@ chrome.tabs.onRemoved.addListener((tabId) => {
   runtimeTabMeta.delete(tabId);
   injectedTabVersions.delete(tabId);
   managedTabOrder.delete(tabId);
+  pendingManualTabIds.delete(tabId);
   for (const [reqId, tid] of busyRequestsByTab) {
     if (tid === tabId) busyRequestsByTab.delete(reqId);
   }
@@ -1696,7 +1892,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
         const activeTabs = await chrome.tabs.query({ active: true, currentWindow: true });
         const fTab = activeTabs && activeTabs[0] ? activeTabs[0] : null;
         if (fTab && fTab.id) {
-          const isVertex = Boolean(fTab.url && fTab.url.startsWith("https://vertexaisearch.cloud.google.com/"));
+          const isVertex = isUsableVertexTabUrl(fTab.url || "");
           const tState = isVertex ? cls.perTabState.get(fTab.id) || null : null;
           focusedTabInfo = {
             id: fTab.id,
@@ -1778,27 +1974,41 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
       return;
     }
 
-    if (msgType === "GEB_POPUP_OPEN_MANUAL_TAB") {
+    if (
+      msgType === "GEB_POPUP_OPEN_MANUAL_TAB" ||
+      msgType === "GEB_POPUP_OPEN_VERTEX_TAB" ||
+      msgType === "GEB_POPUP_OPEN_CLEAN_TAB"
+    ) {
+      const wantManual =
+        msgType === "GEB_POPUP_OPEN_MANUAL_TAB" ||
+        (msgType === "GEB_POPUP_OPEN_CLEAN_TAB" && Boolean(message.manual));
       const cls = await classifyAllVertexTabs();
-      let targetUrl = "https://vertexaisearch.cloud.google.com/";
-      if (cls.allTabs.length > 0) {
-        const refUrl = cls.allTabs[0].url || "";
-        targetUrl = computeCleanVertexHomeUrl(refUrl) || targetUrl;
-      }
+      const targetUrl = await resolvePreferredVertexHomeUrl(cls.allTabs, message.url || "");
       const created = await chrome.tabs.create({ url: targetUrl, active: true });
-      if (created && created.id) {
+      if (wantManual && created && created.id) {
+        pendingManualTabIds.add(created.id);
+        managedTabOrder.delete(created.id);
         await setTabManualState(created.id, true);
         waitForTabComplete(created.id, 14000)
           .then(() => ensureScriptsInjected(created.id))
           .then(() => reportTabStatusToBackend())
           .catch(() => {});
       }
-      sendResponse({ ok: true, tabId: created ? created.id : null });
+      sendResponse({
+        ok: true,
+        handled: true,
+        manual: wantManual,
+        tabId: created ? created.id : null,
+        url: targetUrl
+      });
       return;
     }
 
     if (msgType === "GEB_POPUP_SAVE_SETTINGS") {
-      const patch = message.settings || {};
+      const patch = { ...(message.settings || {}) };
+      if (patch.maxParallelTabs !== undefined) {
+        patch.maxParallelTabs = normalizeMaxParallelTabs(patch.maxParallelTabs, 10);
+      }
       const current = await getSettings();
       const updated = { ...current, ...patch };
       await chrome.storage.local.set(updated);

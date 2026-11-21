@@ -1,6 +1,7 @@
 """Regression checks for file fidelity, continuation, and Carbon-only configuration."""
 import copy
 import json
+import os
 import tomllib
 
 from agent_policy import (
@@ -180,9 +181,11 @@ def test_ccswitch_sync_preserves_other_presets_and_credentials(tmp_path):
         rows = {key: json.loads(raw) for key, raw in conn.execute('SELECT id,settings_config FROM providers')}
     assert rows['other'] == other and rows['local']['auth'] == local['auth']
     assert tomllib.loads(rows['local']['config'])['model_auto_compact_token_limit'] == CARBON_AUTO_COMPACT_TOKENS
-    import os
-    expected_mode = 0o666 if os.name == 'nt' else 0o600
-    assert (backup / 'cc-switch.db').stat().st_mode & 0o777 == expected_mode
+    backup_mode = (backup / 'cc-switch.db').stat().st_mode & 0o777
+    if os.name == 'nt':
+        assert (backup_mode & 0o600) == 0o600
+    else:
+        assert backup_mode == 0o600
     assert update_ccswitch(database, False, None) == []
 
 
@@ -201,3 +204,111 @@ def test_catalog_workflow_is_not_duplicated_by_bridge():
     messages = [ChatMessage(role='developer', content=CODING_WORKFLOW), ChatMessage(role='user', content='Read a file')]
     prepared = ConversationContextBuilder().build(messages, tools=[shell_tool()])
     assert prepared.prompt.count('[Coding workflow]') == 1
+
+
+def test_subagent_prompt_sync_covers_all_gemini_models_and_tool_reminders():
+    from tool_calling import build_tool_delta_reminder
+    source = {
+        'models': [
+            {'slug': 'gpt-6.1-sol', 'model_messages': {'multi_agent': {'role': {'root': 'keep'}}}},
+            {
+                'slug': 'gemini-3.8-flash',
+                'base_instructions': 'You are Codex, an agent based on GPT-6.',
+                'model_messages': {
+                    'instructions_template': 'You are Codex, an agent based on GPT-6.',
+                    'multi_agent': {'role': {'root': 'encrypted_v2_only'}},
+                },
+            },
+        ]
+    }
+    updated = json.loads(update_catalog(json.dumps(source)))
+    assert updated['models'][0]['model_messages']['multi_agent'] == {'role': {'root': 'keep'}}
+    flash = updated['models'][1]
+    assert flash['model_messages']['multi_agent'] is None
+    assert '# Multi-agent coordination' in flash['base_instructions']
+    assert 'parallel sub-agent calls' in flash['base_instructions']
+
+    spawn_tool = {
+        'type': 'function',
+        'function': {
+            'name': 'multi_agent_v1.spawn_agent',
+            'description': (
+                'Spawn a sub-agent.\n'
+                'Do not spawn sub-agents unless the user or applicable AGENTS.md/skill instructions explicitly ask.\n'
+                'Requests for depth, thoroughness, research, investigation, or detailed codebase analysis do not count as permission to spawn.\n'
+                'Agent-role guidance below only helps choose which agent to use after spawning is already authorized; it never authorizes spawning by itself.'
+            ),
+            'parameters': {'type': 'object', 'properties': {'message': {'type': 'string'}}},
+        },
+    }
+    rendered = build_tool_system_instructions([spawn_tool])
+    assert 'Do not spawn sub-agents unless' not in rendered
+    assert 'Follow user and AGENTS.md delegation rules' in rendered
+    assert 'Coordinator note:' in rendered
+
+    delta = build_tool_delta_reminder([spawn_tool], has_tool_results=True, parallel_tool_calls=True)
+    assert 'independent sub-agent calls' in delta
+
+
+def test_github_copilot_selective_tool_batching():
+    import pytest
+    from agent_policy import has_coding_tools
+    from tool_calling import ToolProtocolError, parse_assistant_output
+
+    def _tool(name: str) -> dict:
+        return {'type': 'function', 'function': {'name': name, 'parameters': {'type': 'object'}}}
+
+    def _call(name: str, args: dict) -> str:
+        return f"```codex_tool_call\n{json.dumps({'name': name, 'arguments': args}, ensure_ascii=False)}\n```\n"
+
+    copilot_tools = [
+        _tool('view'),
+        _tool('grep'),
+        _tool('glob'),
+        _tool('lsp'),
+        _tool('edit'),
+        _tool('create'),
+        _tool('powershell'),
+        _tool('multi_replace_string_in_file'),
+    ]
+    assert has_coding_tools(copilot_tools) is True
+
+    # 1. Parallel read-only Copilot inspections + read-only PowerShell + non-rename LSP
+    reads = (
+        _call('view', {'path': r'I:\repo\a.py'})
+        + _call('grep', {'pattern': 'foo'})
+        + _call('glob', {'pattern': '**/*.py'})
+        + _call('lsp', {'operation': 'hover', 'file': r'I:\repo\a.py', 'line': 1, 'character': 1})
+        + _call('powershell', {'command': 'git status -s'})
+    )
+    assert len(parse_assistant_output(reads, copilot_tools).tool_calls) == 5
+
+    # 2. Disjoint Copilot edits / creates may be batched
+    disjoint = (
+        _call('edit', {'path': r'I:\repo\a.py', 'old_str': '1', 'new_str': '2'})
+        + _call('create', {'path': r'I:\repo\b.py', 'file_text': 'x = 1'})
+    )
+    assert len(parse_assistant_output(disjoint, copilot_tools).tool_calls) == 2
+
+    # 3. Same-file Copilot edits must be rejected
+    with pytest.raises(ToolProtocolError):
+        parse_assistant_output(
+            _call('edit', {'path': r'I:\repo\a.py', 'old_str': '1', 'new_str': '2'})
+            + _call('edit', {'path': r'I:\repo\a.py', 'old_str': '3', 'new_str': '4'}),
+            copilot_tools,
+        )
+
+    # 4. Mutating LSP rename or mutating PowerShell cannot be mixed with reads
+    with pytest.raises(ToolProtocolError):
+        parse_assistant_output(
+            _call('view', {'path': r'I:\repo\a.py'})
+            + _call('lsp', {'operation': 'rename', 'file': r'I:\repo\a.py', 'line': 1, 'character': 1, 'newName': 'bar'}),
+            copilot_tools,
+        )
+    with pytest.raises(ToolProtocolError):
+        parse_assistant_output(
+            _call('view', {'path': r'I:\repo\a.py'})
+            + _call('powershell', {'command': 'pytest -q'}),
+            copilot_tools,
+        )
+

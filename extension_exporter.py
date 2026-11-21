@@ -15,6 +15,8 @@ from typing import Any, Dict, Iterable, Tuple
 
 from version import APP_VERSION, get_github_repo, get_release_download_base
 
+from platform_compat import reconfigure_stdio_utf8
+
 
 def _make_png_chunk(chunk_type: bytes, data: bytes) -> bytes:
     crc = zlib.crc32(chunk_type + data) & 0xFFFFFFFF
@@ -346,4 +348,5 @@ def main() -> None:
 
 
 if __name__ == "__main__":
+    reconfigure_stdio_utf8()
     main()

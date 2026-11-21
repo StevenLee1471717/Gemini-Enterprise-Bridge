@@ -1,8 +1,8 @@
 # Chrome Web Store Listing & Permissions Reference
 
 **Extension Name:** Gemini Enterprise Web-to-API Bridge  
-**Current Version:** 1.4.1  
-**Last Updated:** 2026-11-17  
+**Current Version:** 1.5.0  
+**Last Updated:** 2026-11-21  
 **Distribution Target:** Local Developer Unpacked Extension / Private Enterprise Internal Distribution
 
 ---
@@ -18,7 +18,7 @@ Gemini Enterprise Web-to-API Bridge lets developers and researchers use their ac
 ### Key Benefits
 - **Zero credential extraction:** Uses your normal signed-in browser tab directly without copying cookies or tokens to external servers.
 - **Local-only gateway:** Connects exclusively to `127.0.0.1` / `localhost` on your own machine.
-- **Direct model selection:** Choose Gemini 3.1 Pro, Gemini 4 Argon, Gemini 4 Carbon, Gemini 3.8 Flash, or custom enterprise models directly from your local client.
+- **Direct & future-proof model selection:** Choose Gemini 4 Hydrogen, Gemini 4 Carbon, Gemini 4 Argon, Gemini 3.1 Pro, Gemini 3.8 Flash, or newly released enterprise models automatically discovered from your web session.
 - **Agentic & tool-calling ready:** Supports multi-step local tool execution workflows alongside real-time streaming responses.
 - **Multi-account workspace support:** Select which signed-in `/u/0/`, `/u/1/`, or `/u/3/` Gemini Enterprise tab handles your requests.
 - **One-click diagnostics:** Check page readiness, start a fresh conversation, or pause bridging anytime from the toolbar popup.
@@ -51,6 +51,7 @@ Every permission in `manifest.json` is strictly scoped to local bridging:
 
 ## Version History
 
+- **1.5.0 (2026-11-21):** Merged upstream concurrency & infrastructure updates tailored for GitHub Copilot — added selective batch tool calling for GitHub Copilot CLI/App/VS Code Chat tools, up to 64 live browser seat caps & strict session affinity, Cloudflare Tunnel lifecycle management with Windows sleep/wake recovery, `/status` public status monitor, granular client quotas, Windows 10/11 compatibility (including UNC SMB hang fix), plus Gemini 4 Hydrogen and dynamic web model auto-discovery (`page-driver.js` `v2.8.7`).
 - **1.4.1 (2026-11-17):** Fixed attachment upload format errors across all file, image, audio, and video attachments, added seamless compatibility during background extension updates, and preserved standalone file uploads sent without accompanying message text.
 - **1.4.0 (2026-11-16):** Integrated ahead fork enhancements (SQLite session archive & URL re-entry, Codex activity tracking, multi-client API distribution & tenant isolation, compaction auto-reset, UsageLedger, manual self-use tab toggle), upgraded direct web multimodal file/clipboard-paste upload & Copilot vision capability sync, and added runtime-configurable backend debug logging (`/api/logs` & `BRIDGE_LOG_LEVEL`).
 - **1.3.0 (2026-11-16):** Integrated OpenAI `/v1/responses` & `/v1/files` support, multimodal media generation/transcoding, decorated snapshot deduplication, and global worker concurrency & stream integrity hardening (`page-driver.js` `v2.6.5`).

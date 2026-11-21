@@ -19,7 +19,7 @@ const UPDATE_CHECK_ALARM_NAME = "geb-update-check-alarm";
 const VERTEX_MATCH_PATTERN = "https://vertexaisearch.cloud.google.com/*";
 const DEFAULT_VERTEX_HOME_URL =
   "https://vertexaisearch.cloud.google.com/home/cid/f8a26a7c-0f51-4098-bf58-52506661472b?hl=en_US";
-const EXPECTED_DRIVER_VERSION = "2.8.6";
+const EXPECTED_DRIVER_VERSION = "2.8.7";
 const DEFAULT_GITHUB_REPO = "StevenLee1471717/Gemini-Enterprise-Bridge";
 
 // Live non-serializable WebSocket handle & per-tab fast caches; durable settings live in chrome.storage
@@ -477,9 +477,10 @@ async function injectIntoExistingTabs() {
 async function buildReportedTabsSnapshot(precomputedCls = null) {
   const cls = precomputedCls || (await classifyAllVertexTabs());
   const tabs = cls.managedTabs;
-  const { capturedRpc = false, activeModel = "" } = await chrome.storage.session.get([
+  const { capturedRpc = false, activeModel = "", availableModels = [] } = await chrome.storage.session.get([
     "capturedRpc",
-    "activeModel"
+    "activeModel",
+    "availableModels"
   ]);
   return tabs.map((t) => {
     const meta = runtimeTabMeta.get(t.id) || {};
@@ -489,6 +490,9 @@ async function buildReportedTabsSnapshot(precomputedCls = null) {
       tab_title: t.title || "",
       ready: Boolean(t.id),
       active_model: meta.activeModel || activeModel || "",
+      available_models: Array.isArray(meta.availableModels) && meta.availableModels.length > 0
+        ? meta.availableModels
+        : (Array.isArray(availableModels) ? availableModels : []),
       captured_rpc: meta.capturedRpc !== undefined ? Boolean(meta.capturedRpc) : Boolean(capturedRpc)
     };
   });
@@ -498,6 +502,7 @@ async function reportTabStatusToBackend() {
   const cls = await classifyAllVertexTabs();
   const settings = cls.settings;
   const tabsSnapshot = await buildReportedTabsSnapshot(cls);
+  const { availableModels = [] } = await chrome.storage.session.get(["availableModels"]);
   const primary = tabsSnapshot[0] || null;
   const capabilities = ["multi_tab", "reset_tab", "open_session", "session_busy_sync", "usage_push", "auto_update"];
   if (settings.autoSpawnTabs !== false) {
@@ -524,6 +529,7 @@ async function reportTabStatusToBackend() {
     driver_mode: settings.driverMode,
     captured_rpc: tabsSnapshot.some((t) => t.captured_rpc),
     active_model: primary ? primary.active_model : "",
+    available_models: Array.isArray(availableModels) ? availableModels : [],
     capabilities,
     max_parallel_tabs: normalizeMaxParallelTabs(settings.maxParallelTabs, 10),
     tabs: tabsSnapshot,
@@ -1095,9 +1101,9 @@ const swReplyReassembly = new Map();
 function getExtensionVersion() {
   try {
     const mf = chrome.runtime?.getManifest?.();
-    return mf && mf.version ? String(mf.version) : "1.4.1";
+    return mf && mf.version ? String(mf.version) : "1.5.0";
   } catch (_) {
-    return "1.4.1";
+    return "1.5.0";
   }
 }
 
@@ -1823,6 +1829,20 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
         if (typeof eventData.active_model === "string" && eventData.active_model) {
           nextMeta.activeModel = eventData.active_model;
           await chrome.storage.session.set({ activeModel: eventData.active_model });
+        }
+        if (Array.isArray(eventData.available_models) && eventData.available_models.length > 0) {
+          nextMeta.availableModels = eventData.available_models.slice(0, 64);
+          const { availableModels: prevAvail = [] } = await chrome.storage.session.get(["availableModels"]);
+          const merged = Array.isArray(prevAvail) ? prevAvail.slice() : [];
+          const seenLow = new Set(merged.map((m) => String(m).toLowerCase()));
+          for (const rawItem of eventData.available_models) {
+            const lbl = String(rawItem || "").trim();
+            if (lbl && !seenLow.has(lbl.toLowerCase())) {
+              merged.push(lbl);
+              seenLow.add(lbl.toLowerCase());
+            }
+          }
+          await chrome.storage.session.set({ availableModels: merged.slice(-64) });
         }
         runtimeTabMeta.set(senderTabId, nextMeta);
       }

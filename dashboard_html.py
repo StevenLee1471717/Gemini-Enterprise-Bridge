@@ -2603,6 +2603,7 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
               <div class="probe-controls">
                 <select id="modelSelect" class="clean-select" aria-label="选择测试模型">
                   <option value="gemini-4-carbon" selected>Carbon（默认主力）</option>
+                  <option value="gemini-4-hydrogen">Hydrogen（深度推理）</option>
                   <option value="gemini-4-argon">Argon（高阶推理）</option>
                   <option value="gemini-3.1-pro">Gemini 3.1 Pro</option>
                   <option value="gemini-3.8-flash">Gemini 3.8 Flash</option>
@@ -2700,7 +2701,7 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
       <div class="copy-row">
         <div class="copy-meta">
           <div class="copy-label">其他可选模型</div>
-          <div class="copy-val" id="copyOtherModels">gemini-4-argon, gemini-3.1-pro, gemini-3.8-flash</div>
+          <div class="copy-val" id="copyOtherModels">gemini-4-hydrogen, gemini-4-argon, gemini-3.1-pro, gemini-3.8-flash</div>
         </div>
         <button type="button" class="btn sm soft" data-copy-target="copyOtherModels">复制</button>
       </div>
@@ -3095,17 +3096,73 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
         return '¥' + (c > 0 && c < 0.01 ? c.toFixed(4) : c.toFixed(2));
       }
 
+      let dynamicExtraModels = [];
+
       function friendlyModel(raw) {
-        const s = String(raw || '').toLowerCase();
+        const str = String(raw || '').trim();
+        const s = str.toLowerCase();
         if (!s) return 'Carbon';
+        if (s.includes('hydrogen')) return 'Hydrogen';
         if (s.includes('carbon')) return 'Carbon';
         if (s.includes('argon')) return 'Argon';
-        if (s.includes('3.1-pro') || s === '3-pro') return 'Gemini 3.1 Pro';
-        if (s.includes('3.8-flash') || s === '3-flash') return 'Gemini 3.8 Flash';
-        if (s.includes('2.5-pro')) return 'Gemini 2.5 Pro';
-        if (s.includes('2.5-flash')) return 'Gemini 2.5 Flash';
+        if (s.includes('3.1-pro') || s === '3-pro' || s.includes('3.1')) return 'Gemini 3.1 Pro';
+        if (s.includes('3.8-flash') || s === '3-flash' || s.includes('3.8')) return 'Gemini 3.8 Flash';
+        if (s.includes('2.5-pro') || (s.includes('2.5') && s.includes('pro'))) return 'Gemini 2.5 Pro';
+        if (s.includes('2.5-flash') || (s.includes('2.5') && s.includes('flash'))) return 'Gemini 2.5 Flash';
         if (s.includes('enterprise-web') || s === 'auto' || s === 'default') return 'Carbon';
-        return String(raw);
+        const stripped = str.replace(/^(?:gemini-web:|web:|gemini-)/i, '').trim();
+        if (stripped && stripped !== str) {
+          return stripped
+            .split(/[\s_\-]+/)
+            .filter(Boolean)
+            .map(function (p) { return /^\d/.test(p) ? p : (p.charAt(0).toUpperCase() + p.slice(1)); })
+            .join(' ');
+        }
+        return str;
+      }
+
+      function syncDynamicModelOptions(availableModels, defModel) {
+        const sel = document.getElementById('modelSelect');
+        if (!sel || !Array.isArray(availableModels)) return;
+        const existingVals = new Set();
+        Array.from(sel.querySelectorAll('option')).forEach(function (opt) {
+          existingVals.add(String(opt.value || '').toLowerCase());
+        });
+        let dynGroup = document.getElementById('discoveredModelsGroup');
+        const addedExtras = [];
+        availableModels.forEach(function (mid) {
+          const mStr = String(mid || '').trim();
+          const mLow = mStr.toLowerCase();
+          if (!mStr || mLow.endsWith('-newchat') || mLow === 'gemini-enterprise-gcloud') return;
+          if (!existingVals.has(mLow)) {
+            if (!dynGroup) {
+              dynGroup = document.createElement('optgroup');
+              dynGroup.id = 'discoveredModelsGroup';
+              dynGroup.label = '自动发现的新模型';
+              sel.appendChild(dynGroup);
+            }
+            const opt = document.createElement('option');
+            opt.value = mStr;
+            opt.textContent = friendlyModel(mStr) + '（自动适配）';
+            dynGroup.appendChild(opt);
+            existingVals.add(mLow);
+          }
+          if (
+            mLow !== 'gemini-enterprise-web' &&
+            mLow !== 'gemini-2.5-pro' &&
+            mLow !== 'gemini-2.5-flash' &&
+            mLow !== String(defModel || 'gemini-4-carbon').toLowerCase()
+          ) {
+            addedExtras.push(mStr);
+          }
+        });
+        if (addedExtras.length > 0) {
+          dynamicExtraModels = addedExtras;
+          const otherEl = document.getElementById('copyOtherModels');
+          if (otherEl) {
+            otherEl.textContent = addedExtras.join(', ');
+          }
+        }
       }
 
       function friendlyStrategyBadge(strategy) {
@@ -4056,6 +4113,9 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
           }
 
           lastDefaultModel = data.default_model || 'gemini-4-carbon';
+          if (Array.isArray(data.available_models)) {
+            syncDynamicModelOptions(data.available_models, lastDefaultModel);
+          }
           if (data.distribution) renderDistribution(data.distribution, lastDefaultModel);
           if (data.tunnel) renderTunnel(data.tunnel, data.distribution);
           if (data.usage) renderLedger(data.usage, data.context_monitor);
@@ -4467,8 +4527,13 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
         const baseOrigin = apiBase.endsWith('/v1') ? stripTrailingSlashes(apiBase.slice(0, -3)) : stripTrailingSlashes(apiBase);
         const statusUrl = baseOrigin + '/status';
         const keyStr = clientObj.api_key || clientObj.key_preview || '';
-        const defaultCatalog = ['gemini-4-carbon', 'gemini-4-argon', 'gemini-3.1-pro', 'gemini-3.8-flash'];
+        const defaultCatalog = ['gemini-4-carbon', 'gemini-4-hydrogen', 'gemini-4-argon', 'gemini-3.1-pro', 'gemini-3.8-flash'];
         if (defModel && defaultCatalog.indexOf(defModel) === -1) defaultCatalog.unshift(defModel);
+        if (Array.isArray(dynamicExtraModels)) {
+          dynamicExtraModels.forEach(function (mid) {
+            if (mid && defaultCatalog.indexOf(mid) === -1) defaultCatalog.push(mid);
+          });
+        }
         const modelList = (Array.isArray(clientObj.allowed_models) && clientObj.allowed_models.length > 0)
           ? clientObj.allowed_models
           : defaultCatalog;

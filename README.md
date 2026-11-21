@@ -91,9 +91,10 @@ cd I:\Projects\Gemini-Enterprise-Bridge
 | **Model（自动切换 Gemini 3.1 Pro）** | `gemini-3.1-pro`（简写：`3.1pro` / `3.1-pro`；新建对话：`gemini-3.1-pro-newchat`） |
 | **Model（自动切换 Gemini 4 Argon）** | `gemini-4-argon`（简写：`4argon` / `4-argon`；新建对话：`gemini-4-argon-newchat`） |
 | **Model（自动切换 Gemini 4 Carbon）** | `gemini-4-carbon`（简写：`4carbon` / `4-carbon`；新建对话：`gemini-4-carbon-newchat`） |
+| **Model（自动切换 Gemini 4 Hydrogen）** | `gemini-4-hydrogen`（简写：`4hydrogen` / `4-hydrogen` / `hydrogen`；新建对话：`gemini-4-hydrogen-newchat`） |
 | **Model（自动切换 Gemini 3.8 Flash）** | `gemini-3.8-flash`（简写：`3.8flash` / `3.8-flash`；新建对话：`gemini-3.8-flash-newchat`） |
-| **Model（多会话固定绑定语法）** | 任意模型名后追加 `@会话名`（如 `gemini-4-argon@agent1`、`3.1pro@agent2`）或请求头 `X-Session-Id` |
-| **Model（其他网页模型透传）** | `gemini-2.5-pro`、`gemini-2.5-flash` 或任意 `gemini-web:<网页菜单名称>` |
+| **Model（多会话固定绑定语法）** | 任意模型名后追加 `@会话名`（如 `gemini-4-hydrogen@agent1`、`3.1pro@agent2`）或请求头 `X-Session-Id` |
+| **Model（未来模型自动适配与透传）** | 自动适配未来发布的任意版本/元素代号模型（如 `gemini-5-pro`、`5pro`、`gemini-4-oxygen`、`4oxygen`、`gemini-2.5-pro`）及任意 `gemini-web:<网页菜单名称>`，并从网页菜单实时同步发现新模型 |
 | **Model（官方 GCloud 模式）** | `gemini-enterprise-gcloud` |
 
 > **提示**：网关同时兼容将 Base URL 填为 `http://127.0.0.1:8000` 或 `http://127.0.0.1:8000/v1`。`GET /v1/models` 与单模型检索接口 `GET /v1/models/{model_id}`（含 `4argon`、`4carbon`、`gemini-4-carbon@sess1` 等别名）均完整声明 `1,048,576` 上下文窗口与 `65,536` 输出上限（`max_prompt_tokens`、`max_output_tokens`、`context_window`、`limits` 等全生态字段）。若此前在 GitHub Copilot App 中添加 BYOK 模型时 `max_prompt_tokens` 为空导致被回退限制为 `128,000`，启动网关（或手动运行 `python sync_client_limits.py` / `python updater.py --sync-client-limits`）会自动同步修复本地 `provider_models` 上限。

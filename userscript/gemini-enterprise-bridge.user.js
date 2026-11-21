@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Gemini Enterprise Web-to-API Bridge (CSP-Immune Edition)
 // @namespace    https://github.com/StevenLee1471717/Gemini-Enterprise-Bridge
-// @version      1.4.1
+// @version      1.5.0
 // @description  将已登录的 Google Cloud Vertex AI Search / Agentspace 企业网页桥接至本地 OpenAI API 网关（采用 GM_xmlhttpRequest 绕过页面严格 CSP）
 // @downloadURL  https://github.com/StevenLee1471717/Gemini-Enterprise-Bridge/releases/latest/download/gemini-enterprise-bridge.user.js
 // @updateURL    https://github.com/StevenLee1471717/Gemini-Enterprise-Bridge/releases/latest/download/gemini-enterprise-bridge.user.js
@@ -315,11 +315,29 @@
   }
 
   let activeWebModel = "";
+  const discoveredWebModels = [];
   const LIGATURES_RE =
     /\b(arrow_drop_down|arrow_drop_up|expand_more|expand_less|keyboard_arrow_down|unfold_more|stat_minus_1|check|done|auto_awesome|spark)\b|[▾▼⌄]/gi;
 
   function cleanModelStr(s) {
     return String(s || "").replace(LIGATURES_RE, " ").replace(/\s+/g, " ").trim();
+  }
+
+  function recordDiscovered(items) {
+    const arr = Array.isArray(items) ? items : [items];
+    const seen = new Set(discoveredWebModels.map((x) => x.toLowerCase()));
+    for (const raw of arr) {
+      const lbl = cleanModelStr(String(raw || "").split("\n")[0]);
+      if (!lbl || lbl.length < 2 || lbl.length > 64 || /^(?:auto|自动|model|选择模型|切换模型)$/i.test(lbl)) continue;
+      if (!seen.has(lbl.toLowerCase())) {
+        discoveredWebModels.push(lbl);
+        seen.add(lbl.toLowerCase());
+      }
+    }
+  }
+
+  function escRe(s) {
+    return String(s || "").replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
   }
 
   function matchesModel(rawText, targetModel) {
@@ -329,14 +347,34 @@
     const k = String(targetModel).trim().toLowerCase();
     if (k === "auto") return /^(?:gemini\s+)?auto\b|^自动/i.test(headline);
     if (k === "3.1-pro") return /3\.1\s*[-]?\s*pro\b|3\.1pro\b/i.test(headline) || /3\.1\s*[-]?\s*pro\b/i.test(cleaned);
-    if (k === "4-argon") return !/\bcarbon\b|4carbon\b/i.test(headline) && (/4(?:\.0)?\s*[-]?\s*argon\b|4argon\b|\bargon\b/i.test(headline) || /4(?:\.0)?\s*[-]?\s*argon\b/i.test(cleaned));
-    if (k === "4-carbon") return !/\bargon\b|4argon\b/i.test(headline) && (/4(?:\.0)?\s*[-]?\s*carbon\b|4carbon\b|\bcarbon\b/i.test(headline) || /4(?:\.0)?\s*[-]?\s*carbon\b/i.test(cleaned));
+    if (k === "4-argon") return !/\b(?:carbon|hydrogen)\b|4(?:carbon|hydrogen)\b/i.test(headline) && (/4(?:\.0)?\s*[-]?\s*argon\b|4argon\b|\bargon\b/i.test(headline) || /4(?:\.0)?\s*[-]?\s*argon\b/i.test(cleaned));
+    if (k === "4-carbon") return !/\b(?:argon|hydrogen)\b|4(?:argon|hydrogen)\b/i.test(headline) && (/4(?:\.0)?\s*[-]?\s*carbon\b|4carbon\b|\bcarbon\b/i.test(headline) || /4(?:\.0)?\s*[-]?\s*carbon\b/i.test(cleaned));
+    if (k === "4-hydrogen") return !/\b(?:argon|carbon)\b|4(?:argon|carbon)\b/i.test(headline) && (/4(?:\.0)?\s*[-]?\s*hydrogen\b|4hydrogen\b|\bhydrogen\b/i.test(headline) || /4(?:\.0)?\s*[-]?\s*hydrogen\b/i.test(cleaned));
     if (k === "3.8-flash") return /3\.8\s*[-]?\s*flash\b|3\.8flash\b/i.test(headline) || /3\.8\s*[-]?\s*flash\b/i.test(cleaned);
     if (k === "2.5-pro") return /2\.5\s*[-]?\s*pro\b|2\.5pro\b/i.test(headline);
     if (k === "2.5-flash") return /2\.5\s*[-]?\s*flash\b|2\.5flash\b/i.test(headline);
-    const spaced = k.replace(/[-_]+/g, " ");
-    const compact = k.replace(/[\s\-_]+/g, "");
-    return headline.toLowerCase().includes(spaced) || headline.toLowerCase().replace(/[\s\-_]+/g, "").includes(compact);
+
+    const vp = k.match(/^(?:gemini[\s\-_]*)?(\d+(?:\.\d+)?)[\s\-_]*([a-z][a-z0-9\-_\s]*)$/i);
+    if (vp) {
+      const rawVer = vp[1];
+      const rawVar = vp[2].replace(/[\s\-_]+/g, " ").trim();
+      const baseMajor = rawVer.endsWith(".0") ? rawVer.slice(0, -2) : rawVer;
+      const verSrc = rawVer.includes(".") && !rawVer.endsWith(".0") ? escRe(rawVer) : `${escRe(baseMajor)}(?:\\.0)?`;
+      const verRe = new RegExp(`(?:^|[^0-9.])${verSrc}(?![0-9]|\\.\\d)`, "i");
+      const varSrc = rawVar.split(/\s+/).filter(Boolean).map(escRe).join("[\\s\\-_]*");
+      const varRe = new RegExp(`(?:^|[^a-z])${varSrc}(?![a-z0-9])`, "i");
+      const hasDigits = /\d/.test(headline);
+      if (hasDigits && !verRe.test(headline)) return false;
+      if (verRe.test(headline) && varRe.test(headline)) return true;
+      if (!hasDigits && !/^(?:pro|flash|ultra|nano|lite|mini|max|plus|auto|fast|thinking)(?:\s|$)/i.test(rawVar)) {
+        return new RegExp(`^(?:gemini\\s+)?${varSrc}\\b`, "i").test(headline);
+      }
+      return false;
+    }
+
+    const spaced = k.replace(/^(?:gemini[\s\-_]+)/i, "").replace(/[-_]+/g, " ").trim() || k;
+    const compact = spaced.replace(/[\s\-_]+/g, "");
+    return headline.toLowerCase().includes(spaced) || (compact.length >= 4 && headline.toLowerCase().replace(/[\s\-_]+/g, "").includes(compact));
   }
 
   async function triggerNewChat() {
@@ -366,7 +404,7 @@
   async function ensureWebModelSelected(targetModel) {
     if (!targetModel || !String(targetModel).trim()) return;
     const excludeRe = /\b(send|submit|attach|upload|mic|voice|stop|clear|copy|new chat|new session|history|settings|tools|sources)\b|发送|上传|语音|停止|清空|新建|新会话|历史|设置|工具|数据源/i;
-    const modelTextRe = /\b(gemini|3\.1\s*[-]?\s*pro|3\.1pro|4(?:\.0)?\s*[-]?\s*argon|4argon|argon|4(?:\.0)?\s*[-]?\s*carbon|4carbon|carbon|3\.8\s*[-]?\s*flash|3\.8flash|2\.5\s*[-]?\s*pro|2\.5\s*[-]?\s*flash)\b|^(auto|自动|fast|pro|flash|thinking)$/i;
+    const modelTextRe = /\b(gemini|hydrogen|helium|lithium|boron|carbon|nitrogen|oxygen|fluorine|neon|argon|krypton|xenon|radon|\d+(?:\.\d+)?\s*[-]?\s*(?:pro|flash|ultra|nano|lite|mini|max|plus|thinking|experimental|preview|[a-z]{4,14}))\b|^(auto|自动|fast|pro|flash|thinking)$/i;
 
     let trigger = null;
     const hosts = queryDeep('ucs-model-selector, ucs-model-picker, model-selector, [data-test-id*="model" i], [data-testid*="model" i], [class*="model-selector" i]').filter(visible);
@@ -408,6 +446,7 @@
       await sleep(95);
       const allOpts = queryDeep(optSel).filter((o) => visible(o) && o !== trigger && !containsDeep(o, trigger));
       const leafOpts = allOpts.filter((o) => allOpts.filter((c) => c !== o && containsDeep(o, c)).length < 2);
+      recordDiscovered(leafOpts.map((o) => o.innerText || o.textContent || ""));
       const hits = leafOpts.filter((o) => matchesModel(`${o.innerText || o.textContent || ""}\n${o.getAttribute("aria-label") || ""}`, targetModel));
       if (hits.length) {
         hits.sort((a, b) => (a.innerText || "").length - (b.innerText || "").length);
@@ -504,7 +543,7 @@
       const attachBtns = queryDeep('button, md-icon-button, ucs-icon-button, [role="button"]').filter((b) => {
         if (!visible(b) || b.disabled) return false;
         const lbl = readBtnLabelFn(b);
-        if (/\b(send|submit|stop|mic|voice|add_comment|chat_add_on|new chat|model|argon|carbon|pro|flash|auto)\b|发送|停止|新建/.test(lbl)) return false;
+        if (/\b(send|submit|stop|mic|voice|add_comment|chat_add_on|new chat|model|hydrogen|helium|boron|carbon|nitrogen|oxygen|neon|argon|krypton|xenon|radon|pro|flash|ultra|nano|lite|auto)\b|发送|停止|新建/.test(lbl)) return false;
         return /\b(attach|attach_file|upload|upload_file|add_circle|paperclip|add)\b|[+＋]|上传|附件|添加/.test(lbl);
       });
       let captured = null;
@@ -650,7 +689,7 @@
       const sendBtns = queryDeep('button, md-icon-button, md-filled-icon-button, ucs-icon-button, [role="button"]').filter((b) => {
         if (!visible(b) || b.disabled || b.getAttribute("aria-disabled") === "true") return false;
         const lbl = readBtnLabel(b);
-        if (/\b(argon|carbon|pro|flash|auto|model)\b/.test(lbl)) return false;
+        if (/\b(hydrogen|helium|boron|carbon|nitrogen|oxygen|neon|argon|krypton|xenon|radon|pro|flash|ultra|nano|lite|auto|model)\b/.test(lbl)) return false;
         return /\b(send|submit|ask|run|arrow_upward|arrow_forward|north|submitting)\b|发送|提交/.test(lbl);
       });
       if (sendBtns.length) {
@@ -707,7 +746,8 @@
             request_id: requestId,
             reply: job.networkText,
             source: "userscript_network",
-            active_model: activeWebModel
+            active_model: activeWebModel,
+            available_models: discoveredWebModels
           });
           return;
         }

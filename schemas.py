@@ -167,6 +167,7 @@ class BridgeRegisterRequest(_FlexibleModel):
     tab_title: Optional[str] = None
     driver_mode: str = "auto"
     active_model: Optional[str] = None
+    available_models: Optional[List[str]] = None
     tabs: Optional[List[Dict[str, Any]]] = None
     capabilities: Optional[List[str]] = None
 
@@ -189,6 +190,7 @@ class BridgeEventPayload(_FlexibleModel):
     driver_mode: Optional[str] = None
     captured_rpc: Optional[bool] = None
     active_model: Optional[str] = None
+    available_models: Optional[List[str]] = None
     tabs: Optional[List[Dict[str, Any]]] = None
     capabilities: Optional[List[str]] = None
     chunk_index: Optional[int] = None
@@ -211,6 +213,7 @@ class BridgeCallbackPayload(_FlexibleModel):
     citations: Optional[List[Dict[str, Any]]] = None
     source: Optional[str] = "http_callback"
     active_model: Optional[str] = None
+    available_models: Optional[List[str]] = None
 
 
 def extract_text_content(content: Optional[Union[str, List[Any]]]) -> str:
@@ -391,6 +394,16 @@ WEB_MODEL_ALIASES: Dict[str, str] = {
     "4.0-carbon": "4-carbon",
     "4carbon": "4-carbon",
     "carbon": "4-carbon",
+    # Gemini 4 Hydrogen
+    "gemini-4-hydrogen": "4-hydrogen",
+    "gemini-4.0-hydrogen": "4-hydrogen",
+    "gemini4.0hydrogen": "4-hydrogen",
+    "gemini4hydrogen": "4-hydrogen",
+    "gemini-4hydrogen": "4-hydrogen",
+    "4-hydrogen": "4-hydrogen",
+    "4.0-hydrogen": "4-hydrogen",
+    "4hydrogen": "4-hydrogen",
+    "hydrogen": "4-hydrogen",
     # Gemini 3.8 Flash
     "gemini-3.8-flash": "3.8-flash",
     "gemini3.8flash": "3.8-flash",
@@ -422,6 +435,7 @@ _LEGACY_DEFAULT_MODEL_IDS = {
     "gemini-enterprise",
     "gemini-enterprise-web",
 }
+_KEEP_CURRENT_WEB_MODEL_IDS = _LEGACY_DEFAULT_MODEL_IDS
 
 _GCLOUD_PASSTHROUGH_MODEL_IDS = {
     "gemini-enterprise-gcloud",
@@ -434,7 +448,192 @@ _GENERIC_THIRD_PARTY_PREFIXES = (
     "o3-",
     "o4-",
     "claude-",
+    "grok-",
+    "kimi-",
+    "deepseek-",
+    "qwen-",
 )
+
+_ELEMENT_CODENAMES = {
+    "hydrogen",
+    "helium",
+    "lithium",
+    "beryllium",
+    "boron",
+    "carbon",
+    "nitrogen",
+    "oxygen",
+    "fluorine",
+    "neon",
+    "sodium",
+    "magnesium",
+    "aluminum",
+    "aluminium",
+    "silicon",
+    "phosphorus",
+    "sulfur",
+    "sulphur",
+    "chlorine",
+    "argon",
+    "potassium",
+    "calcium",
+    "scandium",
+    "titanium",
+    "vanadium",
+    "chromium",
+    "manganese",
+    "iron",
+    "cobalt",
+    "nickel",
+    "copper",
+    "zinc",
+    "gallium",
+    "germanium",
+    "arsenic",
+    "selenium",
+    "bromine",
+    "krypton",
+    "rubidium",
+    "strontium",
+    "yttrium",
+    "zirconium",
+    "niobium",
+    "molybdenum",
+    "silver",
+    "cadmium",
+    "indium",
+    "tin",
+    "antimony",
+    "tellurium",
+    "iodine",
+    "xenon",
+    "cesium",
+    "barium",
+    "platinum",
+    "gold",
+    "mercury",
+    "thallium",
+    "lead",
+    "bismuth",
+    "radon",
+}
+
+_KNOWN_GEMINI_TIERS = {
+    "pro",
+    "flash",
+    "ultra",
+    "nano",
+    "lite",
+    "mini",
+    "max",
+    "plus",
+    "thinking",
+    "deep-think",
+    "deepthink",
+    "experimental",
+    "exp",
+    "preview",
+    "live",
+}
+
+_UNIT_EXCLUSIONS = {
+    "px",
+    "pt",
+    "em",
+    "rem",
+    "vh",
+    "vw",
+    "ms",
+    "sec",
+    "secs",
+    "min",
+    "mins",
+    "hr",
+    "hrs",
+    "kb",
+    "mb",
+    "gb",
+    "tb",
+}
+
+_COMPACT_TIER_EXPANSIONS = {
+    "flashlite": "flash-lite",
+    "flashthinking": "flash-thinking",
+    "prothinking": "pro-thinking",
+    "deepthink": "deep-think",
+}
+
+_VERSIONED_GEMINI_RE = re.compile(
+    r"^(?:gemini[\s\-_]*)?(\d+(?:\.\d+)?)[\s\-_]*([a-z][a-z0-9\-_\s]*)$",
+    re.IGNORECASE,
+)
+
+_GENERIC_WEB_PLACEHOLDER_RE = re.compile(
+    r"^(?:auto|自动|choose\s+a?\s*model|select\s+a?\s*model|switch\s+model|model\s+selector|model\s+picker|model|选择模型|切换模型)$",
+    re.IGNORECASE,
+)
+
+
+def _parse_dynamic_gemini_target(raw_name: str) -> Optional[str]:
+    """Parse future Gemini model strings (`gemini-5-pro`, `5pro`, `4-oxygen`, `gemini4.5flash`, `oxygen`)."""
+    cleaned = (raw_name or "").strip()
+    if not cleaned:
+        return None
+    low = cleaned.lower()
+    has_gemini_prefix = low.startswith("gemini")
+
+    m = _VERSIONED_GEMINI_RE.match(cleaned)
+    if m:
+        ver, raw_variant = m.group(1), m.group(2)
+        slug = re.sub(r"[\s_\-]+", "-", raw_variant.strip().lower()).strip("-")
+        slug = _COMPACT_TIER_EXPANSIONS.get(slug, slug)
+        if not slug:
+            return None
+        if not has_gemini_prefix:
+            if slug in _UNIT_EXCLUSIONS:
+                return None
+            tokens = slug.split("-")
+            if not (
+                slug in _ELEMENT_CODENAMES
+                or any(t in _KNOWN_GEMINI_TIERS or t in _ELEMENT_CODENAMES for t in tokens)
+                or len(slug) >= 3
+            ):
+                return None
+        if ver.endswith(".0") and slug in _ELEMENT_CODENAMES:
+            ver = ver[:-2]
+        return f"{ver}-{slug}"
+
+    if has_gemini_prefix:
+        rest = re.sub(r"^gemini[\s\-_]*", "", low).strip("-")
+        if rest:
+            rest_slug = re.sub(r"[\s_\-]+", "-", rest)
+            return _COMPACT_TIER_EXPANSIONS.get(rest_slug, rest_slug)
+
+    if low in _ELEMENT_CODENAMES:
+        return low
+
+    return None
+
+
+def _strip_provider_prefix_if_gemini(raw: str) -> str:
+    """Strip `<provider_id>/` prefix (e.g. Copilot BYOK UUIDs) when RHS is a recognized Gemini model."""
+    if "/" not in raw or raw.lower().startswith(("gemini-web:", "web:")):
+        return raw
+    rhs = raw.rsplit("/", 1)[-1].strip()
+    if not rhs:
+        return raw
+    rhs_low = rhs.lower()
+    rhs_hyphen = re.sub(r"[\s_]+", "-", rhs_low)
+    rhs_compact = re.sub(r"[\s_\-]+", "", rhs_low)
+    if (
+        rhs_low in _KEEP_CURRENT_WEB_MODEL_IDS
+        or rhs_hyphen in WEB_MODEL_ALIASES
+        or rhs_compact in WEB_MODEL_ALIASES
+        or rhs_low.startswith(("gemini-", "gemini-web:", "web:"))
+        or _parse_dynamic_gemini_target(rhs) is not None
+    ):
+        return rhs
+    return raw
 
 
 def parse_model_and_session(model_name: Optional[str]) -> tuple[str, Optional[str]]:
@@ -494,7 +693,7 @@ def resolve_target_web_model(model_name: Optional[str]) -> Optional[str]:
     Returns:
         - `"4-carbon"` by default when model is omitted or uses a legacy placeholder (`gemini-enterprise-web`)
         - `None` when using official GCloud upstream (`gemini-enterprise-gcloud`)
-        - Canonical web model key (`"3.1-pro"`, `"4-argon"`, `"4-carbon"`, `"3.8-flash"`, `"2.5-pro"`, `"2.5-flash"`)
+        - Canonical web model key (`"3.1-pro"`, `"4-argon"`, `"4-carbon"`, `"4-hydrogen"`, `"3.8-flash"`, `"2.5-pro"`, `"2.5-flash"`)
         - Or a clean custom UI label for pass-through models (`gemini-web:<label>` or future Gemini versions)
     """
     base_model, _ = parse_model_and_session(model_name)
@@ -505,6 +704,7 @@ def resolve_target_web_model(model_name: Optional[str]) -> Optional[str]:
     if raw.lower().endswith("-newchat"):
         raw = raw[: -len("-newchat")].strip()
 
+    raw = _strip_provider_prefix_if_gemini(raw)
     if not raw:
         return "4-carbon"
 
@@ -535,6 +735,11 @@ def resolve_target_web_model(model_name: Optional[str]) -> Optional[str]:
     # Do not try to click dropdown for unconfigured generic OpenAI/Anthropic default model strings
     if lowered in {"gpt-4", "gpt-4o", "o1", "o3"} or lowered.startswith(_GENERIC_THIRD_PARTY_PREFIXES):
         return None
+
+    # Future Gemini models (`gemini-5-pro`, `5pro`, `4-oxygen`, `gemini4.5flash`, `oxygen`, etc.)
+    dynamic_target = _parse_dynamic_gemini_target(raw)
+    if dynamic_target is not None:
+        return dynamic_target
 
     # Future/custom Gemini Enterprise models: strip optional `gemini-` prefix for cleaner UI matching
     if lowered.startswith("gemini-") and len(raw) > 7:
@@ -595,6 +800,10 @@ AVAILABLE_MODELS: List[Dict[str, Any]] = [
         "Primary flagship model — auto-select Gemini 4 Carbon in Gemini Enterprise (aliases: 4carbon, 4-carbon)",
     ),
     _build_model_entry(
+        "gemini-4-hydrogen",
+        "Auto-select Gemini 4 Hydrogen in Gemini Enterprise web UI (aliases: 4hydrogen, 4-hydrogen)",
+    ),
+    _build_model_entry(
         "gemini-4-argon",
         "Auto-select Gemini 4 Argon in Gemini Enterprise web UI (aliases: 4argon, 4-argon)",
     ),
@@ -620,6 +829,10 @@ _EXTRA_RESOLVABLE_MODELS: List[Dict[str, Any]] = [
     _build_model_entry(
         "gemini-4-carbon-newchat",
         "Start a fresh web chat session and select Gemini 4 Carbon",
+    ),
+    _build_model_entry(
+        "gemini-4-hydrogen-newchat",
+        "Start a fresh web chat session and select Gemini 4 Hydrogen",
     ),
     _build_model_entry(
         "gemini-4-argon-newchat",
@@ -665,10 +878,110 @@ _CANONICAL_TARGET_TO_MODEL_ID: Dict[str, str] = {
     "3.1-pro": "gemini-3.1-pro",
     "4-argon": "gemini-4-argon",
     "4-carbon": "gemini-4-carbon",
+    "4-hydrogen": "gemini-4-hydrogen",
     "3.8-flash": "gemini-3.8-flash",
     "2.5-pro": "gemini-2.5-pro",
     "2.5-flash": "gemini-2.5-flash",
 }
+
+
+def format_gemini_display_name(canonical_or_target: str) -> str:
+    """Format a canonical model ID or target key into a clean display label (e.g. `Gemini 4 Hydrogen`)."""
+    raw = (canonical_or_target or "").strip()
+    if not raw:
+        return "Gemini Enterprise"
+    low = raw.lower()
+    for prefix in ("gemini-web:", "web:"):
+        if low.startswith(prefix):
+            return raw[len(prefix) :].strip() or "Gemini Enterprise"
+    if low in {"gemini-enterprise-web", "gemini-enterprise-auto", "auto"}:
+        return "Gemini Enterprise (Auto)"
+    if low == "gemini-enterprise-gcloud":
+        return "Gemini Enterprise (GCloud)"
+    core = raw[7:].strip() if low.startswith("gemini-") else raw
+    parts = [p for p in re.split(r"[\s_\-]+", core) if p]
+    pretty_parts: List[str] = []
+    for p in parts:
+        if re.fullmatch(r"\d+(?:\.\d+)?", p):
+            pretty_parts.append(p)
+        else:
+            pretty_parts.append(p.capitalize())
+    joined = " ".join(pretty_parts) if pretty_parts else core
+    return joined if joined.lower().startswith("gemini") else f"Gemini {joined}"
+
+
+def normalize_web_label_to_model_spec(
+    raw_label: Optional[str],
+) -> Optional[tuple[str, str, str]]:
+    """Convert a live browser dropdown label into `(canonical_model_id, web_target_key, display_name)`."""
+    if not raw_label:
+        return None
+    headline = str(raw_label).splitlines()[0].strip()
+    if not headline or len(headline) > 80 or _GENERIC_WEB_PLACEHOLDER_RE.match(headline):
+        return None
+
+    low = headline.lower()
+    if low in _KEEP_CURRENT_WEB_MODEL_IDS:
+        return None
+
+    norm_hyphen = re.sub(r"[\s_]+", "-", low)
+    norm_compact = re.sub(r"[\s_\-]+", "", low)
+    alias_target = WEB_MODEL_ALIASES.get(norm_hyphen) or WEB_MODEL_ALIASES.get(norm_compact)
+    if alias_target:
+        if alias_target == "auto":
+            return None
+        cid = _CANONICAL_TARGET_TO_MODEL_ID.get(alias_target, f"gemini-{alias_target}")
+        return (cid, alias_target, format_gemini_display_name(cid))
+
+    dyn_target = _parse_dynamic_gemini_target(headline)
+    if dyn_target:
+        cid = _CANONICAL_TARGET_TO_MODEL_ID.get(dyn_target, f"gemini-{dyn_target}")
+        return (cid, dyn_target, format_gemini_display_name(cid))
+
+    # Arbitrary custom enterprise model/agent exposed in the web selector
+    return (f"gemini-web:{headline}", headline, headline)
+
+
+def get_dynamic_available_models(
+    discovered_labels: Optional[List[str]] = None,
+    extra_default_model: Optional[str] = None,
+) -> List[Dict[str, Any]]:
+    """Return static `AVAILABLE_MODELS` merged with any newly discovered future models from the browser."""
+    out: List[Dict[str, Any]] = [_clone_model_entry(m) for m in AVAILABLE_MODELS]
+    seen_ids = {m["id"].lower() for m in out}
+
+    candidates: List[str] = list(discovered_labels or [])
+    if extra_default_model:
+        base_def, _ = parse_model_and_session(extra_default_model)
+        if base_def and base_def.lower().endswith("-newchat"):
+            base_def = base_def[: -len("-newchat")].strip()
+        if base_def and base_def.lower() not in seen_ids:
+            candidates.append(base_def)
+
+    for label in candidates:
+        spec = normalize_web_label_to_model_spec(label)
+        if not spec:
+            continue
+        cid, target_key, disp = spec
+        if cid.lower() not in seen_ids:
+            desc = (
+                f"Auto-discovered {disp} in Gemini Enterprise web UI (target: {target_key})"
+                if not cid.lower().startswith("gemini-web:")
+                else f"Auto-discovered custom Gemini Enterprise web model ({disp})"
+            )
+            out.append(_build_model_entry(cid, desc))
+            seen_ids.add(cid.lower())
+        if not cid.lower().startswith("gemini-web:"):
+            nc_id = f"{cid}-newchat"
+            if nc_id.lower() not in seen_ids:
+                out.append(
+                    _build_model_entry(
+                        nc_id,
+                        f"Start a fresh web chat session and select {disp}",
+                    )
+                )
+                seen_ids.add(nc_id.lower())
+    return out
 
 
 def _clone_model_entry(entry: Dict[str, Any], model_id: Optional[str] = None) -> Dict[str, Any]:
@@ -680,8 +993,11 @@ def _clone_model_entry(entry: Dict[str, Any], model_id: Optional[str] = None) ->
     return cloned
 
 
-def resolve_model_metadata(model_id: Optional[str]) -> Optional[Dict[str, Any]]:
-    """Resolve `GET /v1/models/{model_id}` for canonical IDs, shorthand aliases, and `@session` tags."""
+def resolve_model_metadata(
+    model_id: Optional[str],
+    discovered_labels: Optional[List[str]] = None,
+) -> Optional[Dict[str, Any]]:
+    """Resolve `GET /v1/models/{model_id}` for canonical IDs, shorthand aliases, future models, and `@session` tags."""
     if not model_id:
         return None
     raw_id = model_id.strip()
@@ -707,6 +1023,7 @@ def resolve_model_metadata(model_id: Optional[str]) -> Optional[Dict[str, Any]]:
     core_name = (
         base_model[: -len("-newchat")].strip() if wants_new_chat else base_model.strip()
     )
+    core_name = _strip_provider_prefix_if_gemini(core_name)
     if not core_name:
         return None
 
@@ -736,9 +1053,31 @@ def resolve_model_metadata(model_id: Optional[str]) -> Optional[Dict[str, Any]]:
             out["description"] = f"{base_entry['description']} [session: {session_tag}]"
         return out
 
-    if lowered_core.startswith(("gemini-web:", "web:", "gemini-")):
-        resolved_label = resolve_target_web_model(core_name) or core_name
-        desc = f"Custom Gemini Enterprise web model ({resolved_label})"
+    if lowered_core in {"gpt-4", "gpt-4o", "o1", "o3"} or lowered_core.startswith(
+        _GENERIC_THIRD_PARTY_PREFIXES
+    ):
+        return None
+
+    # Check live browser-discovered models (including custom enterprise models without `gemini-` prefix)
+    if discovered_labels:
+        for disc_raw in discovered_labels:
+            spec = normalize_web_label_to_model_spec(disc_raw)
+            if not spec:
+                continue
+            disc_cid, disc_target, disc_disp = spec
+            if lowered_core in {disc_cid.lower(), disc_target.lower(), disc_disp.lower()}:
+                desc = f"Auto-discovered Gemini Enterprise web model ({disc_disp})"
+                if wants_new_chat:
+                    desc += " [new chat]"
+                if session_tag:
+                    desc += f" [session: {session_tag}]"
+                return _build_model_entry(raw_id, desc)
+
+    dyn_target = _parse_dynamic_gemini_target(core_name)
+    if dyn_target is not None or lowered_core.startswith(("gemini-web:", "web:", "gemini-")):
+        resolved_label = dyn_target or resolve_target_web_model(core_name) or core_name
+        disp = format_gemini_display_name(resolved_label)
+        desc = f"Auto-adapted Gemini Enterprise web model ({disp})"
         if wants_new_chat:
             desc += " [new chat]"
         if session_tag:

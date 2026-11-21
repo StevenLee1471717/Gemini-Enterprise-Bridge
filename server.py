@@ -64,6 +64,7 @@ from schemas import (
     build_chat_completion_response,
     build_usage,
     normalize_default_model,
+    get_dynamic_available_models,
     parse_model_and_session,
     resolve_model_metadata,
     resolve_target_web_model,
@@ -1122,6 +1123,15 @@ def create_app(
             "backend_mode": cfg.backend_mode,
             "context_mode": cfg.context_mode,
             "default_model": cfg.default_model,
+            "available_models": [
+                m["id"]
+                for m in get_dynamic_available_models(
+                    hub.discovered_web_models,
+                    extra_default_model=cfg.default_model,
+                )
+                if not m["id"].endswith("-newchat")
+            ],
+            "discovered_models": hub.discovered_web_models,
             "api_key_required": bool(cfg.api_key),
             "logging": LOG_MANAGER.status(),
             "context": {"carbon_model_capacity": CARBON_CONTEXT_WINDOW,
@@ -1723,6 +1733,7 @@ def create_app(
             tab_title=payload.tab_title or "",
             driver_mode=payload.driver_mode,
             active_model=payload.active_model or "",
+            available_models=payload.available_models,
         )
         return {"ok": True, "client_id": state.client_id}
 
@@ -1770,6 +1781,7 @@ def create_app(
                     "citations": payload.citations or [],
                     "source": payload.source or "http_callback",
                     "active_model": payload.active_model,
+                    "available_models": payload.available_models,
                 },
             )
         return {"ok": True}
@@ -1836,9 +1848,13 @@ def create_app(
     @app.get("/v1/models", dependencies=[Depends(verify_api_key)])
     @app.get("/models", dependencies=[Depends(verify_api_key)], include_in_schema=False)
     async def list_models() -> Dict[str, Any]:
+        dynamic_models = get_dynamic_available_models(
+            hub.discovered_web_models,
+            extra_default_model=cfg.default_model,
+        )
         return {
             "object": "list",
-            "data": distribution.filter_models_for_principal(current_principal(), AVAILABLE_MODELS),
+            "data": distribution.filter_models_for_principal(current_principal(), dynamic_models),
         }
 
     @app.get("/v1/models/{model_id:path}", dependencies=[Depends(verify_api_key)])
@@ -1846,11 +1862,15 @@ def create_app(
     async def retrieve_model(model_id: str) -> Any:
         clean_id = (model_id or "").strip().strip("/")
         if not clean_id:
+            dynamic_models = get_dynamic_available_models(
+                hub.discovered_web_models,
+                extra_default_model=cfg.default_model,
+            )
             return {
                 "object": "list",
-                "data": distribution.filter_models_for_principal(current_principal(), AVAILABLE_MODELS),
+                "data": distribution.filter_models_for_principal(current_principal(), dynamic_models),
             }
-        entry = resolve_model_metadata(clean_id)
+        entry = resolve_model_metadata(clean_id, discovered_labels=hub.discovered_web_models)
         if entry is None:
             return _openai_error_response(
                 status_code=404,

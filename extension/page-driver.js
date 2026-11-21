@@ -1,7 +1,7 @@
 // MAIN-world driver: DOM controls the composer; the original RPC is the only reply source.
 
 (() => {
-  const DRIVER_VERSION = "2.8.6";
+  const DRIVER_VERSION = "2.8.7";
 
   // Optional Trusted Types policy (gracefully guarded if CSP `trusted-types` header restricts custom policy names;
   // all DOM mutations below strictly use `replaceChildren` + `createElement` + `textContent` and ZERO `innerHTML`!)
@@ -31,12 +31,16 @@
     networkPatched: false,
     lastCapturedRpc: null,
     lastSelectedModel: "",
+    discoveredModels: [],
     onRpcCaptured: null,
     getActiveJob: () => null,
     consumeStream: null,
     parsePacket: null,
     checkChatRpc: null
   };
+  if (!Array.isArray(sharedState.discoveredModels)) {
+    sharedState.discoveredModels = [];
+  }
   globalThis.__GEB_MAIN_STATE__ = sharedState;
 
   const TO_MAIN_CHANNEL = "GEB_ISOLATED_TO_MAIN";
@@ -1059,7 +1063,7 @@
     const sendHintRe =
       /\b(send|submit|ask|run|arrow_upward|arrow_forward|north|submitting)\b|发送|提交|提问/i;
     const excludeHintRe =
-      /attach|upload|mic|voice|audio|stop|clear|reset|copy|more|menu|settings|new chat|model|argon|carbon|pro|flash|auto|上传|语音|停止|清空|新建|模型/i;
+      /attach|upload|mic|voice|audio|stop|clear|reset|copy|more|menu|settings|new chat|model|hydrogen|helium|lithium|boron|carbon|nitrogen|oxygen|fluorine|neon|argon|krypton|xenon|radon|pro|flash|ultra|nano|lite|auto|上传|语音|停止|清空|新建|模型/i;
 
     // Walk up shadow/DOM ancestors near inputEl first so we pick the composer's own button
     let container = inputEl;
@@ -1862,7 +1866,7 @@
   }
 
   // =========================================================================
-  // 2b. Web UI Model Selector Discovery & Auto-Switching (Auto / 3.1 Pro / 4 Argon / 4 Carbon / 3.8 Flash)
+  // 2b. Web UI Model Selector Discovery & Auto-Switching (Auto / 4 Hydrogen / 4 Carbon / 4 Argon / Future Models)
   // =========================================================================
 
   const MODEL_MATCH_RULES = {
@@ -1877,12 +1881,17 @@
     "4-argon": {
       exactRe: /^(?:gemini\s+)?4(?:\.0)?\s*[-]?\s*argon\b|^argon\b/i,
       headlineRe: /4(?:\.0)?\s*[-]?\s*argon\b|4argon\b|\bargon\b/i,
-      conflictRe: /\bcarbon\b|4carbon\b/i
+      conflictRe: /\b(?:carbon|hydrogen)\b|4(?:carbon|hydrogen)\b/i
     },
     "4-carbon": {
       exactRe: /^(?:gemini\s+)?4(?:\.0)?\s*[-]?\s*carbon\b|^carbon\b/i,
       headlineRe: /4(?:\.0)?\s*[-]?\s*carbon\b|4carbon\b|\bcarbon\b/i,
-      conflictRe: /\bargon\b|4argon\b/i
+      conflictRe: /\b(?:argon|hydrogen)\b|4(?:argon|hydrogen)\b/i
+    },
+    "4-hydrogen": {
+      exactRe: /^(?:gemini\s+)?4(?:\.0)?\s*[-]?\s*hydrogen\b|^hydrogen\b/i,
+      headlineRe: /4(?:\.0)?\s*[-]?\s*hydrogen\b|4hydrogen\b|\bhydrogen\b/i,
+      conflictRe: /\b(?:argon|carbon)\b|4(?:argon|carbon)\b/i
     },
     "3.8-flash": {
       exactRe: /^(?:gemini\s+)?3\.8\s*[-]?\s*flash\b/i,
@@ -1897,6 +1906,40 @@
       headlineRe: /2\.5\s*[-]?\s*flash\b|2\.5flash\b/i
     }
   };
+
+  function escapeRegExpStr(s) {
+    return String(s || "").replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  }
+
+  function recordDiscoveredModelLabels(rawItems) {
+    const list = Array.isArray(rawItems) ? rawItems : [rawItems];
+    if (!Array.isArray(sharedState.discoveredModels)) {
+      sharedState.discoveredModels = [];
+    }
+    const seen = new Set(sharedState.discoveredModels.map((m) => m.toLowerCase()));
+    for (const item of list) {
+      const label = stripIconLigatures(String(item || "").split(/\n+/)[0]);
+      if (
+        !label ||
+        label.length < 2 ||
+        label.length > 64 ||
+        GENERIC_MODEL_PLACEHOLDER_RE.test(label) ||
+        /^(?:auto|自动)$/i.test(label)
+      ) {
+        continue;
+      }
+      const low = label.toLowerCase();
+      if (!seen.has(low)) {
+        sharedState.discoveredModels.push(label);
+        seen.add(low);
+        if (sharedState.discoveredModels.length > 64) {
+          const dropped = sharedState.discoveredModels.shift();
+          if (dropped) seen.delete(dropped.toLowerCase());
+        }
+      }
+    }
+    return sharedState.discoveredModels.slice();
+  }
 
   function scoreModelOptionMatch(rawText, targetModel) {
     const cleaned = stripIconLigatures(rawText);
@@ -1921,19 +1964,63 @@
       return 0;
     }
 
-    // Custom pass-through model label matching
+    // Dynamic version-aware & token-boundary matcher for future Gemini models (e.g. `4-oxygen`, `5-pro`, `4.5-flash`)
+    const verParsed = key.match(/^(?:gemini[\s\-_]*)?(\d+(?:\.\d+)?)[\s\-_]*([a-z][a-z0-9\-_\s]*)$/i);
+    if (verParsed) {
+      const rawVer = verParsed[1];
+      const rawVariant = verParsed[2].replace(/[\s\-_]+/g, " ").trim();
+      const baseMajor = rawVer.endsWith(".0") ? rawVer.slice(0, -2) : rawVer;
+      const verTokenSrc = rawVer.includes(".") && !rawVer.endsWith(".0")
+        ? escapeRegExpStr(rawVer)
+        : `${escapeRegExpStr(baseMajor)}(?:\\.0)?`;
+      const verBoundaryRe = new RegExp(`(?:^|[^0-9.])${verTokenSrc}(?![0-9]|\\.\\d)`, "i");
+      const variantPatternSrc = rawVariant
+        .split(/\s+/)
+        .filter(Boolean)
+        .map(escapeRegExpStr)
+        .join("[\\s\\-_]*");
+      const variantRe = new RegExp(`(?:^|[^a-z])${variantPatternSrc}(?![a-z0-9])`, "i");
+      const exactHeadlineRe = new RegExp(
+        `^(?:gemini\\s+)?${verTokenSrc}[\\s\\-_]*${variantPatternSrc}(?:\\s*\\(.*\\))?$`,
+        "i"
+      );
+
+      const headlineHasDigits = /\d/.test(headline);
+      const headlineVerMatches = verBoundaryRe.test(headline);
+      if (headlineHasDigits && !headlineVerMatches) {
+        return 0;
+      }
+      if (exactHeadlineRe.test(headline)) return 120;
+      if (headlineVerMatches && variantRe.test(headline)) return 105;
+
+      const isGenericTier = /^(?:pro|flash|ultra|nano|lite|mini|max|plus|auto|fast|thinking|standard|default)(?:\s|$)/i.test(
+        rawVariant
+      );
+      if (!headlineHasDigits && !isGenericTier && new RegExp(`^(?:gemini\\s+)?${variantPatternSrc}\\b`, "i").test(headline)) {
+        return 95;
+      }
+      if (!headlineHasDigits && verBoundaryRe.test(cleaned) && variantRe.test(cleaned)) {
+        return 75;
+      }
+      return 0;
+    }
+
+    // Custom pass-through or standalone codename matching (e.g. `oxygen`, `Enterprise FinLLM`)
     const normHeadline = headline.toLowerCase();
     const normFull = cleaned.toLowerCase();
-    const spacedKey = key.replace(/[-_]+/g, " ").replace(/\s+/g, " ").trim();
-    const compactKey = key.replace(/[\s\-_]+/g, "");
+    const spacedKey = key.replace(/^(?:gemini[\s\-_]+)/i, "").replace(/[-_]+/g, " ").replace(/\s+/g, " ").trim() || key;
+    const compactKey = spacedKey.replace(/[\s\-_]+/g, "");
     const compactHeadline = normHeadline.replace(/[\s\-_]+/g, "");
-    const compactFull = normFull.replace(/[\s\-_]+/g, "");
+    const wordHeadlineRe = new RegExp(
+      `(?:^|[^a-z0-9])${spacedKey.split(/\s+/).map(escapeRegExpStr).join("[\\s\\-_]+")}(?![a-z0-9])`,
+      "i"
+    );
 
-    if (normHeadline === key || normHeadline === spacedKey) return 120;
-    if (normHeadline.includes(spacedKey) || (compactKey && compactHeadline.includes(compactKey))) {
+    if (normHeadline === key || normHeadline === spacedKey || normHeadline === `gemini ${spacedKey}`) return 120;
+    if (wordHeadlineRe.test(headline) || (compactKey.length >= 4 && compactHeadline.includes(compactKey))) {
       return 100;
     }
-    if (normFull.includes(spacedKey) || (compactKey && compactFull.includes(compactKey))) {
+    if (!/^(?:auto|pro|flash|fast)$/i.test(spacedKey) && normFull.includes(spacedKey)) {
       return 70;
     }
     return 0;
@@ -2011,8 +2098,10 @@
     const excludeRe =
       /\b(send|submit|attach|upload|mic|voice|audio|stop|clear|copy|new chat|new conversation|history|settings|share|feedback|help|sign out|tools|sources|connectors|data stores)\b|发送|提交|上传|附件|语音|停止|清空|新建|新会话|历史|设置|分享|反馈|工具|数据源|连接器/i;
 
+    const nonModelUnitRe =
+      /^\d+(?:\.\d+)?\s*(?:px|pt|em|rem|ms|s|sec|secs|second|seconds|m|min|mins|minute|minutes|h|hr|hrs|hour|hours|d|day|days|kb|mb|gb|tb|b|item|items|file|files|page|pages|tab|tabs|source|sources|result|results|step|steps|token|tokens|char|chars|line|lines|%)\b/i;
     const explicitModelNameRe =
-      /\b(gemini|3\.1\s*[-]?\s*pro|3\.1pro|4(?:\.0)?\s*[-]?\s*argon|4argon|argon|4(?:\.0)?\s*[-]?\s*carbon|4carbon|carbon|3\.8\s*[-]?\s*flash|3\.8flash|2\.5\s*[-]?\s*pro|2\.5\s*[-]?\s*flash|2\.0\s*[-]?\s*flash)\b/i;
+      /\b(gemini|hydrogen|helium|lithium|beryllium|boron|carbon|nitrogen|oxygen|fluorine|neon|sodium|magnesium|aluminum|aluminium|silicon|phosphorus|sulfur|chlorine|argon|potassium|calcium|titanium|cobalt|nickel|copper|zinc|gallium|germanium|selenium|bromine|krypton|xenon|radon|\d+(?:\.\d+)?\s*[-]?\s*(?:pro|flash|ultra|nano|lite|mini|max|plus|thinking|experimental|preview|[a-z]{4,14}))\b/i;
     const shortModePillRe =
       /^(auto|自动|fast|pro|flash|thinking|reasoning|ultra|standard|default)$/i;
     const modelAttrRe = /\b(model|llm|select model|choose model|switch model)\b|模型|切换模型|选择模型/i;
@@ -2066,7 +2155,12 @@
       if (modelAttrRe.test(aria)) {
         score += 75;
       }
-      if (cleanLabel.length >= 2 && cleanLabel.length <= 44 && explicitModelNameRe.test(cleanLabel)) {
+      if (
+        cleanLabel.length >= 2 &&
+        cleanLabel.length <= 44 &&
+        !nonModelUnitRe.test(cleanLabel) &&
+        explicitModelNameRe.test(cleanLabel)
+      ) {
         score += 65;
       }
       // Critical fix: recognize default "Auto" / "自动" / "Fast" / "Thinking" model selector pill!
@@ -2132,10 +2226,12 @@
     if (!trigger) return sharedState.lastSelectedModel || "";
     const deepTxt = stripIconLigatures(getDeepVisibleText(trigger));
     if (deepTxt && deepTxt.length <= 60 && !GENERIC_MODEL_PLACEHOLDER_RE.test(deepTxt)) {
+      recordDiscoveredModelLabels(deepTxt);
       return deepTxt;
     }
     const tipTxt = stripIconLigatures(getElementTooltipOrLabel(trigger)).slice(0, 60);
     if (tipTxt && !GENERIC_MODEL_PLACEHOLDER_RE.test(tipTxt)) {
+      recordDiscoveredModelLabels(tipTxt);
       return tipTxt;
     }
     return sharedState.lastSelectedModel || "";
@@ -2290,6 +2386,7 @@
     const optionLabels = options.map((o) =>
       stripIconLigatures(getDeepVisibleText(o).split("\n")[0])
     );
+    recordDiscoveredModelLabels(optionLabels);
     console.log("[GEB:model] Visible dropdown options:", optionLabels);
 
     const scoredHits = options
@@ -2340,17 +2437,20 @@
     sharedState.lastSelectedModel = chosen.label || desired;
     const updatedLabel = readDetectedWebModel() || chosen.label || desired;
 
+    recordDiscoveredModelLabels(updatedLabel);
     logDriver("info", `已切换网页模型: ${currentClean || "Auto"} -> ${updatedLabel}`);
     emitToIsolated({
       type: "driver_ready",
       captured_rpc: Boolean(sharedState.lastCapturedRpc),
-      active_model: updatedLabel
+      active_model: updatedLabel,
+      available_models: sharedState.discoveredModels.slice()
     });
     return {
       ok: true,
       switched: true,
       model: desired,
-      detectedLabel: updatedLabel
+      detectedLabel: updatedLabel,
+      availableOptions: sharedState.discoveredModels.slice()
     };
   }
 
@@ -3078,6 +3178,9 @@
   function emitRequestComplete(payload) {
     const enrichedPayload = {
       ...payload,
+      available_models:
+        payload.available_models ||
+        (Array.isArray(sharedState.discoveredModels) ? sharedState.discoveredModels.slice() : []),
       tab_url:
         payload.tab_url ||
         (typeof window !== "undefined" && window.location ? String(window.location.href || "") : ""),
@@ -3485,6 +3588,7 @@
       modelSelectorChain: modelTrigger ? getShadowHostChainTagString(modelTrigger) : null,
       detectedModelLabel: detectedModel || null,
       activeModel: detectedModel || sharedState.lastSelectedModel || null,
+      availableModels: Array.isArray(sharedState.discoveredModels) ? sharedState.discoveredModels.slice() : [],
       assistantBlocksCount: replies.length,
       composerAttachmentsCount: composerAttachmentControls().length,
       capturedRpc: sharedState.lastCapturedRpc
@@ -3626,6 +3730,8 @@
   globalThis.__GEB_MAIN_API__ = {
     version: DRIVER_VERSION,
     stripIconLigatures,
+    recordDiscoveredModelLabels,
+    getDiscoveredModels: () => (Array.isArray(sharedState.discoveredModels) ? sharedState.discoveredModels.slice() : []),
     scoreModelOptionMatch,
     computeCleanNewChatUrl,
     findComposerInput,
@@ -3654,6 +3760,7 @@
     type: "driver_ready",
     captured_rpc: Boolean(sharedState.lastCapturedRpc),
     active_model: readDetectedWebModel() || sharedState.lastSelectedModel,
+    available_models: Array.isArray(sharedState.discoveredModels) ? sharedState.discoveredModels.slice() : [],
     driver_version: DRIVER_VERSION
   });
 })();

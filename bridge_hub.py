@@ -273,6 +273,7 @@ class BrowserBridgeHub:
         self._total_requests = 0
         self._total_errors = 0
         self._recent_logs: List[Dict[str, Any]] = []
+        self._discovered_web_models: List[str] = []
         self.usage_snapshot_provider: Optional[Callable[[], Dict[str, Any]]] = None
         self.on_slot_removed: Optional[Callable[[str], None]] = None
         self.on_slot_migrated: Optional[Callable[[str, str], None]] = None
@@ -282,6 +283,35 @@ class BrowserBridgeHub:
         self.is_slot_session_active: Optional[Callable[[WorkerSlot], bool]] = None
         self.on_extension_version_reported: Optional[Callable[[str], Any]] = None
         self.on_outdated_extension_detected: Optional[Callable[[str], Any]] = None
+
+    @property
+    def discovered_web_models(self) -> List[str]:
+        return list(self._discovered_web_models)
+
+    def record_discovered_models(
+        self,
+        models: Optional[Sequence[Any]] = None,
+        active_model: Optional[str] = None,
+    ) -> None:
+        """Record live model labels observed in the Gemini Enterprise browser UI."""
+        seen_lower = {m.lower() for m in self._discovered_web_models}
+        items: List[Any] = list(models) if models else []
+        if active_model:
+            items.append(active_model)
+        for raw in items:
+            if not isinstance(raw, str):
+                continue
+            label = raw.splitlines()[0].strip()
+            if not label or len(label) > 80:
+                continue
+            if label.lower() in {"default", "auto", "自动", "model", "choose a model", "select a model"}:
+                continue
+            if label.lower() not in seen_lower:
+                self._discovered_web_models.append(label)
+                seen_lower.add(label.lower())
+                if len(self._discovered_web_models) > 64:
+                    removed = self._discovered_web_models.pop(0)
+                    seen_lower.discard(removed.lower())
 
     def record_reply_error(self, slot: WorkerSlot, message: str) -> None:
         """A transport-complete reply can still be rejected by the tool protocol."""
@@ -366,6 +396,8 @@ class BrowserBridgeHub:
                 slot.active_model = active_model
             if captured_rpc is not None:
                 slot.captured_rpc = bool(captured_rpc)
+        if active_model:
+            self.record_discovered_models(active_model=active_model)
         return slot
 
     def _evict_slot_binding(self, slot: WorkerSlot) -> None:
@@ -478,6 +510,8 @@ class BrowserBridgeHub:
         for seat_index, item in enumerate(tabs_payload, start=1):
             if not isinstance(item, dict):
                 continue
+            if isinstance(item.get("available_models"), list):
+                self.record_discovered_models(item.get("available_models"))
             raw_tid = item.get("tab_id") if item.get("tab_id") is not None else item.get("id")
             tid = int(raw_tid) if raw_tid is not None else None
             slot = self._upsert_single_slot(
@@ -659,8 +693,10 @@ class BrowserBridgeHub:
         tab_title: str = "",
         driver_mode: str = "auto",
         active_model: str = "",
+        available_models: Optional[Sequence[str]] = None,
     ) -> BrowserClientState:
         self._prune_stale_http_clients()
+        self.record_discovered_models(available_models, active_model=active_model)
         cid = client_id or f"tm-{uuid.uuid4().hex[:8]}"
         existing = self._clients.get(cid)
         if existing and existing.transport == "http_poll":
@@ -822,6 +858,7 @@ class BrowserBridgeHub:
             "in_flight_requests": len(self._pending),
             "total_requests": self._total_requests,
             "total_errors": self._total_errors,
+            "discovered_models": list(self._discovered_web_models),
             "recent_logs": self._recent_logs[-25:],
         }
 
@@ -833,6 +870,11 @@ class BrowserBridgeHub:
         state = self._clients.get(client_id)
         if state is not None:
             state.last_seen_at = time.time()
+        if isinstance(data.get("available_models"), list) or data.get("active_model"):
+            self.record_discovered_models(
+                data.get("available_models") if isinstance(data.get("available_models"), list) else None,
+                active_model=str(data.get("active_model") or ""),
+            )
 
         msg_type = str(data.get("type") or data.get("event") or "").strip()
 

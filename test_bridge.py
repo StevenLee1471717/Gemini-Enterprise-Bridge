@@ -149,6 +149,7 @@ def test_health_models_and_503_when_disconnected() -> None:
         model_ids = [m["id"] for m in models["data"]]
         assert model_ids == [
             "gemini-4-carbon",
+            "gemini-4-hydrogen",
             "gemini-4-argon",
             "gemini-3.1-pro",
             "gemini-3.8-flash",
@@ -436,6 +437,7 @@ def test_model_alias_resolution_and_models_endpoint() -> None:
         listed_ids = [m["id"] for m in models_resp["data"]]
         assert listed_ids == [
             "gemini-4-carbon",
+            "gemini-4-hydrogen",
             "gemini-4-argon",
             "gemini-3.1-pro",
             "gemini-3.8-flash",
@@ -1490,6 +1492,7 @@ def test_gemini_4_carbon_deduplicated_and_context_window_metadata() -> None:
     ids = [m["id"] for m in AVAILABLE_MODELS]
     assert ids == [
         "gemini-4-carbon",
+        "gemini-4-hydrogen",
         "gemini-4-argon",
         "gemini-3.1-pro",
         "gemini-3.8-flash",
@@ -2757,3 +2760,97 @@ def test_runtime_debug_log_level_and_rotating_log_file(tmp_path: Path) -> None:
 
         # Restore INFO level cleanly
         client.post("/api/logs/level", json={"level": "INFO", "log_payloads": False})
+
+
+def test_gemini_4_hydrogen_and_future_model_auto_adaptation(tmp_path: Path) -> None:
+    """Verify gemini-4-hydrogen aliases, future model shorthands, live web discovery, ledger & Codex sync."""
+    from configure_codex_context import update_catalog, update_profile
+    from usage_ledger import UsageLedger
+
+    for alias in (
+        "gemini-4-hydrogen",
+        "gemini-4.0-hydrogen",
+        "gemini4hydrogen",
+        "4-hydrogen",
+        "4.0-hydrogen",
+        "4hydrogen",
+        "hydrogen",
+        "gemini-4-hydrogen-newchat",
+        "4hydrogen@worker1-newchat",
+        "3126a75e-77bb-4baa-b663-6abcc2cdb5a7/gemini-4-hydrogen",
+    ):
+        assert resolve_target_web_model(alias) == "4-hydrogen"
+
+    # Future unhardcoded Gemini models & element/version shorthands
+    assert resolve_target_web_model("gemini-4-oxygen") == "4-oxygen"
+    assert resolve_target_web_model("gemini-4.0-oxygen") == "4-oxygen"
+    assert resolve_target_web_model("4oxygen") == "4-oxygen"
+    assert resolve_target_web_model("gemini5pro") == "5-pro"
+    assert resolve_target_web_model("5pro") == "5-pro"
+    assert resolve_target_web_model("4.5flashlite") == "4.5-flash-lite"
+    assert resolve_target_web_model("oxygen") == "oxygen"
+
+    # Codex catalog & profile updater automatically adapts hydrogen & future gemini-* models without touching gpt-*
+    cat_raw = json.dumps(
+        {
+            "models": [
+                {"slug": "gemini-4-hydrogen", "input_modalities": ["text"]},
+                {"slug": "gemini-5-xenon", "input_modalities": ["text"]},
+                {"slug": "gpt-6.1-sol", "input_modalities": ["text"], "context_window": 200000},
+            ]
+        }
+    )
+    cat_updated = json.loads(update_catalog(cat_raw))
+    assert cat_updated["models"][0]["context_window"] == 1048576
+    assert cat_updated["models"][0]["input_modalities"] == ["text", "image"]
+    assert cat_updated["models"][1]["context_window"] == 1048576
+    assert cat_updated["models"][2]["context_window"] == 200000
+    assert "1048576" in update_profile('model = "gemini-4-hydrogen"\n')
+    assert "1048576" in update_profile('model = "gemini-5-xenon"\n')
+
+    # UsageLedger tracks both gemini-4-hydrogen and future models distinctly
+    ledger = UsageLedger(storage_path=tmp_path / "future_ledger.json")
+    ledger.record_request(requested_model="4hydrogen", prompt_tokens=100_000, completion_tokens=10_000)
+    ledger.record_request(requested_model="5pro", prompt_tokens=100_000, completion_tokens=10_000)
+    ledger.record_request(requested_model="5.2flash", prompt_tokens=100_000, completion_tokens=10_000)
+    snap = ledger.snapshot()
+    assert {"gemini-4-hydrogen", "gemini-5-pro", "gemini-5.2-flash"}.issubset(snap["by_model"].keys())
+
+    # Live browser auto-discovery populates /v1/models, /v1/models/{id}, and /api/status
+    app = create_app(_make_test_settings(generated_dir=str(tmp_path / "gen")))
+    with TestClient(app) as client:
+        base_ids = {m["id"] for m in client.get("/v1/models").json()["data"]}
+        assert "gemini-4-hydrogen" in base_ids
+        assert client.get("/v1/models/gemini-4-hydrogen-newchat").status_code == 200
+
+        for q in ("gemini-4-hydrogen", "4hydrogen", "5pro", "4-oxygen", "3126a75e-77bb-4baa-b663-6abcc2cdb5a7/gemini-4-hydrogen"):
+            r = client.get(f"/v1/models/{q}")
+            assert r.status_code == 200, f"Expected 200 for {q}, got {r.status_code}"
+            assert r.json()["max_prompt_tokens"] == 1048576
+
+        with client.websocket_connect("/ws/browser?client_id=ext-future") as ws:
+            ws.receive_json()  # welcome
+            ws.send_json(
+                {
+                    "type": "tab_status",
+                    "tab_id": 91,
+                    "tab_url": "https://vertexaisearch.cloud.google.com/u/0/home",
+                    "ready": True,
+                    "active_model": "5 Xenon",
+                    "available_models": ["Auto", "4 Hydrogen", "5 Xenon", "Enterprise Legal Agent"],
+                }
+            )
+            ws.receive_json()  # ack
+
+            dyn_ids = {m["id"] for m in client.get("/v1/models").json()["data"]}
+            assert "gemini-5-xenon" in dyn_ids
+            assert "gemini-5-xenon-newchat" in dyn_ids
+            assert "gemini-web:Enterprise Legal Agent" in dyn_ids
+
+            custom_meta = client.get("/v1/models/Enterprise Legal Agent")
+            assert custom_meta.status_code == 200
+            assert custom_meta.json()["max_prompt_tokens"] == 1048576
+
+            st = client.get("/api/status").json()
+            assert "gemini-5-xenon" in st["available_models"]
+            assert "5 Xenon" in st["discovered_models"]

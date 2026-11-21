@@ -31,7 +31,11 @@ from datetime import date, datetime
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Union
 
-from schemas import resolve_target_web_model
+from schemas import (
+    format_gemini_display_name,
+    normalize_web_label_to_model_spec,
+    resolve_target_web_model,
+)
 
 logger = logging.getLogger("gemini_bridge.usage")
 
@@ -66,6 +70,7 @@ class ModelPricingRate:
 _WEB_KEY_TO_CANONICAL: Dict[str, str] = {
     "4-carbon": "gemini-4-carbon",
     "4-argon": "gemini-4-argon",
+    "4-hydrogen": "gemini-4-hydrogen",
     "3.1-pro": "gemini-3.1-pro",
     "3.8-flash": "gemini-3.8-flash",
     "2.5-pro": "gemini-2.5-pro",
@@ -87,6 +92,8 @@ def _match_browser_label_to_canonical(raw_label: Optional[str]) -> Optional[str]
         return "gemini-4-carbon"
     if "argon" in low:
         return "gemini-4-argon"
+    if "hydrogen" in low:
+        return "gemini-4-hydrogen"
     if "3.1" in low:
         return "gemini-3.1-pro"
     if "3.8" in low:
@@ -95,6 +102,10 @@ def _match_browser_label_to_canonical(raw_label: Optional[str]) -> Optional[str]
         return "gemini-2.5-pro"
     if "2.5" in low and "flash" in low:
         return "gemini-2.5-flash"
+    if via_alias and via_alias != "auto":
+        spec = normalize_web_label_to_model_spec(cleaned)
+        if spec and spec[0] not in {"gemini-enterprise-web", "gemini-enterprise-gcloud"}:
+            return spec[0]
     return None
 
 
@@ -124,6 +135,10 @@ def resolve_canonical_billing_model(
     req_target = resolve_target_web_model(requested_model)
     if req_target in _WEB_KEY_TO_CANONICAL:
         return _WEB_KEY_TO_CANONICAL[req_target]
+    if req_target and req_target != "auto":
+        from_req_dynamic = _match_browser_label_to_canonical(requested_model)
+        if from_req_dynamic:
+            return from_req_dynamic
 
     from_browser = _match_browser_label_to_canonical(browser_active_model)
     if from_browser:
@@ -173,7 +188,8 @@ def get_model_pricing(
 ) -> ModelPricingRate:
     """Return official Google Gemini Developer API Paid Tier Standard rate (USD / 1M tokens)."""
     d = _coerce_date(as_of_date)
-    key = (canonical_model or "").strip().lower()
+    raw_model = (canonical_model or "").strip()
+    key = raw_model.lower()
     if key in _WEB_KEY_TO_CANONICAL:
         key = _WEB_KEY_TO_CANONICAL[key]
 
@@ -212,6 +228,27 @@ def get_model_pricing(
         return ModelPricingRate(
             canonical_model="gemini-4-argon",
             display_name="Gemini 4 Argon",
+            context_window=DEFAULT_CONTEXT_WINDOW,
+            input_per_1m=4.00,
+            cached_input_per_1m=0.20,
+            output_per_1m=20.00,
+            rate_note="官方正式标准价",
+        )
+
+    if key == "gemini-4-hydrogen":
+        if d <= date(2026, 11, 30):
+            return ModelPricingRate(
+                canonical_model="gemini-4-hydrogen",
+                display_name="Gemini 4 Hydrogen",
+                context_window=DEFAULT_CONTEXT_WINDOW,
+                input_per_1m=2.00,
+                cached_input_per_1m=0.10,
+                output_per_1m=10.00,
+                rate_note="官方推广期标准价 (至 2026-11-30; 12月起 $4/$20)",
+            )
+        return ModelPricingRate(
+            canonical_model="gemini-4-hydrogen",
+            display_name="Gemini 4 Hydrogen",
             context_window=DEFAULT_CONTEXT_WINDOW,
             input_per_1m=4.00,
             cached_input_per_1m=0.20,
@@ -293,6 +330,20 @@ def get_model_pricing(
             rate_note="官方标准价",
         )
 
+    if key and key not in {"auto", "default", "gemini-enterprise-auto", "gemini-enterprise-web"}:
+        canonical_id = raw_model if key.startswith("gemini-web:") else key
+        disp = format_gemini_display_name(raw_model)
+        is_light = any(t in key for t in ("flash", "lite", "nano", "mini"))
+        return ModelPricingRate(
+            canonical_model=canonical_id,
+            display_name=disp,
+            context_window=DEFAULT_CONTEXT_WINDOW,
+            input_per_1m=0.75 if is_light else (2.00 if d <= date(2026, 11, 30) else 4.00),
+            cached_input_per_1m=0.075 if is_light else (0.10 if d <= date(2026, 11, 30) else 0.20),
+            output_per_1m=3.75 if is_light else (10.00 if d <= date(2026, 11, 30) else 20.00),
+            rate_note="自动适配未来模型参考单价",
+        )
+
     # Frontier default when web UI is kept on "Auto" and actual concrete model isn't exposed
     if d <= date(2026, 11, 30):
         return ModelPricingRate(
@@ -321,6 +372,7 @@ def list_official_pricing_catalog(
     """Return full pricing catalog for UI display."""
     ordered = [
         "gemini-4-carbon",
+        "gemini-4-hydrogen",
         "gemini-4-argon",
         "gemini-3.1-pro",
         "gemini-3.8-flash",

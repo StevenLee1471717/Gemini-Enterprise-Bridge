@@ -140,13 +140,25 @@ function flashSavedToast() {
 }
 
 function friendlyModelName(raw) {
-  const s = String(raw || "").toLowerCase();
+  const str = String(raw || "").trim();
+  const s = str.toLowerCase();
   if (!s) return "Carbon (默认)";
+  if (s.includes("hydrogen")) return "Hydrogen";
   if (s.includes("carbon")) return "Carbon";
   if (s.includes("argon")) return "Argon";
-  if (s.includes("3.1") || s.includes("pro")) return "3.1 Pro";
-  if (s.includes("flash")) return "3.8 Flash";
-  return raw;
+  if (s.includes("3.1")) return "3.1 Pro";
+  if (s.includes("3.8")) return "3.8 Flash";
+  if (s.includes("2.5") && s.includes("pro")) return "2.5 Pro";
+  if (s.includes("2.5") && s.includes("flash")) return "2.5 Flash";
+  const stripped = str.replace(/^(?:gemini-web:|web:|gemini-)/i, "").trim();
+  if (stripped && stripped !== str) {
+    return stripped
+      .split(/[\s_\-]+/)
+      .filter(Boolean)
+      .map((p) => (/^\d/.test(p) ? p : p.charAt(0).toUpperCase() + p.slice(1)))
+      .join(" ");
+  }
+  return str;
 }
 
 function cleanTabTitle(rawTitle, index) {

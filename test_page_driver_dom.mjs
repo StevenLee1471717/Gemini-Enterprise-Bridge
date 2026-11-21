@@ -391,6 +391,9 @@ const menuDefs = [
   { label: "3.1 Pro", desc: "Complex reasoning & analysis" },
   { label: "4 Argon", desc: "Frontier multimodal & agentic tasks" },
   { label: "4 Carbon", desc: "Next-gen enterprise reasoning & coding" },
+  { label: "4 Hydrogen", desc: "Deep reasoning & scientific frontier" },
+  { label: "5 Xenon", desc: "Future generation multimodal reasoning" },
+  { label: "2.5 Pro", desc: "Legacy pro tier" },
   { label: "3.8 Flash", desc: "Fast everyday assistance" }
 ];
 
@@ -561,7 +564,27 @@ assert.equal(swCarbonAgain.ok, true);
 assert.equal(swCarbonAgain.switched, false);
 assert.equal(swCarbonAgain.alreadySelected, true);
 
-// Switching back from "4 Carbon" -> "4-argon" must also switch cleanly without false match
+// Test 2c: Switch from "4 Carbon" -> "4-hydrogen" and verify sibling isolation & idempotency
+const swHydrogen = await api.ensureWebModelSelected("4-hydrogen");
+assert.equal(swHydrogen.ok, true);
+assert.equal(swHydrogen.switched, true);
+assert.equal(api.readDetectedWebModel(), "4 Hydrogen");
+const swHydrogenAgain = await api.ensureWebModelSelected("4-hydrogen");
+assert.equal(swHydrogenAgain.ok, true);
+assert.equal(swHydrogenAgain.switched, false);
+assert.equal(swHydrogenAgain.alreadySelected, true);
+
+// Test 2d: Future model auto-adaptation (`5-xenon` & version boundary safety `5-pro` vs `2.5 Pro`)
+assert.equal(api.scoreModelOptionMatch("2.5 Pro\nLegacy pro tier", "5-pro"), 0, "5-pro must NEVER false-match 2.5 Pro");
+assert.ok(api.scoreModelOptionMatch("5 Pro\nNext gen", "5-pro") >= 100, "5-pro must match 5 Pro");
+assert.ok(api.scoreModelOptionMatch("Oxygen\nFuture element", "4-oxygen") >= 90, "4-oxygen must match standalone Oxygen headline");
+const swFutureXenon = await api.ensureWebModelSelected("5-xenon");
+assert.equal(swFutureXenon.ok, true);
+assert.equal(swFutureXenon.switched, true);
+assert.equal(api.readDetectedWebModel(), "5 Xenon");
+assert.ok(api.getDiscoveredModels().includes("4 Hydrogen") && api.getDiscoveredModels().includes("5 Xenon"), "Must auto-discover dropdown models");
+
+// Switching back from "5 Xenon" -> "4-argon" must still locate the trigger pill and switch cleanly
 const swBackToArgon = await api.ensureWebModelSelected("4-argon");
 assert.equal(swBackToArgon.ok, true);
 assert.equal(swBackToArgon.switched, true);

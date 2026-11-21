@@ -20,6 +20,29 @@ from agent_policy import (
     GEMINI_DESKTOP_BASE_INSTRUCTIONS, upgrade_desktop_agent_instructions,
 )
 from platform_compat import best_effort_chmod, reconfigure_stdio_utf8, sqlite_file_uri
+from schemas import WEB_MODEL_ALIASES, _LEGACY_DEFAULT_MODEL_IDS, _parse_dynamic_gemini_target, parse_model_and_session
+
+
+def is_gemini_bridge_slug(slug: object) -> bool:
+    """Return True for `gemini-4-hydrogen`, `gemini-4-carbon`, `gemini-4-argon`, and any future Gemini bridge slug."""
+    if not isinstance(slug, str):
+        return False
+    base_slug, _ = parse_model_and_session(slug)
+    if base_slug.lower().endswith('-newchat'):
+        base_slug = base_slug[:-len('-newchat')].strip()
+    cleaned = base_slug.strip()
+    if not cleaned:
+        return False
+    low = cleaned.lower()
+    if low in {'default', 'auto', 'web', 'gcloud'}:
+        return False
+    if low in _LEGACY_DEFAULT_MODEL_IDS or low.startswith(('gemini-', 'gemini-web:')):
+        return True
+    norm_hyphen = re.sub(r'[\s_]+', '-', low)
+    norm_compact = re.sub(r'[\s_\-]+', '', low)
+    if norm_hyphen in WEB_MODEL_ALIASES or norm_compact in WEB_MODEL_ALIASES:
+        return True
+    return _parse_dynamic_gemini_target(cleaned) is not None
 
 
 def _safe_backup_relpath(path: Path) -> Path:
@@ -80,8 +103,7 @@ def update_catalog(text: str) -> str:
     document = json.loads(text)
     changed = False
     for model in document.get('models', []):
-        slug = str(model.get('slug') or '')
-        if not slug.startswith('gemini-'):
+        if not is_gemini_bridge_slug(model.get('slug')):
             continue
         model.update(context_window=CARBON_CONTEXT_WINDOW, max_context_window=CARBON_CONTEXT_WINDOW,
                      auto_compact_token_limit=CARBON_AUTO_COMPACT_TOKENS,
@@ -138,7 +160,7 @@ def update_stream_timeouts(text: str) -> str:
 
 def update_profile(text: str) -> str:
     document = tomllib.loads(text)
-    if not str(document.get('model') or '').startswith('gemini-'):
+    if not is_gemini_bridge_slug(document.get('model')):
         return text
     # Restrict replacements to the root table, preserving providers, plugins, and unrelated preferences.
     split = re.search(r'^\[', text, re.M)
@@ -202,10 +224,19 @@ def main():
     repo_dir = Path(__file__).resolve().parent
     catalogs = [repo_dir / 'codex-models.json', args.codex_home / 'model-router/models.json',
                 args.codex_home / 'gemini-ccswitch-models.json']
-    profiles = [args.codex_home / 'gemini-bridge.config.toml', args.codex_home / 'gemini-4-carbon.config.toml',
-                args.codex_home / 'gemini-4-argon.config.toml']
+    base_profiles = [
+        args.codex_home / 'gemini-bridge.config.toml',
+        args.codex_home / 'gemini-4-carbon.config.toml',
+        args.codex_home / 'gemini-4-hydrogen.config.toml',
+        args.codex_home / 'gemini-4-argon.config.toml',
+        *sorted(args.codex_home.glob('gemini-*.config.toml')),
+    ]
     if args.outputs is not None:
-        profiles.extend([args.outputs / 'gemini-bridge.config.toml', args.outputs / 'ccswitch-gemini.config.toml'])
+        base_profiles.extend([
+            args.outputs / 'gemini-bridge.config.toml',
+            args.outputs / 'ccswitch-gemini.config.toml',
+        ])
+    profiles = list(dict.fromkeys(base_profiles))
     # The shared desktop config switches providers; per-model catalogs own its budgets.
     if args.apply:
         args.backup_dir.mkdir(parents=True, exist_ok=True)

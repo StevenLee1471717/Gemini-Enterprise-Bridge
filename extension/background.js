@@ -19,22 +19,27 @@ const UPDATE_CHECK_ALARM_NAME = "geb-update-check-alarm";
 const VERTEX_MATCH_PATTERN = "https://vertexaisearch.cloud.google.com/*";
 const DEFAULT_VERTEX_HOME_URL =
   "https://vertexaisearch.cloud.google.com/home/cid/f8a26a7c-0f51-4098-bf58-52506661472b?hl=en_US";
-const EXPECTED_DRIVER_VERSION = "2.8.7";
+const EXPECTED_DRIVER_VERSION = "2.8.8";
 const DEFAULT_GITHUB_REPO = "StevenLee1471717/Gemini-Enterprise-Bridge";
+const BUSY_REQUEST_SESSION_TTL_MS = 45 * 60 * 1000;
 
 // Live non-serializable WebSocket handle & per-tab fast caches; durable settings live in chrome.storage
 const socketRuntime = {
   ws: null,
   connecting: false,
+  connectPromise: null,
   heartbeatTimer: null,
   reconnectTimer: null,
+  reportStatusTimer: null,
   reconnectAttempts: 0
 };
 
 const runtimeTabMeta = new Map(); // tabId -> { activeModel, capturedRpc }
 const injectedTabVersions = new Map(); // tabId -> driverVersion
 const busyRequestsByTab = new Map(); // requestId -> tabId
+const busyRequestTimestamps = new Map(); // requestId -> epochMs
 const preparingRequests = new Map(); // requestId -> { cancelled }
+const spawningTabIds = new Set(); // tabIds currently mid-spawn before URL commits
 let backendBusyTabIds = new Set(); // session-level active tabIds pushed by Bridge
 let managedTabOrder = new Set(); // stable admitted tabIds within maxParallelTabs
 const pendingManualTabIds = new Set(); // immediate guard while new manual tab persists
@@ -87,10 +92,80 @@ function extractVertexSessionKey(rawUrl) {
   }
 }
 
+function persistBusyRequestsToSession() {
+  try {
+    const now = Date.now();
+    const serialized = {};
+    for (const [reqId, tid] of busyRequestsByTab) {
+      const ts = busyRequestTimestamps.get(reqId) || now;
+      if (now - ts <= BUSY_REQUEST_SESSION_TTL_MS) {
+        serialized[reqId] = { tabId: tid, ts };
+      }
+    }
+    chrome.storage.session.set({ busyRequestsMap: serialized }).catch(() => {});
+  } catch (_) {}
+}
+
+async function hydrateBusyRequestsFromSession() {
+  try {
+    const { busyRequestsMap } = await chrome.storage.session.get("busyRequestsMap");
+    if (!busyRequestsMap || typeof busyRequestsMap !== "object") return;
+    const now = Date.now();
+    let dirty = false;
+    for (const [reqId, entry] of Object.entries(busyRequestsMap)) {
+      const tid = Number(entry && entry.tabId);
+      const ts = Number(entry && entry.ts) || 0;
+      if (!reqId || !Number.isFinite(tid) || tid <= 0 || now - ts > BUSY_REQUEST_SESSION_TTL_MS) {
+        dirty = true;
+        continue;
+      }
+      if (!busyRequestsByTab.has(reqId)) {
+        busyRequestsByTab.set(reqId, tid);
+        busyRequestTimestamps.set(reqId, ts);
+      }
+    }
+    if (dirty) persistBusyRequestsToSession();
+  } catch (_) {}
+}
+
+function setBusyRequestForTab(requestId, tabId) {
+  busyRequestsByTab.set(requestId, tabId);
+  busyRequestTimestamps.set(requestId, Date.now());
+  persistBusyRequestsToSession();
+}
+
+function deleteBusyRequest(requestId) {
+  busyRequestTimestamps.delete(requestId);
+  const deleted = busyRequestsByTab.delete(requestId);
+  if (deleted) persistBusyRequestsToSession();
+  return deleted;
+}
+
+function clearBusyRequestsByTabId(tabId) {
+  const numTabId = Number(tabId);
+  let removed = false;
+  for (const [reqId, tid] of Array.from(busyRequestsByTab.entries())) {
+    if (tid === numTabId) {
+      busyRequestsByTab.delete(reqId);
+      busyRequestTimestamps.delete(reqId);
+      removed = true;
+    }
+  }
+  if (removed) persistBusyRequestsToSession();
+  return removed;
+}
+
 function isTabCurrentlyBusy(tabId) {
   if (!tabId) return false;
   if (backendBusyTabIds.has(Number(tabId))) return true;
-  for (const [, tid] of busyRequestsByTab) {
+  const now = Date.now();
+  for (const [reqId, tid] of Array.from(busyRequestsByTab.entries())) {
+    const ts = busyRequestTimestamps.get(reqId) || now;
+    if (now - ts > BUSY_REQUEST_SESSION_TTL_MS) {
+      busyRequestsByTab.delete(reqId);
+      busyRequestTimestamps.delete(reqId);
+      continue;
+    }
     if (tid === tabId) return true;
   }
   return false;
@@ -182,7 +257,28 @@ async function classifyAllVertexTabs() {
   const maxTabs = normalizeMaxParallelTabs(settings.maxParallelTabs, 10);
   const wsConnected = Boolean(socketRuntime.ws && socketRuntime.ws.readyState === WebSocket.OPEN);
   const rawTabs = (await chrome.tabs.query({ url: VERTEX_MATCH_PATTERN })) || [];
-  const allTabs = rawTabs.filter((t) => Boolean(t && t.id && isUsableVertexTabUrl(t.url || "")));
+  const seenRawIds = new Set(rawTabs.filter((t) => t && t.id).map((t) => t.id));
+  for (const spId of Array.from(spawningTabIds)) {
+    if (seenRawIds.has(spId)) continue;
+    try {
+      const spTab = await chrome.tabs.get(spId);
+      if (spTab && spTab.id) {
+        rawTabs.push(spTab);
+        seenRawIds.add(spTab.id);
+      } else {
+        spawningTabIds.delete(spId);
+      }
+    } catch (_) {
+      spawningTabIds.delete(spId);
+    }
+  }
+  const allTabs = rawTabs.filter((t) =>
+    Boolean(
+      t &&
+        t.id &&
+        (spawningTabIds.has(t.id) || isUsableVertexTabUrl(t.url || t.pendingUrl || ""))
+    )
+  );
   for (const t of allTabs) {
     const normalizedHome = normalizeVertexHomeUrl(t.url || "");
     if (normalizedHome && hasVertexWorkspacePath(normalizedHome)) {
@@ -402,8 +498,10 @@ async function findBestVertexTab() {
   if (tabs.length === 0) {
     return null;
   }
-  const activeInWindow = tabs.find((t) => t.active);
-  return activeInWindow || tabs[0];
+  const idleTabs = tabs.filter((t) => !isTabCurrentlyBusy(t.id));
+  const pool = idleTabs.length > 0 ? idleTabs : tabs;
+  const activeInWindow = pool.find((t) => t.active);
+  return activeInWindow || pool[0];
 }
 
 async function protectTabFromFreeze(tabId) {
@@ -551,6 +649,14 @@ function sendWsJson(payload) {
   }
 }
 
+function scheduleReportTabStatus(delayMs = 150) {
+  if (socketRuntime.reportStatusTimer !== null) return;
+  socketRuntime.reportStatusTimer = setTimeout(() => {
+    socketRuntime.reportStatusTimer = null;
+    void reportTabStatusToBackend();
+  }, Math.max(20, Number(delayMs) || 150));
+}
+
 function clearHeartbeatInterval() {
   if (socketRuntime.heartbeatTimer !== null) {
     clearInterval(socketRuntime.heartbeatTimer);
@@ -560,9 +666,10 @@ function clearHeartbeatInterval() {
 
 function startHeartbeatInterval() {
   clearHeartbeatInterval();
-  // Send a WebSocket frame every 20s to keep MV3 service worker & WS alive (Chrome 116+)
+  // Touch chrome.storage.session + send WS heartbeat every 18s to reset Chromium's 30s MV3 SW idle timer
   socketRuntime.heartbeatTimer = setInterval(() => {
     void (async () => {
+      await chrome.storage.session.set({ lastSwHeartbeatAt: Date.now() }).catch(() => {});
       const settings = await getSettings();
       const tabsSnapshot = await buildReportedTabsSnapshot();
       const primary = tabsSnapshot[0] || null;
@@ -586,7 +693,7 @@ function startHeartbeatInterval() {
         tabs: tabsSnapshot
       });
     })();
-  }, 20000);
+  }, 18000);
 }
 
 function clearReconnectTimer() {
@@ -602,8 +709,8 @@ function scheduleReconnectWithBackoff() {
   }
   const attempt = socketRuntime.reconnectAttempts;
   socketRuntime.reconnectAttempts = Math.min(attempt + 1, 8);
-  const baseDelay = Math.min(500 * Math.pow(2, attempt), 15000);
-  const jitter = Math.floor(Math.random() * 250);
+  const baseDelay = attempt === 0 ? 150 : Math.min(400 * Math.pow(2, attempt), 10000);
+  const jitter = Math.floor(Math.random() * 120);
   const delayMs = baseDelay + jitter;
 
   socketRuntime.reconnectTimer = setTimeout(() => {
@@ -631,41 +738,51 @@ async function disconnectWebSocket() {
 }
 
 async function ensureWebSocketConnected(forceReconnect = false, fromBackoffTimer = false) {
-  const settings = await getSettings();
-  if (!settings.enabled) {
-    socketRuntime.reconnectAttempts = 0;
-    await disconnectWebSocket();
-    return;
-  }
-
-  if (forceReconnect) {
-    socketRuntime.reconnectAttempts = 0;
-    await disconnectWebSocket();
-  }
-
-  if (
-    socketRuntime.connecting ||
-    (socketRuntime.ws &&
-      (socketRuntime.ws.readyState === WebSocket.OPEN ||
-        socketRuntime.ws.readyState === WebSocket.CONNECTING))
-  ) {
+  if (!forceReconnect) {
     if (socketRuntime.ws && socketRuntime.ws.readyState === WebSocket.OPEN) {
-      await reportTabStatusToBackend();
+      return;
     }
-    return;
+    if (socketRuntime.connectPromise) {
+      await socketRuntime.connectPromise;
+      return;
+    }
+    if (!fromBackoffTimer && socketRuntime.reconnectTimer !== null) {
+      return;
+    }
   }
 
-  // Respect active exponential backoff timer unless explicitly forced or triggered by the timer itself
-  if (!forceReconnect && !fromBackoffTimer && socketRuntime.reconnectTimer !== null) {
-    return;
-  }
+  const connectTask = (async () => {
+    const settings = await getSettings();
+    if (!settings.enabled) {
+      socketRuntime.reconnectAttempts = 0;
+      await disconnectWebSocket();
+      return;
+    }
 
-  clearReconnectTimer();
-  socketRuntime.connecting = true;
-  const clientId = await getClientId();
-  let targetUrl = settings.wsUrl.trim() || DEFAULT_SETTINGS.wsUrl;
-  const separator = targetUrl.includes("?") ? "&" : "?";
-  targetUrl = `${targetUrl}${separator}client_id=${encodeURIComponent(clientId)}`;
+    if (forceReconnect) {
+      socketRuntime.reconnectAttempts = 0;
+      await disconnectWebSocket();
+    }
+
+    if (
+      socketRuntime.connecting ||
+      (socketRuntime.ws &&
+        (socketRuntime.ws.readyState === WebSocket.OPEN ||
+          socketRuntime.ws.readyState === WebSocket.CONNECTING))
+    ) {
+      return;
+    }
+
+    if (!forceReconnect && !fromBackoffTimer && socketRuntime.reconnectTimer !== null) {
+      return;
+    }
+
+    clearReconnectTimer();
+    socketRuntime.connecting = true;
+    const clientId = await getClientId();
+    let targetUrl = settings.wsUrl.trim() || DEFAULT_SETTINGS.wsUrl;
+    const separator = targetUrl.includes("?") ? "&" : "?";
+    targetUrl = `${targetUrl}${separator}client_id=${encodeURIComponent(clientId)}`;
 
   try {
     const ws = new WebSocket(targetUrl);
@@ -720,14 +837,24 @@ async function ensureWebSocketConnected(forceReconnect = false, fromBackoffTimer
         });
       })();
     });
-  } catch (err) {
-    socketRuntime.connecting = false;
-    socketRuntime.ws = null;
-    await setSessionStatus({
-      wsConnected: false,
-      lastError: err.message || "WebSocket 初始化失败"
-    });
-    scheduleReconnectWithBackoff();
+    } catch (err) {
+      socketRuntime.connecting = false;
+      socketRuntime.ws = null;
+      await setSessionStatus({
+        wsConnected: false,
+        lastError: err.message || "WebSocket 初始化失败"
+      });
+      scheduleReconnectWithBackoff();
+    }
+  })();
+
+  socketRuntime.connectPromise = connectTask;
+  try {
+    await connectTask;
+  } finally {
+    if (socketRuntime.connectPromise === connectTask) {
+      socketRuntime.connectPromise = null;
+    }
   }
 }
 
@@ -994,39 +1121,49 @@ async function spawnParallelWorkerTab(baseUrlHint = "", preserveSessionUrl = fal
     throw new Error("无法创建新的后台工作标签页");
   }
 
-  const loadPromise =
-    created.status === "complete" ? Promise.resolve() : waitForTabComplete(created.id, 14000);
-  await protectTabFromFreeze(created.id);
+  spawningTabIds.add(created.id);
   managedTabOrder.add(created.id);
-  await loadPromise;
-  await new Promise((r) => setTimeout(r, 600));
-  await ensureScriptsInjected(created.id);
-  injectedTabVersions.set(created.id, EXPECTED_DRIVER_VERSION);
-
-  const targetSid = preserveSessionUrl ? extractVertexSessionIdFromUrl(targetUrl) : "";
-  let sessionProbe = null;
-  if (targetSid) {
-    sessionProbe = await waitForSessionPageReady(created.id, targetSid, 10000);
-    if (sessionProbe.active_model) {
-      const prevMeta = runtimeTabMeta.get(created.id) || {};
-      runtimeTabMeta.set(created.id, { ...prevMeta, activeModel: sessionProbe.active_model });
-    }
-  }
-
-  let latest = created;
   try {
-    latest = await chrome.tabs.get(created.id);
-  } catch (_) {}
+    const loadPromise =
+      created.status === "complete" ? Promise.resolve() : waitForTabComplete(created.id, 14000);
+    await protectTabFromFreeze(created.id);
+    await loadPromise;
+    await new Promise((r) => setTimeout(r, 600));
+    await ensureScriptsInjected(created.id);
+    injectedTabVersions.set(created.id, EXPECTED_DRIVER_VERSION);
 
-  await appendLog("info", `Spawned parallel worker tab #${latest.id}`);
-  await reportTabStatusToBackend();
-  return {
-    tab_id: latest.id,
-    tab_url: (sessionProbe && sessionProbe.tab_url) || latest.url || targetUrl,
-    tab_title: (sessionProbe && sessionProbe.tab_title) || latest.title || "Gemini Enterprise",
-    active_model: (sessionProbe && sessionProbe.active_model) || "",
-    ready: true
-  };
+    const targetSid = preserveSessionUrl ? extractVertexSessionIdFromUrl(targetUrl) : "";
+    let sessionProbe = null;
+    if (targetSid) {
+      sessionProbe = await waitForSessionPageReady(created.id, targetSid, 10000);
+      if (sessionProbe.active_model) {
+        const prevMeta = runtimeTabMeta.get(created.id) || {};
+        runtimeTabMeta.set(created.id, { ...prevMeta, activeModel: sessionProbe.active_model });
+      }
+    }
+
+    let latest = created;
+    try {
+      latest = await chrome.tabs.get(created.id);
+    } catch (_) {}
+    const prevMeta = runtimeTabMeta.get(latest.id) || {};
+    runtimeTabMeta.set(latest.id, {
+      ...prevMeta,
+      knownVertexUrl: (sessionProbe && sessionProbe.tab_url) || latest.url || targetUrl
+    });
+
+    await appendLog("info", `Spawned parallel worker tab #${latest.id}`);
+    await reportTabStatusToBackend();
+    return {
+      tab_id: latest.id,
+      tab_url: (sessionProbe && sessionProbe.tab_url) || latest.url || targetUrl,
+      tab_title: (sessionProbe && sessionProbe.tab_title) || latest.title || "Gemini Enterprise",
+      active_model: (sessionProbe && sessionProbe.active_model) || "",
+      ready: true
+    };
+  } finally {
+    spawningTabIds.delete(created.id);
+  }
 }
 
 async function resetTabChatWithFallback(tab) {
@@ -1101,9 +1238,9 @@ const swReplyReassembly = new Map();
 function getExtensionVersion() {
   try {
     const mf = chrome.runtime?.getManifest?.();
-    return mf && mf.version ? String(mf.version) : "1.5.0";
+    return mf && mf.version ? String(mf.version) : "1.5.1";
   } catch (_) {
-    return "1.5.0";
+    return "1.5.1";
   }
 }
 
@@ -1257,48 +1394,90 @@ async function prepareAttachmentsForTab(tabId, requestId, rawAttachments) {
   return prepared;
 }
 
+let backendActiveRequestIds = new Set();
+let backendActiveRequestIdsSynced = false;
+
+async function syncBackendActiveRequestIds(rawReqIds) {
+  if (!Array.isArray(rawReqIds)) return;
+  backendActiveRequestIds = new Set(rawReqIds.map((id) => String(id || "").trim()).filter(Boolean));
+  backendActiveRequestIdsSynced = true;
+  let releasedAny = false;
+  const now = Date.now();
+  for (const [reqId, tabId] of Array.from(busyRequestsByTab.entries())) {
+    if (preparingRequests.has(reqId)) continue;
+    if (backendActiveRequestIds.has(reqId)) continue;
+    const startedAt = busyRequestTimestamps.get(reqId) || 0;
+    if (startedAt > 0 && now - startedAt < 2500) continue;
+    deleteBusyRequest(reqId);
+    releasedAny = true;
+    if (tabId) {
+      chrome.tabs.sendMessage(tabId, { type: "GEB_CANCEL_REQUEST", request_id: reqId }).catch(() => {});
+    }
+  }
+  if (releasedAny) {
+    void broadcastTabTakeoverStates();
+    maybePerformIdleExtensionReload();
+  }
+}
+
+async function postCallbackFallback(eventData) {
+  if (typeof fetch !== "function") return false;
+  try {
+    const settings = await getSettings();
+    const clientId = await getClientId();
+    const callbackUrl = eventData.callback_url || deriveCallbackUrlFromWs(settings.wsUrl);
+    const resp = await fetch(callbackUrl, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        client_id: clientId,
+        tab_id: eventData.tab_id || null,
+        request_id: eventData.request_id,
+        reply: eventData.type === "request_complete" ? String(eventData.reply || "") : null,
+        error: eventData.type === "request_error" ? String(eventData.error || "浏览器页面执行失败") : null,
+        submitted: typeof eventData.submitted === "boolean" ? eventData.submitted : undefined,
+        tab_reset: typeof eventData.tab_reset === "boolean" ? eventData.tab_reset : undefined,
+        citations: eventData.citations || [],
+        source: eventData.source || "http_callback",
+        output_images: eventData.output_images || [],
+        output_files: eventData.output_files || [],
+        active_model: eventData.active_model || null,
+        tab_url: eventData.tab_url || null,
+        tab_title: eventData.tab_title || null
+      })
+    });
+    return Boolean(resp && resp.ok);
+  } catch (_) {
+    return false;
+  }
+}
+
 async function deliverResultToBackend(eventData) {
-  if (
+  const isTerminal =
     eventData &&
     (eventData.type === "request_complete" || eventData.type === "request_error") &&
-    eventData.request_id
-  ) {
-    if (busyRequestsByTab.delete(eventData.request_id)) {
+    Boolean(eventData.request_id);
+  if (isTerminal) {
+    if (deleteBusyRequest(eventData.request_id)) {
       void broadcastTabTakeoverStates();
     }
   }
   const replyStr = String(eventData.reply || "");
   const hasMediaOutputs = (eventData.output_images || []).length > 0 || (eventData.output_files || []).length > 0;
-  if (eventData.type === "request_complete" && (replyStr.length > LARGE_REPLY_THRESHOLD || hasMediaOutputs)) {
-    const settings = await getSettings();
-    const clientId = await getClientId();
-    const callbackUrl = eventData.callback_url || deriveCallbackUrlFromWs(settings.wsUrl);
-    try {
-      const resp = await fetch(callbackUrl, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          client_id: clientId,
-          tab_id: eventData.tab_id || null,
-          request_id: eventData.request_id,
-          reply: replyStr,
-          citations: eventData.citations || [],
-          source: eventData.source || "http_callback",
-          output_images: eventData.output_images || [],
-          output_files: eventData.output_files || [],
-          active_model: eventData.active_model || null,
-          tab_url: eventData.tab_url || null,
-          tab_title: eventData.tab_title || null
-        })
-      });
-      if (resp.ok) {
-        maybePerformIdleExtensionReload();
-        return;
-      }
-    } catch (_) {
-      // Fallback to chunked WebSocket frames below if HTTP callback fails
-    }
+  const wsOpenNow = Boolean(socketRuntime.ws && socketRuntime.ws.readyState === WebSocket.OPEN);
 
+  // Always deliver large replies OR any terminal completion/error while WS is reconnecting via direct HTTP callback!
+  if (
+    (eventData.type === "request_complete" && (replyStr.length > LARGE_REPLY_THRESHOLD || hasMediaOutputs || !wsOpenNow)) ||
+    (eventData.type === "request_error" && !wsOpenNow)
+  ) {
+    if (await postCallbackFallback(eventData)) {
+      maybePerformIdleExtensionReload();
+      return;
+    }
+  }
+
+  if (eventData.type === "request_complete" && (replyStr.length > LARGE_REPLY_THRESHOLD || hasMediaOutputs)) {
     if (!socketRuntime.ws || socketRuntime.ws.readyState !== WebSocket.OPEN) {
       await ensureWebSocketConnected(false);
     }
@@ -1326,7 +1505,9 @@ async function deliverResultToBackend(eventData) {
   if (!socketRuntime.ws || socketRuntime.ws.readyState !== WebSocket.OPEN) {
     await ensureWebSocketConnected(false);
   }
-  sendWsJson(eventData);
+  if (!sendWsJson(eventData) && isTerminal) {
+    await postCallbackFallback(eventData);
+  }
   maybePerformIdleExtensionReload();
 }
 
@@ -1334,6 +1515,9 @@ async function handleBackendCommand(msg) {
   const type = msg.type || "";
   if (Array.isArray(msg.busy_tab_ids)) {
     applyBackendBusyTabIds(msg.busy_tab_ids);
+  }
+  if (Array.isArray(msg.active_request_ids)) {
+    await syncBackendActiveRequestIds(msg.active_request_ids);
   }
   if (type === "sync_busy_tabs" || type === "welcome" || type === "pong" || type === "ack") {
     return;
@@ -1524,11 +1708,35 @@ async function handleBackendCommand(msg) {
         });
         return;
       }
-      if (Array.from(busyRequestsByTab.values()).includes(rawTab.id)) {
-        throw new Error("该 Google 标签页仍在处理上一项请求");
+      const conflictingReqIds = [];
+      for (const [existingReqId, existingTabId] of busyRequestsByTab.entries()) {
+        if (existingTabId === rawTab.id && existingReqId !== requestId) {
+          conflictingReqIds.push(existingReqId);
+        }
+      }
+      if (conflictingReqIds.length > 0) {
+        const allConfirmedOrphans =
+          backendActiveRequestIdsSynced &&
+          conflictingReqIds.every(
+            (oldId) => !preparingRequests.has(oldId) && !backendActiveRequestIds.has(oldId)
+          );
+        if (!allConfirmedOrphans) {
+          throw new Error("该 Google 标签页仍在处理上一项请求");
+        }
+        for (const oldId of conflictingReqIds) {
+          deleteBusyRequest(oldId);
+          try {
+            await chrome.tabs.sendMessage(rawTab.id, {
+              type: "GEB_CANCEL_REQUEST",
+              request_id: oldId
+            });
+          } catch (_) {}
+        }
+        await new Promise((r) => setTimeout(r, 180));
       }
 
-      busyRequestsByTab.set(requestId, rawTab.id);
+      setBusyRequestForTab(requestId, rawTab.id);
+      backendActiveRequestIds.add(requestId);
       sendWsJson({ type: "request_ack", request_id: requestId, tab_id: rawTab.id });
       void broadcastTabTakeoverStates();
 
@@ -1626,22 +1834,25 @@ async function handleBackendCommand(msg) {
 
       await dispatchToReadyTab();
     } catch (err) {
-      if (busyRequestsByTab.delete(requestId)) {
+      if (deleteBusyRequest(requestId)) {
         void broadcastTabTakeoverStates();
       }
       if (!preparation.cancelled) {
-        sendWsJson({
+        const errPacket = {
           type: "request_error",
           request_id: requestId,
           submitted: false,
           tab_reset: tabResetDone,
           error: "Gemini 工作页面恢复或发送失败: " + err.message
-        });
+        };
+        if (!sendWsJson(errPacket)) {
+          await postCallbackFallback(errPacket);
+        }
       }
       maybePerformIdleExtensionReload();
     } finally {
       preparingRequests.delete(requestId);
-      if (preparation.cancelled && busyRequestsByTab.delete(requestId)) {
+      if (preparation.cancelled && deleteBusyRequest(requestId)) {
         void broadcastTabTakeoverStates();
         maybePerformIdleExtensionReload();
       }
@@ -1653,6 +1864,7 @@ async function handleBackendCommand(msg) {
     const requestId = msg.request_id;
     if (!requestId) return;
     swPromptReassembly.delete(requestId);
+    backendActiveRequestIds.delete(requestId);
     const preparation = preparingRequests.get(requestId);
     if (preparation) preparation.cancelled = true;
     const tabId = busyRequestsByTab.get(requestId) || Number(msg.tab_id);
@@ -1664,7 +1876,7 @@ async function handleBackendCommand(msg) {
         });
       } catch (_) {}
     }
-    if (!preparation && busyRequestsByTab.delete(requestId)) {
+    if (!preparation && deleteBusyRequest(requestId)) {
       void broadcastTabTakeoverStates();
     }
     maybePerformIdleExtensionReload();

@@ -385,9 +385,13 @@ def wire_history_entry(role: str, content: str) -> str:
 _CLIENT_FENCE_LINE = re.compile(
     r"(?mi)(?:^[ \t]{0,3}|(?:\[\[section:[^\r\n]*?\]\][ \t]*)+)(?:\[\[section:[^\r\n]*?\]\][ \t]*)*(`{3,}|~{3,})([^\r\n]*)\r?$"
 )
+_ADJOINED_CLIENT_FENCE_HEAD_RE = re.compile(
+    r"(?mi)[ \t]*(?:\[\[section:[^\r\n]*?\]\][ \t]*)*(`{3,}|~{3,})([^\r\n]*)\r?$"
+)
 _WS_OR_SECTION_RE = re.compile(r"(?:\s+|\[\[section:[^\r\n]*?\]\])+", re.IGNORECASE)
 _CLIENT_TOOL_EXACT_CLOSE_RE = re.compile(
-    r"(?:```[ \t]*(?:(?:`{3,}|~{3,})[ \t]*)?suggested_questions\b[^\r\n]*(?:\r?\n[\s\S]*?^[ \t]{0,3}(?:`{3,}|~{3,})[ \t]*\r?$|\r?\n[\s\S]*$|\r?$)"
+    r"(?:```[ \t]*(?:\[\[section:[^\r\n]*?\]\][ \t]*)*(?:(?:`{3,}|~{3,})[ \t]*)?suggested_questions\b[^\r\n]*(?:\r?\n[\s\S]*?^[ \t]{0,3}(?:`{3,}|~{3,})[ \t]*\r?$|\r?\n[\s\S]*$|\r?$)"
+    r"|```[ \t]*(?:\[\[section:[^\r\n]*?\]\][ \t]*)*(?=`{3}[ \t]*codex_tool_call\b)"
     r"|```[ \t]*(?=(?:\[\[(?:section:[^\r\n]*?|suggested_questions|section:suggested_questions)\]\][ \t]*(?:\r?$|\r?\n)|\r?$|\r?\n)))",
     re.IGNORECASE | re.MULTILINE,
 )
@@ -396,9 +400,18 @@ _CLIENT_TOOL_EXACT_CLOSE_RE = re.compile(
 def _client_tool_fences(text: str):
     """Read JSON to its actual end; quoted backticks cannot close a tool block."""
     cursor = 0
+    adjoined_next = False
     unframed = re.compile(r"(?:`{3,}|~{3,})codex_tool_call(?:\s|$)", re.IGNORECASE)
     decoder = json.JSONDecoder()
-    while match := _CLIENT_FENCE_LINE.search(text, cursor):
+    while True:
+        match = (
+            _ADJOINED_CLIENT_FENCE_HEAD_RE.match(text, cursor)
+            if adjoined_next
+            else None
+        ) or _CLIENT_FENCE_LINE.search(text, cursor)
+        adjoined_next = False
+        if not match:
+            break
         if unframed.search(text[cursor:match.start()]):
             raise ToolProtocolError("客户端工具代码块必须独立成行，未执行不完整请求。")
         fence = match[1]
@@ -434,6 +447,8 @@ def _client_tool_fences(text: str):
                 raise ToolProtocolError("客户端工具代码块必须包含 JSON 对象参数，未执行该请求。")
         yield match.start(), close.end(), values
         cursor = close.end()
+        if re.match(r"`{3}[ \t]*codex_tool_call\b", text[cursor:], re.IGNORECASE):
+            adjoined_next = True
     if unframed.search(text[cursor:]):
         raise ToolProtocolError("客户端工具代码块必须独立成行，未执行不完整请求。")
 
@@ -1574,6 +1589,14 @@ class ToolStreamProcessor:
                 return n - k
         return None
 
+    @property
+    def raw_text(self) -> str:
+        return "".join(self._raw_parts)
+
+    @property
+    def emitted_text(self) -> str:
+        return "".join(self._emitted_parts)
+
     def finalize(self) -> Tuple[List[str], ParsedAssistantTurn]:
         tail, parsed = self._finalize()
         emitted = ''.join(self._emitted_parts)
@@ -1618,6 +1641,117 @@ class ToolStreamProcessor:
         leftover = self._pending
         self._pending = ""
         return ([leftover] if leftover else []), parsed
+
+
+# ---------------------------------------------------------------------------
+# Truncated Large Tool Call Detection & Seamless Continuation Helpers
+# ---------------------------------------------------------------------------
+
+MIN_TRUNCATED_TOOL_RECOVERY_CHARS = 4000
+
+_LEADING_WRAPPER_FENCE_RE = re.compile(
+    r"^\s*(?:\[\[section:[^\r\n]*?\]\]\s*)*(?:`{3,}|~{3,})[ \t]*(?:json|codex_tool_call|text)?[ \t]*\r?\n",
+    re.IGNORECASE,
+)
+
+
+def is_truncated_tool_protocol_error(
+    exc: BaseException,
+    raw_text: str,
+    min_chars: int = MIN_TRUNCATED_TOOL_RECOVERY_CHARS,
+) -> bool:
+    """Return True when a long tool-call reply hit an upstream output cutoff mid-JSON/fence."""
+    if not isinstance(exc, ToolProtocolError):
+        return False
+    text = raw_text or ""
+    if len(text) < min_chars:
+        return False
+    if "codex_tool_call" not in text.lower():
+        return False
+    msg = str(exc)
+    return ("JSON 不完整" in msg) or ("未正确结束" in msg)
+
+
+def build_truncated_tool_continuation_prompt(raw_text: str) -> str:
+    """Build an in-session continuation prompt anchored to the exact cutoff tail."""
+    cleaned_base = re.sub(r"(?:\r?\n)?```[ \t]*suggested_questions[\s\S]*$", "", raw_text, flags=re.IGNORECASE)
+    tail_anchor = cleaned_base[-220:]
+    return (
+        "[Seamless Continuation — Tool Call JSON Was Cut Off Before Closing]\n"
+        "Your immediately preceding `codex_tool_call` output hit the single-turn length limit and stopped mid-block right after this exact tail:\n"
+        "<<<TAIL_ANCHOR>>>\n"
+        f"{tail_anchor}\n"
+        "<<<END_TAIL_ANCHOR>>>\n"
+        "Continue outputting ONLY the exact remaining characters starting immediately after the final character of `<<<TAIL_ANCHOR>>>` through the closing `}` and closing ``` line.\n"
+        "STRICT RULES:\n"
+        "- Do NOT output any prose, markdown wrapper fence, or opening ```codex_tool_call line before the continuation.\n"
+        "- Do NOT repeat characters already inside `<<<TAIL_ANCHOR>>>`; start at the very next character.\n"
+        "- Preserve valid RFC 8259 JSON string escaping (`\\n`, `\\\"`, `\\\\`), close the JSON object cleanly, and end with ``` on its own line."
+    )
+
+
+def build_truncated_tool_part1_rewrite_prompt() -> str:
+    """Fallback prompt when a single huge tool call cannot be spliced cleanly."""
+    return (
+        "[Retry Notice — Tool Call Payload Too Large For One Turn; Split Into Smaller Steps]\n"
+        "Your previous `codex_tool_call` JSON was too large and got truncated before closing, so NO tool call was executed.\n"
+        "Rewrite this step NOW as a smaller, self-contained Part 1:\n"
+        "- Keep the entire `codex_tool_call` JSON under 10,000 characters (~150-220 lines of code).\n"
+        "- For creating a large file, create Part 1 (imports + core structure) with `create` now, and append remaining sections with `edit` in the next turn(s) after receiving the tool result.\n"
+        "- Output ONLY one complete ```codex_tool_call JSON block closed with ``` on its own line (no prose recap, no suggested_questions)."
+    )
+
+
+def _dedupe_nonperiodic_overlap(prefix: str, continuation: str, max_window: int = 320) -> str:
+    limit = min(max_window, len(prefix), len(continuation))
+    for k in range(limit, 3, -1):
+        ov = continuation[:k]
+        if prefix.endswith(ov) and ov.strip() and not prefix[:-k].endswith(ov):
+            return continuation[k:]
+    return continuation
+
+
+def _dedupe_boundary_overlap(prefix: str, continuation: str, max_window: int = 400) -> str:
+    limit = min(max_window, len(prefix), len(continuation))
+    for k in range(limit, 1, -1):
+        if prefix.endswith(continuation[:k]):
+            return continuation[k:]
+    return continuation
+
+
+def candidate_spliced_tool_replies(base_raw: str, cont_raw: str) -> List[str]:
+    """Generate candidate spliced strings from `base_raw` + `cont_raw` for strict JSON validation."""
+    base = re.sub(r"(?:\r?\n)?```[ \t]*suggested_questions[\s\S]*$", "", base_raw or "", flags=re.IGNORECASE)
+    cont = re.sub(r"\[\[section:[^\]]*\]\]", "", cont_raw or "", flags=re.IGNORECASE)
+    cont = re.sub(r"(?:\r?\n)?```[ \t]*suggested_questions[\s\S]*$", "", cont, flags=re.IGNORECASE)
+    cont = re.sub(r"(?:\r?\n)?\[\[(?:suggested_questions|section:suggested_questions)\]\][\s\S]*$", "", cont, flags=re.IGNORECASE)
+
+    anchor = base[-220:] if len(base) >= 220 else ""
+    if anchor and cont.startswith(anchor):
+        cont = cont[len(anchor) :]
+
+    stripped_fence = _LEADING_WRAPPER_FENCE_RE.sub("", cont, count=1)
+    variants_raw = [
+        _dedupe_nonperiodic_overlap(base, cont),
+        cont,
+        _dedupe_nonperiodic_overlap(base, stripped_fence),
+        stripped_fence,
+        _dedupe_nonperiodic_overlap(base, cont.lstrip("\r\n")),
+        cont.lstrip("\r\n"),
+        _dedupe_boundary_overlap(base, cont),
+        _dedupe_boundary_overlap(base, stripped_fence),
+    ]
+    out: List[str] = []
+    seen: set[str] = set()
+    for tail in variants_raw:
+        if not tail:
+            continue
+        for suffix_fix in ("", "\n```"):
+            cand = base + tail + suffix_fix
+            if cand not in seen:
+                seen.add(cand)
+                out.append(cand)
+    return out
 
 
 # ---------------------------------------------------------------------------

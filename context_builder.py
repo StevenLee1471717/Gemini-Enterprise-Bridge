@@ -782,14 +782,14 @@ class ConversationContextBuilder:
         if not submitted:
             return bool(tracked)
         if not tracked or session_key in self._session_recovery:
-            if not tracked and kind == "protocol_error":
+            if kind == "protocol_error":
                 untracked_sig = self._slot_last_untracked_sig.get(session_key)
                 if untracked_sig:
                     now = time.time()
                     stale_sigs = [
                         sig
                         for sig, (ts, _) in self._untracked_protocol_recovery.items()
-                        if now - ts > 180.0
+                        if now - ts > 300.0
                     ]
                     for sig in stale_sigs:
                         self._untracked_protocol_recovery.pop(sig, None)
@@ -813,6 +813,7 @@ class ConversationContextBuilder:
         clean_reason = _WHITESPACE_RUN_RE.sub(" ", recovery.reason or "").replace("```", "'''").strip()[:240]
         if recovery.kind == "protocol_error":
             detail = f" Reason: {clean_reason}" if clean_reason else ""
+            was_truncated = ("不完整" in clean_reason) or ("未正确结束" in clean_reason)
             lines = [
                 "[Retry Notice — Previous Reply Had a Format Error; Please Rewrite]",
                 f"Your immediately preceding reply in this chat had an invalid format and was REJECTED without executing.{detail}",
@@ -820,6 +821,10 @@ class ConversationContextBuilder:
                 "Rewrite your response cleanly from scratch for the input below:",
             ]
             if has_tools:
+                if was_truncated:
+                    lines.append(
+                        "- CRITICAL LENGTH RULE: Your previous `codex_tool_call` JSON was cut off before closing because the single tool payload was too long for one web response turn. Do NOT write an oversized file or multi-script payload (>12,000 chars) in a single tool call — split it into bounded steps (<12,000 chars / ~150-220 lines per turn), close the ``` fence cleanly now, and append remaining parts in the next turn(s)."
+                    )
                 lines.extend(
                     [
                         '- For client tool calls, use a standalone three-backtick `codex_tool_call` code block on its own line containing valid RFC 8259 JSON `{"name": "...", "arguments": {...}}` (never backslash-escape Markdown characters inside JSON strings), close with three backticks on its own line, and stop immediately without `suggested_questions`.',
@@ -902,6 +907,28 @@ class ConversationContextBuilder:
         _, dialogue = self._normalize_messages(messages)
         inline_cnt, _ = _extract_compaction_summary_info(dialogue)
         return inline_cnt > 0
+
+    def is_explicit_new_chat_messages(self, messages: Sequence[ChatMessage], model: str = "") -> bool:
+        if model_requests_new_chat(model):
+            return True
+        _, dialogue = self._normalize_messages(messages)
+        return bool(dialogue and dialogue[-1][0] == "user" and dialogue[-1][1].startswith("[NEW_CHAT]"))
+
+    def derive_subconversation_session_id(
+        self,
+        base_session_id: Optional[str],
+        messages: Sequence[ChatMessage],
+    ) -> Optional[str]:
+        base = (base_session_id or "").strip()
+        if not base:
+            return None
+        user_sys, dialogue = self._normalize_messages(messages)
+        if not dialogue:
+            return base
+        first_role, first_text = dialogue[0]
+        seed = f"{user_sys[:256]}\n{first_role}:{first_text[:2048]}"
+        digest = hashlib.sha1(seed.encode("utf-8", "ignore")).hexdigest()[:12]
+        return f"{base}#sub:{digest}"
 
     def delete_archived_by_vertex_session_id(self, vertex_session_id: str) -> None:
         if vertex_session_id:
@@ -1976,17 +2003,20 @@ class ConversationContextBuilder:
 
         tracked = self._session_turns.get(session_key)
         recovery_notice = self._build_recovery_prompt_block(pending_recovery, has_tools=tools_enabled) if pending_recovery else ""
-        dialogue_sig = ""
+        dialogue_sig = (
+            hashlib.sha1(json.dumps(dialogue, ensure_ascii=False).encode("utf-8", "ignore")).hexdigest()
+            if dialogue
+            else ""
+        )
+        if dialogue_sig:
+            self._slot_last_untracked_sig[session_key] = dialogue_sig
         untracked_retry_notice = ""
-        if not tracked and dialogue:
-            dialogue_sig = hashlib.sha1(
-                json.dumps(dialogue, ensure_ascii=False).encode("utf-8", "ignore")
-            ).hexdigest()
+        if not tracked and dialogue_sig:
             if user_requested_new_chat:
                 self._untracked_protocol_recovery.pop(dialogue_sig, None)
             else:
                 saved_untracked = self._untracked_protocol_recovery.pop(dialogue_sig, None)
-                if saved_untracked is not None and (time.time() - saved_untracked[0]) <= 180.0:
+                if saved_untracked is not None and (time.time() - saved_untracked[0]) <= 300.0:
                     untracked_retry_notice = self._build_recovery_prompt_block(
                         saved_untracked[1], has_tools=tools_enabled
                     )

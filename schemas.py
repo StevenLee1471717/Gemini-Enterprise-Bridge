@@ -157,6 +157,8 @@ class ChatCompletionRequest(_FlexibleModel):
     stop: Optional[Union[str, List[str]]] = None
     user: Optional[str] = None
     session_id: Optional[str] = None
+    prompt_cache_key: Optional[str] = None
+    metadata: Optional[Dict[str, Any]] = None
 
 
 class BridgeRegisterRequest(_FlexibleModel):
@@ -208,6 +210,8 @@ class BridgeCallbackPayload(_FlexibleModel):
     request_id: str
     reply: Optional[str] = None
     error: Optional[str] = None
+    submitted: Optional[bool] = None
+    tab_reset: Optional[bool] = None
     output_images: Optional[List[Dict[str, Any]]] = None
     output_files: Optional[List[Dict[str, Any]]] = None
     citations: Optional[List[Dict[str, Any]]] = None

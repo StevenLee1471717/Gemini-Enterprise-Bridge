@@ -117,6 +117,8 @@ class WorkerSlot:
     last_dispatch_tab_reset: bool = False
     lock: asyncio.Lock = field(default_factory=asyncio.Lock)
     seat_index: Optional[int] = None
+    created_at: float = field(default_factory=time.time)
+    tab_busy_until: float = 0.0
 
     @property
     def is_busy(self) -> bool:
@@ -165,6 +167,8 @@ class BrowserClientState:
     capabilities: Set[str] = field(default_factory=set)
     client_max_parallel_tabs: Optional[int] = None
     spawning_count: int = 0
+    disconnected_at: float = 0.0
+    pending_cancels: List[tuple[str, Optional[int], bool]] = field(default_factory=list)
     ws_send_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
     command_queue: asyncio.Queue[Dict[str, Any]] = field(default_factory=asyncio.Queue)
 
@@ -242,6 +246,8 @@ class BrowserBridgeHub:
         auto_spawn_tabs: bool = True,
         session_affinity_ttl_seconds: float = 300.0,
         backend_version: str = APP_VERSION,
+        ws_reconnect_grace_seconds: float = 45.0,
+        ws_reconnect_wait_seconds: float = 35.0,
     ) -> None:
         self.include_citations = include_citations
         self.callback_base_url = callback_base_url.rstrip("/")
@@ -250,6 +256,12 @@ class BrowserBridgeHub:
         self.auto_spawn_tabs = auto_spawn_tabs
         self.session_affinity_ttl_seconds = max(0.0, session_affinity_ttl_seconds)
         self.backend_version = normalize_version(backend_version) or APP_VERSION
+        self.ws_reconnect_grace_seconds = max(0.0, float(ws_reconnect_grace_seconds))
+        self.ws_reconnect_wait_seconds = max(0.0, float(ws_reconnect_wait_seconds))
+        self._ws_reconnect_event = asyncio.Event()
+        self._ws_grace_tasks: Dict[str, asyncio.Task[None]] = {}
+        self._cached_ws_usage_snapshot: Optional[Dict[str, Any]] = None
+        self._cached_ws_usage_at: float = 0.0
         bg_path = Path(__file__).resolve().parent / "background.js"
         drv_match = (
             re.search(r'EXPECTED_DRIVER_VERSION\s*=\s*"([^"]+)"', bg_path.read_text(encoding="utf-8", errors="ignore"))
@@ -526,9 +538,21 @@ class BrowserBridgeHub:
             slot.seat_index = seat_index
             seen_keys.add(slot.slot_key)
 
-        # Prune slots belonging to `client_id` that were closed in the browser
+        # Prune slots belonging to `client_id` that were closed in the browser,
+        # while protecting actively working/queued slots and freshly spawned tabs from stale snapshots.
+        now_sync = time.time()
         for existing_key, existing_slot in list(self._slots.items()):
             if existing_slot.client_id == client_id and existing_key not in seen_keys:
+                if (
+                    existing_slot.is_busy
+                    or existing_slot.waiting_count > 0
+                    or (
+                        state is not None
+                        and state.spawning_count > 0
+                        and (now_sync - existing_slot.created_at) < 30.0
+                    )
+                ):
+                    continue
                 self._remove_slot(existing_key, reason="tab_removed")
 
         if state is not None:
@@ -590,9 +614,66 @@ class BrowserBridgeHub:
     # Client registration & lifecycle
     # ------------------------------------------------------------------
 
+    def _get_ws_usage_snapshot(self, max_age: float = 3.0) -> Optional[Dict[str, Any]]:
+        if self.usage_snapshot_provider is None:
+            return None
+        now_mono = time.monotonic()
+        if (
+            self._cached_ws_usage_snapshot is not None
+            and (now_mono - self._cached_ws_usage_at) <= max_age
+        ):
+            return self._cached_ws_usage_snapshot
+        try:
+            snap = self.usage_snapshot_provider()
+            self._cached_ws_usage_snapshot = snap
+            self._cached_ws_usage_at = now_mono
+            return snap
+        except Exception:
+            return self._cached_ws_usage_snapshot
+
+    def _abort_client_pending_requests(self, client_id: str, reason: str) -> None:
+        for req_id, inflight in list(self._pending.items()):
+            if inflight.client_id == client_id:
+                inflight.events.put_nowait(
+                    {
+                        "type": "error",
+                        "message": f"浏览器桥接连接在生成过程中断开 ({reason})，请确认页面未关闭。",
+                    }
+                )
+                self._pending.pop(req_id, None)
+
+    def _schedule_ws_grace_watchdog(self, client_id: str, reason: str) -> None:
+        prev_task = self._ws_grace_tasks.pop(client_id, None)
+        if prev_task is not None and not prev_task.done():
+            prev_task.cancel()
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            self._abort_client_pending_requests(client_id, reason)
+            return
+
+        async def _watchdog() -> None:
+            try:
+                await asyncio.sleep(self.ws_reconnect_grace_seconds)
+                st = self._clients.get(client_id)
+                if st is None or (st.transport == "websocket" and st.websocket is None):
+                    self._abort_client_pending_requests(client_id, reason)
+            except asyncio.CancelledError:
+                return
+            finally:
+                if self._ws_grace_tasks.get(client_id) is task:
+                    self._ws_grace_tasks.pop(client_id, None)
+
+        task = loop.create_task(_watchdog())
+        self._ws_grace_tasks[client_id] = task
+
     async def register_websocket(self, websocket: WebSocket, client_id: Optional[str] = None) -> BrowserClientState:
         cid = client_id or f"ws-{uuid.uuid4().hex[:8]}"
+        prev_grace = self._ws_grace_tasks.pop(cid, None)
+        if prev_grace is not None and not prev_grace.done():
+            prev_grace.cancel()
         prev = self._clients.get(cid)
+        queued_cancels = list(prev.pending_cancels) if prev is not None else []
         state = BrowserClientState(
             client_id=cid,
             transport="websocket",
@@ -607,13 +688,19 @@ class BrowserBridgeHub:
             extension_version=prev.extension_version if prev else "",
             capabilities=set(prev.capabilities) if prev else set(),
             client_max_parallel_tabs=prev.client_max_parallel_tabs if prev else None,
+            spawning_count=prev.spawning_count if prev else 0,
+            disconnected_at=0.0,
         )
         self._clients[cid] = state
         if prev is not None and prev.websocket is not None and prev.websocket is not websocket:
+            old_ws = prev.websocket
+            prev.websocket = None
             try:
-                await prev.websocket.close(code=1000)
+                await old_ws.close(code=1000)
             except Exception:
                 pass
+        self._ws_reconnect_event.set()
+        self._parallel_limit.wake_waiters()
         self.add_log("info", f"Extension WebSocket connected ({cid})", cid)
         welcome_payload: Dict[str, Any] = {
             "type": "welcome",
@@ -622,13 +709,19 @@ class BrowserBridgeHub:
             "backend_version": self.backend_version,
             "max_parallel_tabs": self.max_parallel_tabs,
             "auto_spawn_tabs": self.auto_spawn_tabs,
+            "busy_tab_ids": self.compute_working_tab_ids(),
         }
-        if self.usage_snapshot_provider is not None:
-            try:
-                welcome_payload["usage_snapshot"] = self.usage_snapshot_provider()
-            except Exception:
-                pass
+        usage_snap = self._get_ws_usage_snapshot(max_age=3.0)
+        if usage_snap is not None:
+            welcome_payload["usage_snapshot"] = usage_snap
         await self._safe_ws_send(state, welcome_payload)
+        for cancel_req_id, cancel_tab_id, force_clear in queued_cancels:
+            cancel_payload: Dict[str, Any] = {"type": "cancel_request", "request_id": cancel_req_id}
+            if cancel_tab_id is not None:
+                cancel_payload["tab_id"] = cancel_tab_id
+            if force_clear:
+                cancel_payload["force_tab_clear"] = True
+            await self._safe_ws_send(state, cancel_payload)
         return state
 
     async def broadcast_ws_event(
@@ -661,6 +754,9 @@ class BrowserBridgeHub:
             return
         should_drop_slots = drop_slots if drop_slots is not None else (existing.transport != "websocket")
         if should_drop_slots:
+            prev_grace = self._ws_grace_tasks.pop(client_id, None)
+            if prev_grace is not None and not prev_grace.done():
+                prev_grace.cancel()
             state = self._clients.pop(client_id, None)
             if state is not None:
                 state.websocket = None
@@ -668,21 +764,27 @@ class BrowserBridgeHub:
             for skey, slot in list(self._slots.items()):
                 if slot.client_id == client_id:
                     self._remove_slot(skey, reason=reason)
-        else:
-            # Keep WS client & worker slot conversation ledgers dormant across MV3 SW sleep / transient reconnects.
-            existing.websocket = None
-            existing.last_seen_at = time.time()
-            self.add_log("warn", f"Browser client {client_id} socket closed ({reason}); preserving slot affinity", client_id)
+            self._abort_client_pending_requests(client_id, reason)
+            return
 
-        for req_id, inflight in list(self._pending.items()):
-            if inflight.client_id == client_id:
-                inflight.events.put_nowait(
-                    {
-                        "type": "error",
-                        "message": f"浏览器桥接连接在生成过程中断开 ({reason})，请确认页面未关闭。",
-                    }
-                )
-                self._pending.pop(req_id, None)
+        # Keep WS client, slot conversation ledgers, and active in-flight generations alive across
+        # MV3 Service Worker sleep / transient WebSocket reconnects.
+        now = time.time()
+        existing.websocket = None
+        existing.last_seen_at = now
+        existing.disconnected_at = now
+        inflight_cnt = sum(1 for inf in self._pending.values() if inf.client_id == client_id)
+        if inflight_cnt > 0 and self.ws_reconnect_grace_seconds > 0:
+            self.add_log(
+                "warn",
+                f"Browser client {client_id} socket closed ({reason}); keeping {inflight_cnt} in-flight request(s) alive for {self.ws_reconnect_grace_seconds:.0f}s reconnect grace",
+                client_id,
+            )
+            self._schedule_ws_grace_watchdog(client_id, reason)
+        elif inflight_cnt > 0:
+            self._abort_client_pending_requests(client_id, reason)
+        else:
+            self.add_log("warn", f"Browser client {client_id} socket closed ({reason}); preserving slot affinity", client_id)
 
     def register_http_client(
         self,
@@ -781,21 +883,102 @@ class BrowserBridgeHub:
         alive.sort(key=sort_key, reverse=True)
         return alive[0]
 
+    def _has_spawnable_ws_client(self, now: Optional[float] = None) -> bool:
+        if not self.auto_spawn_tabs:
+            return False
+        ts = time.time() if now is None else now
+        return any(
+            c.transport == "websocket" and c.is_alive(ts) and "spawn_tab" in c.capabilities
+            for c in self._clients.values()
+        )
+
     def has_ready_client(self) -> bool:
-        return len(self._get_alive_ready_slots()) > 0 or self.select_active_client() is not None
+        return (
+            len(self._get_alive_ready_slots()) > 0
+            or self.select_active_client() is not None
+            or self._has_spawnable_ws_client()
+        )
+
+    def has_reconnecting_ws_client(self, now: Optional[float] = None) -> bool:
+        if self.ws_reconnect_grace_seconds <= 0:
+            return False
+        ts = time.time() if now is None else now
+        for c in self._clients.values():
+            if c.transport != "websocket":
+                continue
+            if (
+                c.websocket is None
+                and c.disconnected_at > 0.0
+                and (ts - c.disconnected_at) <= self.ws_reconnect_grace_seconds
+            ):
+                return True
+            if (
+                c.websocket is not None
+                and not c.tab_ready
+                and (ts - c.connected_at) <= 5.0
+            ):
+                return True
+        return False
+
+    async def wait_for_client_reconnect(
+        self,
+        client_id: Optional[str] = None,
+        timeout: Optional[float] = None,
+    ) -> bool:
+        budget = min(
+            self.ws_reconnect_wait_seconds if timeout is None else max(0.0, float(timeout)),
+            self.ws_reconnect_grace_seconds,
+        )
+        if budget <= 0:
+            return False
+        deadline = time.monotonic() + budget
+        while True:
+            now = time.time()
+            if client_id:
+                st = self._clients.get(client_id)
+                if st is not None and st.is_alive(now):
+                    return True
+                if (
+                    st is None
+                    or st.transport != "websocket"
+                    or st.disconnected_at <= 0.0
+                    or (now - st.disconnected_at) > self.ws_reconnect_grace_seconds
+                ):
+                    return False
+            else:
+                if self.has_ready_client():
+                    return True
+                if not self.has_reconnecting_ws_client(now):
+                    return False
+            rem = deadline - time.monotonic()
+            if rem <= 0:
+                return False
+            self._ws_reconnect_event.clear()
+            if client_id:
+                st_recheck = self._clients.get(client_id)
+                if st_recheck is not None and st_recheck.is_alive():
+                    return True
+            elif self.has_ready_client():
+                return True
+            try:
+                await asyncio.wait_for(self._ws_reconnect_event.wait(), timeout=min(rem, 0.25))
+            except asyncio.TimeoutError:
+                continue
+
+    async def wait_for_ready_client(self, timeout: Optional[float] = None) -> bool:
+        if self.has_ready_client():
+            return True
+        return await self.wait_for_client_reconnect(client_id=None, timeout=timeout)
 
     def effective_pool_capacity(self) -> int:
         """Return max parallel browser slots available right now (accounting for auto-spawn when supported)."""
         slots = self._get_alive_ready_slots()
         active = self.select_active_client()
-        if not slots and active is None:
-            return 0
-        eff_max = self._effective_client_tab_cap(active) if active is not None else self.max_parallel_tabs
         now = time.time()
-        can_spawn = self.auto_spawn_tabs and any(
-            c.transport == "websocket" and c.is_alive(now) and "spawn_tab" in c.capabilities
-            for c in self._clients.values()
-        )
+        can_spawn = self._has_spawnable_ws_client(now)
+        if not slots and active is None:
+            return self.max_parallel_tabs if can_spawn else 0
+        eff_max = self._effective_client_tab_cap(active) if active is not None else self.max_parallel_tabs
         live_count = len(slots) if slots else (1 if active is not None else 0)
         if can_spawn:
             return max(min(len(slots), eff_max), eff_max)
@@ -990,10 +1173,14 @@ class BrowserBridgeHub:
                     else:
                         self._sync_client_tabs(client_id, [])
 
+            self._ws_reconnect_event.set()
             resp: Dict[str, Any] = {
                 "type": "pong" if msg_type == "heartbeat" else "ack",
                 "server_time": int(time.time()),
                 "backend_version": self.backend_version,
+                "active_request_ids": [
+                    rid for rid, inf in self._pending.items() if inf.client_id == client_id
+                ],
             }
             if backend_outdated_flag:
                 resp["backend_update_required"] = True
@@ -1001,11 +1188,9 @@ class BrowserBridgeHub:
                 resp["_emit_extension_reload"] = self.backend_version
             if state is not None and "session_busy_sync" in state.capabilities:
                 resp["busy_tab_ids"] = self.compute_working_tab_ids()
-            if self.usage_snapshot_provider is not None:
-                try:
-                    resp["usage_snapshot"] = self.usage_snapshot_provider()
-                except Exception:
-                    pass
+            usage_snap = self._get_ws_usage_snapshot(max_age=3.0)
+            if usage_snap is not None:
+                resp["usage_snapshot"] = usage_snap
             return resp
 
         if msg_type == "log":
@@ -1086,11 +1271,14 @@ class BrowserBridgeHub:
                 inflight.tab_reset = True
                 if slot_obj is not None:
                     slot_obj.last_dispatch_tab_reset = True
-            if not (data.get("submitted") is False and not inflight.submitted):
+            err_msg = str(data.get("error") or data.get("message") or "浏览器页面执行失败")
+            if data.get("submitted") is False and not inflight.submitted:
+                if slot_obj is not None and "仍在处理上一项请求" in err_msg:
+                    slot_obj.tab_busy_until = time.time() + 12.0
+            else:
                 inflight.submitted = True
                 if slot_obj is not None:
                     slot_obj.last_dispatch_submitted = True
-            err_msg = str(data.get("error") or data.get("message") or "浏览器页面执行失败")
             self._total_errors += 1
             self.add_log("error", f"Request {req_id[:8]} error: {err_msg}", client_id)
             await inflight.events.put({"type": "error", "message": err_msg})
@@ -1539,6 +1727,7 @@ class BrowserBridgeHub:
         tenant_id: str = "host",
         avoid_affinity_slot: bool = False,
         strict_session_affinity: bool = False,
+        avoid_slot_key: Optional[str] = None,
     ) -> AsyncIterator[WorkerSlot]:
         """Atomically select/spawn and lock an isolated `WorkerSlot` for parallel execution."""
         loop = asyncio.get_running_loop()
@@ -1558,6 +1747,7 @@ class BrowserBridgeHub:
                 explicit_session_id, matching_slot_keys, queue_deadline, queue_timeout,
                 ephemeral_aux, preferred_session_url, ephemeral_probe, tenant_id,
                 avoid_affinity_slot and thread_lock is None, thread_lock is not None,
+                avoid_slot_key=avoid_slot_key if thread_lock is None else None,
             ) as slot:
                 yield slot
         finally:
@@ -1577,6 +1767,7 @@ class BrowserBridgeHub:
         tenant_id: str,
         avoid_affinity_slot: bool,
         strict_session_affinity: bool,
+        avoid_slot_key: Optional[str] = None,
     ) -> AsyncIterator[WorkerSlot]:
         chosen: Optional[WorkerSlot] = None
         spawn_target: Optional[tuple[BrowserClientState, str]] = None
@@ -1586,166 +1777,191 @@ class BrowserBridgeHub:
         preferred_vsid = "" if is_ephemeral else extract_vertex_session_id(preferred_session_url or "")
         reused_existing_session = False
 
+        if not self.has_ready_client():
+            rem_wait = max(0.0, queue_deadline - asyncio.get_running_loop().time())
+            await self.wait_for_ready_client(timeout=min(self.ws_reconnect_wait_seconds, rem_wait))
+
         async with self._routing_lock:
             ready_slots = self._get_alive_ready_slots()
 
-            # Ensure any alive ready client without an explicit slot yet gets its default slot
             if not ready_slots:
-                fallback_client = self.select_active_client()
-                if fallback_client is not None:
-                    s = self._upsert_single_slot(
-                        client_id=fallback_client.client_id,
-                        tab_id=fallback_client.tab_id,
-                        tab_url=fallback_client.tab_url,
-                        tab_title=fallback_client.tab_title,
-                        tab_ready=True,
-                        active_model=fallback_client.active_model,
-                        captured_rpc=fallback_client.captured_rpc,
+                spawn_zero = self._find_spawnable_client([])
+                if spawn_zero is not None:
+                    spawn_client, spawn_url = spawn_zero
+                    spawn_client.spawning_count += 1
+                    spawn_target = (
+                        spawn_client,
+                        preferred_session_url if preferred_vsid and preferred_session_url else spawn_url,
                     )
-                    ready_slots = [s]
+                else:
+                    fallback_client = self.select_active_client()
+                    if fallback_client is not None:
+                        s = self._upsert_single_slot(
+                            client_id=fallback_client.client_id,
+                            tab_id=fallback_client.tab_id,
+                            tab_url=fallback_client.tab_url,
+                            tab_title=fallback_client.tab_title,
+                            tab_ready=True,
+                            active_model=fallback_client.active_model,
+                            captured_rpc=fallback_client.captured_rpc,
+                        )
+                        ready_slots = [s]
 
-            if not ready_slots:
+            if not ready_slots and spawn_target is None:
                 self._total_errors += 1
                 raise BridgeUnavailableError(
                     "未检测到挂载的 Gemini Enterprise 浏览器页面。请打开 "
                     "https://vertexaisearch.cloud.google.com 并确保浏览器扩展或油猴脚本处于已连接状态。"
                 )
 
-            ready_map = {s.slot_key: s for s in ready_slots}
-            now = time.time()
-            in_flight_or_waiting = sum(
-                1 for s in ready_slots if s.is_busy or s.waiting_count > 0
-            ) + sum(c.spawning_count for c in self._clients.values())
-            eff_global_cap = self._effective_global_tab_cap()
-            has_parallel_headroom = (eff_global_cap == 0) or (in_flight_or_waiting < eff_global_cap)
-            busy_affinity_cand: Optional[WorkerSlot] = None
+            if spawn_target is None:
+                ready_map = {s.slot_key: s for s in ready_slots}
+                now = time.time()
+                in_flight_or_waiting = sum(
+                    1 for s in ready_slots if s.is_busy or s.waiting_count > 0
+                ) + sum(c.spawning_count for c in self._clients.values())
+                eff_global_cap = self._effective_global_tab_cap()
+                has_parallel_headroom = (eff_global_cap == 0) or (in_flight_or_waiting < eff_global_cap)
+                busy_affinity_cand: Optional[WorkerSlot] = None
 
-            valid_matches = (
-                [
-                    ready_map[k]
-                    for k in matching_slot_keys
-                    if k in ready_map
-                    and (not strict_session_affinity or ready_map[k].pinned_session_id == effective_session_id)
-                    and (
-                        not ready_map[k].owner_tenant_id
-                        or not effective_tenant_id
-                        or ready_map[k].owner_tenant_id == effective_tenant_id
-                    )
-                ]
-                if matching_slot_keys
-                else []
-            )
-            idle_matches = [
-                s for s in valid_matches if not s.is_busy and s.waiting_count == 0
-            ]
-
-            # 1) Explicit session_id affinity (`X-Session-Id` / `session_id` / `model@session`)
-            aff_key = self.get_affinity_slot_key(effective_session_id)
-            if strict_session_affinity and aff_key and aff_key not in ready_map and self._slots[aff_key].is_busy:
-                raise BridgeUnavailableError("此 Codex 会话的浏览器页面正在工作，但暂时无法连接，请稍后重试。")
-            if aff_key in ready_map:
-                cand = ready_map[aff_key]
-                if not cand.owner_tenant_id or not effective_tenant_id or cand.owner_tenant_id == effective_tenant_id:
-                    if strict_session_affinity:
-                        chosen = cand
-                        reused_existing_session = True
-                    elif not cand.is_busy and cand.waiting_count == 0 and not avoid_affinity_slot:
-                        chosen = idle_matches[0] if (idle_matches and cand not in idle_matches) else cand
-                        reused_existing_session = True
-                    else:
-                        busy_affinity_cand = cand
-
-            # 2) Multi-turn conversation history prefix affinity (`matching_slot_keys`)
-            if chosen is None and valid_matches:
-                if idle_matches:
-                    chosen = idle_matches[0]
-                    reused_existing_session = True
-                elif not has_parallel_headroom:
-                    chosen = valid_matches[0]
-                    reused_existing_session = True
-                elif busy_affinity_cand is None:
-                    busy_affinity_cand = valid_matches[0]
-
-            # 2.5) Live tab already sitting on the target archived `/r/session/<id>` URL
-            if chosen is None and preferred_vsid:
-                url_matches = [
-                    s
-                    for s in ready_slots
-                    if extract_vertex_session_id(s.tab_url) == preferred_vsid
-                    and (not s.owner_tenant_id or not effective_tenant_id or s.owner_tenant_id == effective_tenant_id)
-                    and (not strict_session_affinity or s.pinned_session_id in (None, effective_session_id))
-                ]
-                if url_matches:
-                    idle_url_matches = [
-                        s for s in url_matches if not s.is_busy and s.waiting_count == 0
+                valid_matches = (
+                    [
+                        ready_map[k]
+                        for k in matching_slot_keys
+                        if k in ready_map
+                        and (not strict_session_affinity or ready_map[k].pinned_session_id == effective_session_id)
+                        and (
+                            not ready_map[k].owner_tenant_id
+                            or not effective_tenant_id
+                            or ready_map[k].owner_tenant_id == effective_tenant_id
+                        )
                     ]
-                    if idle_url_matches:
-                        chosen = idle_url_matches[0]
+                    if matching_slot_keys
+                    else []
+                )
+                idle_matches = [
+                    s for s in valid_matches if not s.is_busy and s.waiting_count == 0 and now >= s.tab_busy_until
+                ]
+
+                # 1) Explicit session_id affinity (`X-Session-Id` / `session_id` / `model@session`)
+                aff_key = self.get_affinity_slot_key(effective_session_id)
+                excluded_slot_key = avoid_slot_key or (aff_key if avoid_affinity_slot else None)
+                if strict_session_affinity and aff_key and aff_key not in ready_map and self._slots[aff_key].is_busy:
+                    raise BridgeUnavailableError("此 Codex 会话的浏览器页面正在工作，但暂时无法连接，请稍后重试。")
+                if aff_key in ready_map:
+                    cand = ready_map[aff_key]
+                    if not cand.owner_tenant_id or not effective_tenant_id or cand.owner_tenant_id == effective_tenant_id:
+                        if strict_session_affinity:
+                            chosen = cand
+                            reused_existing_session = True
+                        elif (
+                            not cand.is_busy
+                            and cand.waiting_count == 0
+                            and now >= cand.tab_busy_until
+                            and not avoid_affinity_slot
+                            and cand.slot_key != excluded_slot_key
+                        ):
+                            chosen = idle_matches[0] if (idle_matches and cand not in idle_matches) else cand
+                            reused_existing_session = True
+                        elif cand.slot_key != excluded_slot_key:
+                            busy_affinity_cand = cand
+
+                # 2) Multi-turn conversation history prefix affinity (`matching_slot_keys`)
+                if chosen is None and valid_matches:
+                    if idle_matches:
+                        chosen = idle_matches[0]
                         reused_existing_session = True
                     elif not has_parallel_headroom:
-                        chosen = url_matches[0]
+                        chosen = valid_matches[0]
                         reused_existing_session = True
+                    elif busy_affinity_cand is None:
+                        busy_affinity_cand = valid_matches[0]
 
-            # 3) Truly blank/unoccupied idle slot not holding any prior conversation
-            if chosen is None:
-                clean_idle = [
-                    s
-                    for s in ready_slots
-                    if not s.is_busy
-                    and s.waiting_count == 0
-                    and not (avoid_affinity_slot and s.slot_key == aff_key)
-                    and not self._is_slot_holding_protected_session(
-                        s, effective_session_id, now, requester_tenant_id=effective_tenant_id
-                    )
-                ]
-                if clean_idle:
-                    def _idle_rank(s: WorkerSlot) -> tuple[int, int, float]:
-                        is_probe = bool(
-                            self.is_slot_ephemeral_probe is not None
-                            and self.is_slot_ephemeral_probe(s.slot_key)
+                # 2.5) Live tab already sitting on the target archived `/r/session/<id>` URL
+                if chosen is None and preferred_vsid:
+                    url_matches = [
+                        s
+                        for s in ready_slots
+                        if extract_vertex_session_id(s.tab_url) == preferred_vsid
+                        and (not s.owner_tenant_id or not effective_tenant_id or s.owner_tenant_id == effective_tenant_id)
+                        and (not strict_session_affinity or s.pinned_session_id in (None, effective_session_id))
+                    ]
+                    if url_matches:
+                        idle_url_matches = [
+                            s for s in url_matches if not s.is_busy and s.waiting_count == 0 and now >= s.tab_busy_until
+                        ]
+                        if idle_url_matches:
+                            chosen = idle_url_matches[0]
+                            reused_existing_session = True
+                        elif not has_parallel_headroom:
+                            chosen = url_matches[0]
+                            reused_existing_session = True
+
+                # 3) Truly blank/unoccupied idle slot not holding any prior conversation
+                if chosen is None:
+                    clean_idle = [
+                        s
+                        for s in ready_slots
+                        if not s.is_busy
+                        and s.waiting_count == 0
+                        and now >= s.tab_busy_until
+                        and s.slot_key != excluded_slot_key
+                        and not self._is_slot_holding_protected_session(
+                            s, effective_session_id, now, requester_tenant_id=effective_tenant_id
                         )
-                        is_blank = not bool(extract_vertex_session_id(s.tab_url))
-                        if ephemeral_probe:
-                            tier = 0 if is_probe else (1 if is_blank else 2)
-                        else:
-                            tier = 0 if is_blank else (1 if is_probe else 2)
-                        return (tier, 0 if s.last_used_at == 0.0 else 1, s.last_used_at)
+                    ]
+                    if clean_idle:
+                        def _idle_rank(s: WorkerSlot) -> tuple[int, int, float]:
+                            is_probe = bool(
+                                self.is_slot_ephemeral_probe is not None
+                                and self.is_slot_ephemeral_probe(s.slot_key)
+                            )
+                            is_blank = not bool(extract_vertex_session_id(s.tab_url))
+                            if ephemeral_probe:
+                                tier = 0 if is_probe else (1 if is_blank else 2)
+                            else:
+                                tier = 0 if is_blank else (1 if is_probe else 2)
+                            return (tier, 0 if s.last_used_at == 0.0 else 1, s.last_used_at)
 
-                    clean_idle.sort(key=_idle_rank)
-                    chosen = clean_idle[0]
+                        clean_idle.sort(key=_idle_rank)
+                        chosen = clean_idle[0]
 
-            # 4) Auto-spawn a new background worker tab before evicting any occupied session slot
-            if chosen is None:
-                spawn_candidate = self._find_spawnable_client(ready_slots)
-                if spawn_candidate is not None:
-                    spawn_client, spawn_url = spawn_candidate
-                    spawn_client.spawning_count += 1
-                    spawn_target = (
-                        spawn_client,
-                        preferred_session_url if preferred_vsid and preferred_session_url else spawn_url,
+                # 4) Auto-spawn a new background worker tab before evicting any occupied session slot
+                if chosen is None:
+                    spawn_candidate = self._find_spawnable_client(ready_slots)
+                    if spawn_candidate is not None:
+                        spawn_client, spawn_url = spawn_candidate
+                        spawn_client.spawning_count += 1
+                        spawn_target = (
+                            spawn_client,
+                            preferred_session_url if preferred_vsid and preferred_session_url else spawn_url,
+                        )
+
+                # 5) Pool at max_parallel_tabs (or spawn unavailable): pick true LRU idle slot, else least-loaded busy slot
+                if chosen is None and spawn_target is None:
+                    fallback_pool = (
+                        [s for s in ready_slots if s.slot_key != excluded_slot_key]
+                        if (excluded_slot_key and len(ready_slots) > 1)
+                        else ready_slots
                     )
-
-            # 5) Pool at max_parallel_tabs (or spawn unavailable): pick true LRU idle slot, else least-loaded busy slot
-            if chosen is None and spawn_target is None:
-                fallback_pool = (
-                    [s for s in ready_slots if s.slot_key != aff_key]
-                    if (avoid_affinity_slot and len(ready_slots) > 1)
-                    else ready_slots
-                )
-                fallback = self._select_fallback_slot(
-                    fallback_pool, now, requester_tenant_id=effective_tenant_id or "host"
-                )
-                if (
-                    busy_affinity_cand is not None
-                    and not avoid_affinity_slot
-                    and (fallback.is_busy or fallback.waiting_count > 0)
-                    and (busy_affinity_cand.waiting_count + (1 if busy_affinity_cand.is_busy else 0))
-                    <= (fallback.waiting_count + (1 if fallback.is_busy else 0))
-                ):
-                    chosen = busy_affinity_cand
-                    reused_existing_session = True
-                else:
-                    chosen = fallback
+                    non_busy_flagged = [s for s in fallback_pool if now >= s.tab_busy_until]
+                    fallback = self._select_fallback_slot(
+                        non_busy_flagged or fallback_pool,
+                        now,
+                        requester_tenant_id=effective_tenant_id or "host",
+                    )
+                    if (
+                        busy_affinity_cand is not None
+                        and not avoid_affinity_slot
+                        and busy_affinity_cand.slot_key != excluded_slot_key
+                        and (fallback.is_busy or fallback.waiting_count > 0)
+                        and (busy_affinity_cand.waiting_count + (1 if busy_affinity_cand.is_busy else 0))
+                        <= (fallback.waiting_count + (1 if fallback.is_busy else 0))
+                    ):
+                        chosen = busy_affinity_cand
+                        reused_existing_session = True
+                    else:
+                        chosen = fallback
 
             if chosen is not None:
                 chosen.waiting_count += 1
@@ -2041,6 +2257,8 @@ class BrowserBridgeHub:
         sanitized_prompt = prompt.replace("\x00", "")
         req_id = uuid.uuid4().hex
         client = self._clients.get(slot.client_id)
+        if (client is None or not client.is_alive()) and await self.wait_for_client_reconnect(slot.client_id):
+            client = self._clients.get(slot.client_id)
         if client is None or not client.is_alive():
             self._total_errors += 1
             raise BridgeUnavailableError("目标浏览器工作标签页所属连接已断开。")
@@ -2225,6 +2443,7 @@ class BrowserBridgeHub:
         video_generation: bool = False,
         output_images: Optional[List[Dict[str, Any]]] = None,
         output_files: Optional[List[Dict[str, Any]]] = None,
+        strip_reply: bool = True,
     ) -> str:
         chunks: List[str] = []
         async for delta in self.dispatch_stream_on_slot(
@@ -2242,7 +2461,8 @@ class BrowserBridgeHub:
         ):
             if delta:
                 chunks.append(delta)
-        return "".join(chunks).strip()
+        joined = "".join(chunks)
+        return joined.strip() if strip_reply else joined
 
     async def dispatch_stream(
         self,
@@ -2304,6 +2524,10 @@ class BrowserBridgeHub:
             if not ok:
                 if websocket is not None:
                     self.unregister_client(client.client_id, reason="ws_send_failed", websocket=websocket)
+                if await self.wait_for_client_reconnect(client.client_id):
+                    reconnected = self._clients.get(client.client_id)
+                    if reconnected is not None and await self._safe_ws_send(reconnected, command):
+                        return
                 raise BridgeUnavailableError("浏览器扩展 WebSocket 发送失败，连接已断开。")
         else:
             await client.command_queue.put(command)
@@ -2319,7 +2543,12 @@ class BrowserBridgeHub:
             cancel_cmd["tab_id"] = tab_id
         try:
             if client.transport == "websocket":
-                await self._safe_ws_send(client, cancel_cmd)
+                latest_client = self._clients.get(client.client_id) or client
+                sent = await self._safe_ws_send(latest_client, cancel_cmd)
+                if not sent:
+                    latest_client.pending_cancels.append((request_id, tab_id, False))
+                    if len(latest_client.pending_cancels) > 32:
+                        latest_client.pending_cancels = latest_client.pending_cancels[-32:]
             else:
                 client.command_queue.put_nowait(cancel_cmd)
         except Exception:

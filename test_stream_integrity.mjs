@@ -165,3 +165,23 @@ state.parsePacket({summaryText:'检查中。\n' + ticks3 + 'codex_tool_call\n' +
 assert.equal((fencedSqJob.networkText.match(/codex_tool_call/g) || []).length, 1);
 assert.ok(!fencedSqJob.networkText.includes('suggested_questions'));
 console.log('PASS: batchexecute exclusion, primary stream lock, XSSI + UTF-8 split, and fenced suggested_questions snapshot');
+
+// Truncated/unclosed summaryText snapshot must never corrupt an already-complete streamed tool call
+const truncSummaryJob = job();
+const longToolPayload = { name: 'create', arguments: { path: 'I:\\scene.py', file_text: 'x = 1\n'.repeat(800) } };
+const fullStreamedTool = '我将创建场景脚本。\n\n' + ticks3 + 'codex_tool_call\n' + JSON.stringify(longToolPayload) + '\n' + ticks3;
+state.parsePacket({ groundedContent: { content: { text: fullStreamedTool } } }, truncSummaryJob);
+state.parsePacket({ summaryText: fullStreamedTool.slice(0, 1200) }, truncSummaryJob);
+assert.equal(truncSummaryJob.networkText, fullStreamedTool, 'truncated summaryText must not append an unclosed duplicate tool block');
+
+// Multi-leg RPC stream where Leg 1 closes mid-tool-fence releases primaryStreamToken so Leg 2 completes cleanly
+const multiLegJob = job();
+const fullMultiJson = JSON.stringify({ name: 'exec_command', arguments: { cmd: 'echo ' + 'A'.repeat(200) } });
+const leg1Text = ticks3 + 'codex_tool_call\n' + fullMultiJson.slice(0, 80);
+const leg2Text = fullMultiJson.slice(80) + '\n' + ticks3;
+await state.consumeStream(stream(['[{"groundedContent":{"content":{"text":' + JSON.stringify(leg1Text) + '}}}]']), multiLegJob);
+assert.equal(multiLegJob.primaryStreamToken, null, 'unclosed tool fence releases primaryStreamToken for continuation leg');
+await state.consumeStream(stream(['[{"groundedContent":{"content":{"text":' + JSON.stringify(leg2Text) + '}}}]']), multiLegJob);
+assert.equal(multiLegJob.networkText, leg1Text + leg2Text);
+assert.equal(multiLegJob.networkDone, true);
+console.log('PASS: truncated summaryText guard and multi-leg RPC tool fence continuation');

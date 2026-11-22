@@ -106,7 +106,11 @@ from tool_calling import (
     build_sse_tool_call_deltas,
     build_tool_system_instructions,
     build_response_format_instructions,
+    build_truncated_tool_continuation_prompt,
+    build_truncated_tool_part1_rewrite_prompt,
+    candidate_spliced_tool_replies,
     is_tool_generation_enabled,
+    is_truncated_tool_protocol_error,
     normalize_request_tools,
     normalize_tool_choice,
     parse_assistant_output,
@@ -354,7 +358,7 @@ def create_app(
         return mutated
 
     def _effective_pool_capacity() -> int:
-        ready_cnt = len(hub.list_ready_slot_keys())
+        ready_cnt = hub.effective_pool_capacity()
         if ready_cnt > 0:
             return ready_cnt
         if gcloud.is_configured() and cfg.backend_mode in {"auto", "gcloud"}:
@@ -511,21 +515,48 @@ def create_app(
             _consumed_compactions_var.get()
             or context_builder.has_compaction_summary(request_messages)
         )
+        explicit_new_chat_req = context_builder.is_explicit_new_chat_messages(
+            request_messages, model=model_name
+        )
+        slot_busy_now = bool(
+            aff_slot_obj is not None and (aff_slot_obj.is_busy or aff_slot_obj.waiting_count > 0)
+        )
         avoid_affinity_slot = bool(
-            not (strict_session_affinity or ephemeral_probe or ephemeral_compaction or ephemeral_aux)
+            not (strict_session_affinity or ephemeral_probe or ephemeral_compaction or ephemeral_aux or explicit_new_chat_req)
             and tools_active
             and aff_slot_obj is not None
             and aff_slot in ready_keys
             and aff_slot not in matching_slots
-            and context_builder.has_active_tool_session(aff_slot)
             and not context_builder.has_pending_recovery(aff_slot)
             and not has_compaction_resume
-            and time.time() < aff_slot_obj.pending_tool_call_until
+            and (
+                slot_busy_now
+                or (
+                    context_builder.has_active_conversation(aff_slot)
+                    and (
+                        time.time() < aff_slot_obj.pending_tool_call_until
+                        or hub._is_slot_codex_active(aff_slot_obj)
+                    )
+                )
+            )
         )
 
-        effective_sid = None if (ephemeral_aux or ephemeral_probe) else explicit_session_id
+        avoid_slot_key: Optional[str] = None
+        if ephemeral_aux or ephemeral_probe:
+            effective_sid = None
+        elif avoid_affinity_slot and explicit_session_id:
+            avoid_slot_key = aff_slot
+            effective_sid = context_builder.derive_subconversation_session_id(
+                explicit_session_id, request_messages
+            )
+            sub_aff = hub.get_affinity_slot_key(effective_sid)
+            if sub_aff in ready_keys and sub_aff != aff_slot:
+                avoid_affinity_slot = False
+        else:
+            effective_sid = explicit_session_id
+
         async with hub.acquire_slot(
-            explicit_session_id=explicit_session_id,
+            explicit_session_id=effective_sid if (avoid_slot_key is not None) else explicit_session_id,
             matching_slot_keys=matching_slots,
             queue_timeout=queue_timeout,
             ephemeral_aux=ephemeral_aux,
@@ -534,6 +565,7 @@ def create_app(
             tenant_id=tenant_id,
             avoid_affinity_slot=avoid_affinity_slot,
             strict_session_affinity=strict_session_affinity and not (ephemeral_probe or ephemeral_compaction),
+            avoid_slot_key=avoid_slot_key,
         ) as slot:
             slot.last_dispatch_submitted = False
             slot.last_dispatch_tab_reset = False
@@ -1707,10 +1739,11 @@ def create_app(
                     reply_packet = await hub.handle_browser_event(client.client_id, data)
                     if reply_packet is not None:
                         reload_ver = reply_packet.pop("_emit_extension_reload", None)
-                        await websocket.send_json(reply_packet)
+                        await hub._safe_ws_send(client, reply_packet)
                         if reload_ver:
-                            await websocket.send_json(
-                                {"type": "extension_reload_available", "version": str(reload_ver)}
+                            await hub._safe_ws_send(
+                                client,
+                                {"type": "extension_reload_available", "version": str(reload_ver)},
                             )
         except WebSocketDisconnect:
             logger.info("浏览器扩展前端已断开连接 (%s)", client.client_id)
@@ -1758,14 +1791,18 @@ def create_app(
             active = hub.select_active_client()
             cid = active.client_id if active else "http_callback"
         if payload.error:
-            await hub.handle_browser_event(
-                cid,
-                {
-                    "type": "request_error",
-                    "request_id": payload.request_id,
-                    "error": payload.error,
-                },
-            )
+            err_ev: Dict[str, Any] = {
+                "type": "request_error",
+                "request_id": payload.request_id,
+                "error": payload.error,
+            }
+            if payload.tab_id is not None:
+                err_ev["tab_id"] = payload.tab_id
+            if payload.submitted is not None:
+                err_ev["submitted"] = payload.submitted
+            if payload.tab_reset is not None:
+                err_ev["tab_reset"] = payload.tab_reset
+            await hub.handle_browser_event(cid, err_ev)
         else:
             await hub.handle_browser_event(
                 cid,
@@ -2495,15 +2532,25 @@ def create_app(
             (x_thread_id.strip() if isinstance(x_thread_id, str) and x_thread_id.strip() else None)
             or (thread_id.strip() if isinstance(thread_id, str) and thread_id.strip() else None)
         )
+        req_meta = request.metadata if isinstance(request.metadata, dict) else {}
+        meta_thread_id = (
+            str(req_meta.get("thread_id") or req_meta.get("subagent_id") or "").strip() or None
+        )
         clean_x_sid = x_session_id.strip() if isinstance(x_session_id, str) and x_session_id.strip() else None
         clean_req_sid = request.session_id.strip() if isinstance(request.session_id, str) and request.session_id.strip() else None
-        verified_thread_id = request._bridge_thread_id or clean_thread_hdr
+        clean_cache_key = (
+            request.prompt_cache_key.strip()
+            if isinstance(request.prompt_cache_key, str) and request.prompt_cache_key.strip()
+            else None
+        )
+        verified_thread_id = request._bridge_thread_id or clean_thread_hdr or meta_thread_id
         raw_explicit_session_id = (
             verified_thread_id
             or model_session_tag
             or clean_x_bridge
             or clean_x_sid
             or clean_req_sid
+            or clean_cache_key
         )
         is_probe_req = bool(
             (isinstance(x_bridge_probe, str) and x_bridge_probe.strip() == "1")
@@ -2808,7 +2855,9 @@ def create_app(
             )
 
         # ---------------- Option 2: Parallel Browser-in-the-loop Worker Pool ----------------
-        if not hub.has_ready_client():
+        if not hub.has_ready_client() and not await hub.wait_for_ready_client(
+            timeout=min(hub.ws_reconnect_wait_seconds, cfg.queue_timeout_seconds)
+        ):
             return _openai_error_response(
                 status_code=503,
                 message=(
@@ -2873,7 +2922,7 @@ def create_app(
                         context_diagnostics["resumed_archived_session"] = True
                     raw_out_images: list[dict[str, Any]] = []
                     raw_out_files: list[dict[str, Any]] = []
-                    raw_reply = await hub.dispatch_complete_on_slot(
+                    raw_reply_unstripped = await hub.dispatch_complete_on_slot(
                         slot=slot,
                         prompt=prepared.prompt,
                         target_model=target_web_model,
@@ -2883,7 +2932,9 @@ def create_app(
                         attachments=sent_attachments,
                         output_images=raw_out_images,
                         output_files=raw_out_files,
+                        strip_reply=False,
                     )
+                    raw_reply = raw_reply_unstripped.strip()
                     if superseded_compactions:
                         schedule_compaction_resets(superseded_compactions, exclude_slot_key=session_key)
                     saved_outputs = persist_browser_outputs(
@@ -2894,18 +2945,78 @@ def create_app(
                         pub_base_url,
                         tenant_id=principal.tenant_id,
                     )
-                    parsed = parse_assistant_output(
-                        raw_reply, tools=norm_tools, tool_choice=norm_tool_choice,
-                        parallel_tool_calls=request.parallel_tool_calls,
-                        response_format=request.response_format,
-                    )
+                    try:
+                        parsed = parse_assistant_output(
+                            raw_reply, tools=norm_tools, tool_choice=norm_tool_choice,
+                            parallel_tool_calls=request.parallel_tool_calls,
+                            response_format=request.response_format,
+                        )
+                    except ToolProtocolError as trunc_exc:
+                        if not (tools_active and is_truncated_tool_protocol_error(trunc_exc, raw_reply_unstripped)):
+                            raise
+                        logger.warning(
+                            "Truncated long tool-call JSON on slot=%s (chars=%d); running seamless continuation...",
+                            session_key,
+                            len(raw_reply_unstripped),
+                        )
+                        parsed = None
+                        accum_raw = raw_reply_unstripped.lstrip()
+                        for leg in range(2):
+                            cont_parts_sync: list[str] = []
+                            async for c_delta_sync in hub.dispatch_stream_on_slot(
+                                slot=slot,
+                                prompt=build_truncated_tool_continuation_prompt(accum_raw),
+                                target_model=target_web_model,
+                                reset_chat=False,
+                                suppress_citations=True,
+                                request_timeout=cfg.request_timeout_seconds,
+                            ):
+                                if c_delta_sync:
+                                    cont_parts_sync.append(c_delta_sync)
+                            cont_reply = "".join(cont_parts_sync).rstrip()
+                            if not cont_reply.strip():
+                                break
+                            candidates = candidate_spliced_tool_replies(accum_raw, cont_reply)
+                            for cand in candidates:
+                                try:
+                                    cand_parsed = parse_assistant_output(
+                                        cand, tools=norm_tools, tool_choice=norm_tool_choice,
+                                        parallel_tool_calls=request.parallel_tool_calls,
+                                        response_format=request.response_format,
+                                    )
+                                    if cand_parsed.has_tool_calls:
+                                        parsed = cand_parsed
+                                        break
+                                except ToolProtocolError:
+                                    continue
+                            if parsed is not None or leg == 1 or len(cont_reply) < 2000 or not candidates:
+                                break
+                            accum_raw = candidates[0]
+                        if parsed is None:
+                            logger.warning(
+                                "Continuation splice did not close cleanly on slot=%s; requesting bounded Part-1 tool call...",
+                                session_key,
+                            )
+                            rewrite_reply = await hub.dispatch_complete_on_slot(
+                                slot=slot,
+                                prompt=build_truncated_tool_part1_rewrite_prompt(),
+                                target_model=target_web_model,
+                                reset_chat=False,
+                                suppress_citations=True,
+                                request_timeout=cfg.request_timeout_seconds,
+                            )
+                            parsed = parse_assistant_output(
+                                rewrite_reply, tools=norm_tools, tool_choice=norm_tool_choice,
+                                parallel_tool_calls=request.parallel_tool_calls,
+                                response_format=request.response_format,
+                            )
                     record_reply_protocol(parsed, session_key, request)
                     if saved_outputs and not parsed.has_tool_calls and not json_mode_active:
                         md_links = format_artifacts_markdown(saved_outputs, parsed.content or "")
                         if md_links and (not tools_active or not (parsed.content or "").strip()):
                             parsed.content = ((parsed.content or "").rstrip() + "\n\n" + md_links).strip()
                     slot.pending_tool_call_until = (
-                        time.time() + 60.0 if parsed.has_tool_calls else 0.0
+                        time.time() + 180.0 if parsed.has_tool_calls else 0.0
                     )
                     effective_slot_model = slot.active_model or target_web_model
                     sent_att_toks = estimate_attachment_input_tokens(sent_attachments)
@@ -3171,7 +3282,85 @@ def create_app(
                             yield f"data: {json.dumps(chunk, ensure_ascii=False)}\n\n"
                             last_sse_ts = time.monotonic()
 
-                    tail_pieces, parsed = processor.finalize()
+                    try:
+                        tail_pieces, parsed = processor.finalize()
+                    except ToolProtocolError as trunc_exc:
+                        stream_raw_so_far = processor.raw_text
+                        if not (tools_active and is_truncated_tool_protocol_error(trunc_exc, stream_raw_so_far)):
+                            raise
+                        logger.warning(
+                            "Truncated streamed tool-call JSON on slot=%s (chars=%d); running seamless continuation...",
+                            session_key,
+                            len(stream_raw_so_far),
+                        )
+                        tail_pieces = []
+                        parsed = None
+                        accum_raw = stream_raw_so_far
+                        for leg in range(2):
+                            cont_chunks: list[str] = []
+                            cont_stream = hub.dispatch_stream_on_slot(
+                                slot=slot,
+                                prompt=build_truncated_tool_continuation_prompt(accum_raw),
+                                target_model=target_web_model,
+                                reset_chat=False,
+                                suppress_citations=True,
+                                request_timeout=cfg.request_timeout_seconds,
+                            )
+                            stream_cleanup.push_async_callback(cont_stream.aclose)
+                            async for c_delta in cont_stream:
+                                if c_delta:
+                                    cont_chunks.append(c_delta)
+                                elif time.monotonic() - last_sse_ts >= 12.0:
+                                    yield ": keepalive\n\n"
+                                    last_sse_ts = time.monotonic()
+                            cont_text = "".join(cont_chunks).strip()
+                            if not cont_text:
+                                break
+                            candidates = candidate_spliced_tool_replies(accum_raw, cont_text)
+                            for cand in candidates:
+                                try:
+                                    cand_parsed = parse_assistant_output(
+                                        cand, tools=norm_tools, tool_choice=norm_tool_choice,
+                                        parallel_tool_calls=request.parallel_tool_calls,
+                                        response_format=request.response_format,
+                                    )
+                                    if cand_parsed.has_tool_calls:
+                                        parsed = cand_parsed
+                                        break
+                                except ToolProtocolError:
+                                    continue
+                            if parsed is not None or leg == 1 or len(cont_text) < 2000 or not candidates:
+                                break
+                            accum_raw = candidates[0]
+                        if parsed is None:
+                            logger.warning(
+                                "Stream continuation splice did not close cleanly on slot=%s; requesting bounded Part-1 tool call...",
+                                session_key,
+                            )
+                            rw_chunks: list[str] = []
+                            rw_stream = hub.dispatch_stream_on_slot(
+                                slot=slot,
+                                prompt=build_truncated_tool_part1_rewrite_prompt(),
+                                target_model=target_web_model,
+                                reset_chat=False,
+                                suppress_citations=True,
+                                request_timeout=cfg.request_timeout_seconds,
+                            )
+                            stream_cleanup.push_async_callback(rw_stream.aclose)
+                            async for rw_delta in rw_stream:
+                                if rw_delta:
+                                    rw_chunks.append(rw_delta)
+                                elif time.monotonic() - last_sse_ts >= 12.0:
+                                    yield ": keepalive\n\n"
+                                    last_sse_ts = time.monotonic()
+                            parsed = parse_assistant_output(
+                                "".join(rw_chunks), tools=norm_tools, tool_choice=norm_tool_choice,
+                                parallel_tool_calls=request.parallel_tool_calls,
+                                response_format=request.response_format,
+                            )
+                        emitted_preamble = "".join(emitted_content).strip()
+                        parsed.content = emitted_preamble or (None if parsed.has_tool_calls else "")
+
                     if not handoff_cleanup_triggered and superseded_compactions:
                         handoff_cleanup_triggered = True
                         schedule_compaction_resets(
@@ -3219,7 +3408,7 @@ def create_app(
                                 yield f"data: {json.dumps(chunk, ensure_ascii=False)}\n\n"
 
                     slot.pending_tool_call_until = (
-                        time.time() + 60.0 if parsed.has_tool_calls else 0.0
+                        time.time() + 180.0 if parsed.has_tool_calls else 0.0
                     )
 
                     effective_slot_model = slot.active_model or target_web_model
@@ -3405,6 +3594,8 @@ if __name__ == "__main__":
         port=runtime_cfg.port,
         log_level="debug" if LOG_MANAGER.is_debug_enabled() else "info",
         ws_max_size=16 * 1024 * 1024,
+        ws_ping_interval=25.0,
+        ws_ping_timeout=60.0,
         h11_max_incomplete_event_size=16 * 1024 * 1024,
         timeout_graceful_shutdown=5,
     )

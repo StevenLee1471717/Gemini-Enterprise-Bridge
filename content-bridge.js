@@ -445,30 +445,49 @@
     }
   }
 
+  let keepaliveConnectedAt = 0;
+  const PORT_MAX_LIFETIME_MS = 240000; // Rotate before Chrome MV3's 5-min port cutoff
+
   function schedulePortReconnect() {
-    if (disposed || !chrome.runtime?.id || portRetryTimer !== null) return;
+    if (disposed || !chrome.runtime?.id || typeof chrome.runtime?.connect !== "function" || portRetryTimer !== null) {
+      return;
+    }
     const attempt = portRetryAttempts;
     portRetryAttempts = Math.min(attempt + 1, 6);
-    const delayMs = Math.min(500 * Math.pow(2, attempt), 10000);
+    const delayMs = attempt === 0 ? 80 : Math.min(400 * Math.pow(2, attempt), 8000);
     portRetryTimer = setTimeout(() => {
       portRetryTimer = null;
       ensureKeepalivePort();
     }, delayMs);
   }
 
-  function ensureKeepalivePort() {
-    if (disposed || !chrome.runtime?.id || keepalivePort) return;
+  function ensureKeepalivePort(forceRotate = false) {
+    if (disposed || !chrome.runtime?.id || typeof chrome.runtime?.connect !== "function") return;
+    if (keepalivePort) {
+      if (!forceRotate && Date.now() - keepaliveConnectedAt < PORT_MAX_LIFETIME_MS) {
+        return;
+      }
+      const stalePort = keepalivePort;
+      keepalivePort = null;
+      try {
+        stalePort.disconnect();
+      } catch (_) {}
+    }
     try {
-      keepalivePort = chrome.runtime.connect({ name: "geb-keepalive" });
+      const port = chrome.runtime.connect({ name: "geb-keepalive" });
+      keepalivePort = port;
+      keepaliveConnectedAt = Date.now();
       portRetryAttempts = 0;
       if (portRetryTimer !== null) {
         clearTimeout(portRetryTimer);
         portRetryTimer = null;
       }
-      keepalivePort.onDisconnect.addListener(() => {
-        // Page navigation closes this port normally; consume Chrome's diagnostic.
+      port.onDisconnect.addListener(() => {
+        // Page navigation or 5-min MV3 cycle closes this port; consume Chrome's diagnostic.
         void chrome.runtime.lastError;
-        keepalivePort = null;
+        if (keepalivePort === port) {
+          keepalivePort = null;
+        }
         if (!disposed && chrome.runtime?.id) {
           schedulePortReconnect();
         }
@@ -476,6 +495,31 @@
     } catch (_) {
       keepalivePort = null;
       schedulePortReconnect();
+    }
+  }
+
+  function startPortKeepaliveLoop() {
+    if (disposed || !chrome.runtime?.id || typeof chrome.runtime?.connect !== "function") return;
+    ensureKeepalivePort();
+    if (hiddenKeepaliveTimer === null) {
+      hiddenKeepaliveTimer = setInterval(() => {
+        if (disposed || !chrome.runtime?.id) {
+          if (hiddenKeepaliveTimer !== null) {
+            clearInterval(hiddenKeepaliveTimer);
+            hiddenKeepaliveTimer = null;
+          }
+          return;
+        }
+        ensureKeepalivePort();
+        if (keepalivePort) {
+          try {
+            keepalivePort.postMessage({ type: "keepalive_ping", ts: Date.now() });
+          } catch (_) {
+            keepalivePort = null;
+            ensureKeepalivePort();
+          }
+        }
+      }, 18000);
     }
   }
 
@@ -496,32 +540,9 @@
       } catch (_) {}
     })();
 
-    if (isHidden) {
-      ensureKeepalivePort();
-      if (hiddenKeepaliveTimer === null) {
-        hiddenKeepaliveTimer = setInterval(() => {
-          if (disposed || !chrome.runtime?.id || !document.hidden) {
-            if (hiddenKeepaliveTimer !== null) {
-              clearInterval(hiddenKeepaliveTimer);
-              hiddenKeepaliveTimer = null;
-            }
-            return;
-          }
-          ensureKeepalivePort();
-          if (keepalivePort) {
-            try {
-              keepalivePort.postMessage({ type: "keepalive_ping", ts: Date.now() });
-            } catch (_) {
-              keepalivePort = null;
-            }
-          }
-        }, 15000);
-      }
-    } else {
-      if (hiddenKeepaliveTimer !== null) {
-        clearInterval(hiddenKeepaliveTimer);
-        hiddenKeepaliveTimer = null;
-      }
+    // Keep MV3 Service Worker alive from ANY open Vertex tab (visible or hidden)
+    startPortKeepaliveLoop();
+    if (!isHidden) {
       flushQueuedPrompts();
     }
   }

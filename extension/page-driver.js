@@ -1,7 +1,7 @@
 // MAIN-world driver: DOM controls the composer; the original RPC is the only reply source.
 
 (() => {
-  const DRIVER_VERSION = "2.8.7";
+  const DRIVER_VERSION = "2.8.8";
 
   // Optional Trusted Types policy (gracefully guarded if CSP `trusted-types` header restricts custom policy names;
   // all DOM mutations below strictly use `replaceChildren` + `createElement` + `textContent` and ZERO `innerHTML`!)
@@ -324,24 +324,42 @@
 
   function replaceClientToolFences(text, replace) {
     const opening = /(?:^[ \t]{0,3}|(?:\[\[section:[^\r\n]*?\]\][ \t]*)+)(?:\[\[section:[^\r\n]*?\]\][ \t]*)*(`{3,}|~{3,})([^\r\n]*)\r?$/gmi;
+    const adjoinedHeadRe = /[ \t]*(?:\[\[section:[^\r\n]*?\]\][ \t]*)*(`{3,}|~{3,})([^\r\n]*)\r?$/ymi;
     const wsOrSectionRe = /(?:\s+|\[\[section:[^\r\n]*?\]\])+/yi;
-    const exactCloseRe = /(?:```[ \t]*(?:(?:`{3,}|~{3,})[ \t]*)?suggested_questions\b[^\r\n]*(?:\r?\n[\s\S]*?^[ \t]{0,3}(?:`{3,}|~{3,})[ \t]*\r?$|\r?\n[\s\S]*$|\r?$)|```[ \t]*(?=(?:\[\[(?:section:[^\r\n]*?|suggested_questions|section:suggested_questions)\]\][ \t]*(?:\r?$|\r?\n)|\r?$|\r?\n)))/ymi;
-    let match, cursor = 0, output = "";
-    while ((match = opening.exec(text))) {
+    const exactCloseRe = /(?:```[ \t]*(?:\[\[section:[^\r\n]*?\]\][ \t]*)*(?:(?:`{3,}|~{3,})[ \t]*)?suggested_questions\b[^\r\n]*(?:\r?\n[\s\S]*?^[ \t]{0,3}(?:`{3,}|~{3,})[ \t]*\r?$|\r?\n[\s\S]*$|\r?$)|```[ \t]*(?:\[\[section:[^\r\n]*?\]\][ \t]*)*(?=`{3}[ \t]*codex_tool_call\b)|```[ \t]*(?=(?:\[\[(?:section:[^\r\n]*?|suggested_questions|section:suggested_questions)\]\][ \t]*(?:\r?$|\r?\n)|\r?$|\r?\n)))/ymi;
+    let cursor = 0, searchFrom = 0, adjoinedNext = false, output = "";
+    while (true) {
+      let match = null;
+      let matchEnd = 0;
+      if (adjoinedNext) {
+        adjoinedHeadRe.lastIndex = searchFrom;
+        match = adjoinedHeadRe.exec(text);
+        if (match) matchEnd = adjoinedHeadRe.lastIndex;
+      }
+      adjoinedNext = false;
+      if (!match) {
+        opening.lastIndex = searchFrom;
+        match = opening.exec(text);
+        if (match) matchEnd = opening.lastIndex;
+      }
+      if (!match) break;
       const fence = match[1];
       const language = match[2].replace(/\[\[section:[^\]]*\]\]/gi, "").trim().toLowerCase();
       const closing = new RegExp("^[ \\t]{0,3}" + fence[0] + "{" + fence.length + ",}[ \\t]*\\r?$", "gm");
-      closing.lastIndex = opening.lastIndex;
+      closing.lastIndex = matchEnd;
       if (language !== "codex_tool_call" || fence !== "```") {
         const end = closing.exec(text);
-        opening.lastIndex = end ? closing.lastIndex : text.length;
+        searchFrom = end ? closing.lastIndex : text.length;
         continue;
       }
-      let pos = opening.lastIndex;
+      let pos = matchEnd;
       wsOrSectionRe.lastIndex = pos;
       const leadWs = wsOrSectionRe.exec(text);
       if (leadWs) pos = wsOrSectionRe.lastIndex;
-      if (text[pos] !== "{") continue;
+      if (text[pos] !== "{") {
+        searchFrom = matchEnd;
+        continue;
+      }
       const parsedValues = [];
       let parseOk = true;
       while (pos < text.length && text[pos] === "{") {
@@ -368,13 +386,22 @@
         const midWs = wsOrSectionRe.exec(text);
         if (midWs) pos = wsOrSectionRe.lastIndex;
       }
-      if (!parseOk || parsedValues.length === 0) continue;
+      if (!parseOk || parsedValues.length === 0) {
+        searchFrom = matchEnd;
+        continue;
+      }
       exactCloseRe.lastIndex = pos;
       const close = exactCloseRe.exec(text);
-      if (!close) continue;
+      if (!close) {
+        searchFrom = matchEnd;
+        continue;
+      }
       output += text.slice(cursor, match.index) + parsedValues.map((v) => replace(v)).join("\n");
       cursor = exactCloseRe.lastIndex;
-      opening.lastIndex = cursor;
+      searchFrom = cursor;
+      if (/^`{3}[ \t]*codex_tool_call\b/i.test(text.slice(cursor))) {
+        adjoinedNext = true;
+      }
     }
     return output + text.slice(cursor);
   }
@@ -427,10 +454,20 @@
     if (fpSnapshot === fpExisting) return "";
     if (fpExisting.startsWith(fpSnapshot)) return "";
     if (!fpSnapshot.startsWith(fpExisting)) return null;
-    const candidates = [];
+
+    const allNewlines = [];
     for (let i = 0; i < snapshotText.length; i += 1) {
-      if (snapshotText[i] === "\n") candidates.push(i);
+      if (snapshotText[i] === "\n") allNewlines.push(i);
     }
+    const candidates =
+      allNewlines.length <= 160
+        ? allNewlines
+        : allNewlines.filter(
+            (nlIdx, idx) =>
+              idx < 32 ||
+              idx >= allNewlines.length - 96 ||
+              snapshotText.slice(Math.max(0, nlIdx - 6), nlIdx + 6).includes("```")
+          );
     for (const cut of candidates) {
       if (replyFingerprint(snapshotText.slice(0, cut)) === fpExisting) {
         return snapshotText.slice(cut);
@@ -515,6 +552,9 @@
     for (const piece of texts) {
       const combined = piece.text;
       if (combined) {
+        if (!piece.snapshot) {
+          job.sawIncrementalDelta = true;
+        }
         if (piece.snapshot && job.networkText) {
           const snapshotSuffix = extractSnapshotSuffix(combined, job.networkText);
           if (snapshotSuffix !== null) {
@@ -522,6 +562,10 @@
               job.networkText += snapshotSuffix;
               job.onNetworkDelta(snapshotSuffix);
             }
+            continue;
+          }
+          // Guard: never append a truncated/unclosed `summaryText` echo onto an already-streamed reply!
+          if (findLastUnclosedToolFence(combined) >= 0) {
             continue;
           }
         }
@@ -711,7 +755,12 @@
           !invalidPacket &&
           job.networkText
         ) {
+          if (findLastUnclosedToolFence(job.networkText) >= 0) {
+            // Allow a continuation RPC leg to attach if the page is still streaming a long tool block
+            job.primaryStreamToken = null;
+          }
           job.networkDone = true;
+          job.networkDoneAt = Date.now();
           job.onNetworkDone();
         } else if (
           (isPrimary || noOtherStream) &&
@@ -2535,6 +2584,10 @@
   function stopJob(job) {
     job.cancelled = true;
     if (job.cancelStream) job.cancelStream();
+    if (job.wakeWaiters) job.wakeWaiters();
+    if (activeJob === job) {
+      activeJob = null;
+    }
     const stopButton = findGenerationStopButton();
     if (stopButton) stopButton.click();
   }
@@ -3260,6 +3313,9 @@
           delta
         });
       },
+      wakeWaiters() {
+        resolveNetworkComplete(false);
+      },
       onNetworkDone() {
         lastActivityAt = Date.now();
         resolveNetworkComplete(true);
@@ -3392,6 +3448,29 @@
       let latestDomCandidate = "";
       let sawDomGrowth = false;
 
+      const canFinishNetworkReplyNow = () => {
+        if (mediaGenerationMode || !job.networkDone || !job.networkText.trim()) {
+          return false;
+        }
+        if (findLastUnclosedToolFence(job.networkText) < 0) {
+          return true;
+        }
+        const activeStreamsOpen = Boolean(job.activeStreams && job.activeStreams.size > 0);
+        const pageGen = isPageStillGenerating();
+        const sinceDone = Date.now() - (job.networkDoneAt || lastActivityAt);
+        if ((activeStreamsOpen || pageGen) && Date.now() - lastActivityAt < 25000 && sinceDone < 45000) {
+          return false;
+        }
+        if (latestDomCandidate) {
+          const domSuffix = extractSnapshotSuffix(latestDomCandidate, job.networkText);
+          if (domSuffix && findLastUnclosedToolFence(job.networkText + domSuffix) < 0) {
+            job.networkText += domSuffix;
+            job.onNetworkDelta(domSuffix);
+          }
+        }
+        return true;
+      };
+
       while (
         !job.cancelled &&
         Date.now() - lastActivityAt < idleTimeoutMs &&
@@ -3399,7 +3478,7 @@
       ) {
         assertJobActive(job);
         // Fast path: if passive network stream sniffer captured and completed the RPC!
-        if (!mediaGenerationMode && job.networkDone && job.networkText.trim()) {
+        if (canFinishNetworkReplyNow()) {
           const { outImages, outFiles } = await collectNewTurnArtifacts(true);
           emitRequestComplete({
             type: "request_complete",
@@ -3420,7 +3499,7 @@
         await (job.networkDone ? sleep(220) : Promise.race([networkCompletePromise, sleep(220)]));
         assertJobActive(job);
 
-        if (!mediaGenerationMode && job.networkDone && job.networkText.trim()) {
+        if (canFinishNetworkReplyNow()) {
           const { outImages, outFiles } = await collectNewTurnArtifacts(true);
           emitRequestComplete({
             type: "request_complete",
@@ -3568,6 +3647,8 @@
     return {
       ok: true,
       driverVersion: DRIVER_VERSION,
+      busy: Boolean(activeJob),
+      activeRequestId: activeJob ? activeJob.requestId : null,
       visibilityState: document.visibilityState || "visible",
       hidden: Boolean(document.hidden),
       url: window.location.href,

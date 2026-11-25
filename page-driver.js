@@ -1,7 +1,7 @@
 // MAIN-world driver: DOM controls the composer; the original RPC is the only reply source.
 
 (() => {
-  const DRIVER_VERSION = "2.8.8";
+  const DRIVER_VERSION = "2.8.9";
 
   // Optional Trusted Types policy (gracefully guarded if CSP `trusted-types` header restricts custom policy names;
   // all DOM mutations below strictly use `replaceChildren` + `createElement` + `textContent` and ZERO `innerHTML`!)
@@ -771,6 +771,15 @@
         } else if ((isPrimary || noOtherStream) && rpcErrorMessage && !job.networkText) {
           job.networkError = `网页接口返回错误: ${rpcErrorMessage}`;
           logDriver("warn", job.networkError);
+        } else if (
+          (isPrimary || noOtherStream) &&
+          streamEnded &&
+          parsedPackets > 0 &&
+          !rpcErrorMessage &&
+          !job.networkText
+        ) {
+          job.emptyRpcEndedAt = Date.now();
+          job.onNetworkDone();
         }
       }
       reader.releaseLock();
@@ -3537,6 +3546,29 @@
         const generating = isPageStillGenerating();
         if (generating) {
           lastActivityAt = Date.now();
+        }
+        if (
+          !mediaGenerationMode &&
+          job.emptyRpcEndedAt &&
+          !job.networkText.trim() &&
+          (!job.activeStreams || job.activeStreams.size === 0) &&
+          !generating &&
+          Date.now() - job.emptyRpcEndedAt >= 1200
+        ) {
+          const { outImages, outFiles } = await collectNewTurnArtifacts(true);
+          emitRequestComplete({
+            type: "request_complete",
+            request_id: requestId,
+            reply: "",
+            output_images: outImages,
+            output_files: outFiles,
+            callback_url: callbackUrl || "",
+            citations: job.citations,
+            source: "empty_rpc_stream",
+            captured_rpc: Boolean(sharedState.lastCapturedRpc),
+            active_model: readDetectedWebModel() || sharedState.lastSelectedModel
+          });
+          return;
         }
         if (
           (generating || sawDomGrowth || job.networkText.length > 0) &&

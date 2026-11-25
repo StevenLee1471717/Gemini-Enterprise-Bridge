@@ -1,8 +1,8 @@
 # Chrome Web Store Listing & Permissions Reference
 
 **Extension Name:** Gemini Enterprise Web-to-API Bridge  
-**Current Version:** 1.5.1  
-**Last Updated:** 2026-11-22  
+**Current Version:** 1.5.2  
+**Last Updated:** 2026-11-25  
 **Distribution Target:** Local Developer Unpacked Extension / Private Enterprise Internal Distribution
 
 ---
@@ -51,6 +51,7 @@ Every permission in `manifest.json` is strictly scoped to local bridging:
 
 ## Version History
 
+- **1.5.2 (2026-11-25):** Prevented unexpected mid-session exits caused by leaked multimodal/turn control tokens (`<end_of_image>`, `<start_of_image>`, `<end_of_turn>`) or empty thought-only replies via stream-safe filtering, `DegenerateReplyError` protocol guarding, two-stage seamless in-session & clean-rebuild recovery, and fast empty-RPC completion (`page-driver.js` `v2.8.9`), alongside dual pre/post-discount usage ledger metrics, pre-update usage backfill, and daily token trend charts.
 - **1.5.1 (2026-11-22):** Eliminated periodic MV3 background disconnects, WebSocket reconnection collisions, false 503 offline errors during reconnects, and post-reconnect busy-tab errors; unlocked reliable 10-tab parallel concurrency and on-demand worker auto-spawning for multi-agent sessions; added seamless multi-leg continuation & bounded Part-1 fallback for oversized truncated tool-call JSON payloads (`page-driver.js` `v2.8.8`).
 - **1.5.0 (2026-11-21):** Merged upstream concurrency & infrastructure updates tailored for GitHub Copilot — added selective batch tool calling for GitHub Copilot CLI/App/VS Code Chat tools, up to 64 live browser seat caps & strict session affinity, Cloudflare Tunnel lifecycle management with Windows sleep/wake recovery, `/status` public status monitor, granular client quotas, Windows 10/11 compatibility (including UNC SMB hang fix), plus Gemini 4 Hydrogen and dynamic web model auto-discovery (`page-driver.js` `v2.8.7`).
 - **1.4.1 (2026-11-17):** Fixed attachment upload format errors across all file, image, audio, and video attachments, added seamless compatibility during background extension updates, and preserved standalone file uploads sent without accompanying message text.

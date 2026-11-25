@@ -8,7 +8,7 @@ import posixpath
 import re
 import shlex
 import uuid
-from web_text import WebTextFilter, clean_web_text
+from web_text import CONTROL_TOKEN_PATTERN, WebTextFilter, clean_web_text, has_leaked_control_tokens
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
@@ -38,6 +38,10 @@ _BROWSER_TASK_FAILURE = "I couldn't complete this request. If it needs a file, p
 
 class ToolProtocolError(ValueError):
     """A tool-enabled reply cannot safely be delivered or executed."""
+
+
+class DegenerateReplyError(ToolProtocolError):
+    """The upstream page returned an empty or control-token-only reply without content or tool calls."""
 
 
 _THINKING_PREFIXES = (
@@ -382,17 +386,18 @@ def wire_history_entry(role: str, content: str) -> str:
     return content
 
 
+_DECOR_TOKEN_RE_STR = r"(?:\[\[section:[^\r\n]*?\]\]|" + CONTROL_TOKEN_PATTERN + r")"
 _CLIENT_FENCE_LINE = re.compile(
-    r"(?mi)(?:^[ \t]{0,3}|(?:\[\[section:[^\r\n]*?\]\][ \t]*)+)(?:\[\[section:[^\r\n]*?\]\][ \t]*)*(`{3,}|~{3,})([^\r\n]*)\r?$"
+    r"(?mi)(?:^[ \t]{0,3}|(?:" + _DECOR_TOKEN_RE_STR + r"[ \t]*)+)(?:" + _DECOR_TOKEN_RE_STR + r"[ \t]*)*(`{3,}|~{3,})([^\r\n]*)\r?$"
 )
 _ADJOINED_CLIENT_FENCE_HEAD_RE = re.compile(
-    r"(?mi)[ \t]*(?:\[\[section:[^\r\n]*?\]\][ \t]*)*(`{3,}|~{3,})([^\r\n]*)\r?$"
+    r"(?mi)[ \t]*(?:" + _DECOR_TOKEN_RE_STR + r"[ \t]*)*(`{3,}|~{3,})([^\r\n]*)\r?$"
 )
-_WS_OR_SECTION_RE = re.compile(r"(?:\s+|\[\[section:[^\r\n]*?\]\])+", re.IGNORECASE)
+_WS_OR_SECTION_RE = re.compile(r"(?:\s+|" + _DECOR_TOKEN_RE_STR + r")+", re.IGNORECASE)
 _CLIENT_TOOL_EXACT_CLOSE_RE = re.compile(
-    r"(?:```[ \t]*(?:\[\[section:[^\r\n]*?\]\][ \t]*)*(?:(?:`{3,}|~{3,})[ \t]*)?suggested_questions\b[^\r\n]*(?:\r?\n[\s\S]*?^[ \t]{0,3}(?:`{3,}|~{3,})[ \t]*\r?$|\r?\n[\s\S]*$|\r?$)"
-    r"|```[ \t]*(?:\[\[section:[^\r\n]*?\]\][ \t]*)*(?=`{3}[ \t]*codex_tool_call\b)"
-    r"|```[ \t]*(?=(?:\[\[(?:section:[^\r\n]*?|suggested_questions|section:suggested_questions)\]\][ \t]*(?:\r?$|\r?\n)|\r?$|\r?\n)))",
+    r"(?:```[ \t]*(?:" + _DECOR_TOKEN_RE_STR + r"[ \t]*)*(?:(?:`{3,}|~{3,})[ \t]*)?suggested_questions\b[^\r\n]*(?:\r?\n[\s\S]*?^[ \t]{0,3}(?:`{3,}|~{3,})[ \t]*\r?$|\r?\n[\s\S]*$|\r?$)"
+    r"|```[ \t]*(?:" + _DECOR_TOKEN_RE_STR + r"[ \t]*)*(?=`{3}[ \t]*codex_tool_call\b)"
+    r"|```[ \t]*(?:" + CONTROL_TOKEN_PATTERN + r"[ \t]*)*(?=(?:\[\[(?:section:[^\r\n]*?|suggested_questions|section:suggested_questions)\]\][ \t]*(?:\r?$|\r?\n)|\r?$|\r?\n)))",
     re.IGNORECASE | re.MULTILINE,
 )
 
@@ -415,7 +420,7 @@ def _client_tool_fences(text: str):
         if unframed.search(text[cursor:match.start()]):
             raise ToolProtocolError("客户端工具代码块必须独立成行，未执行不完整请求。")
         fence = match[1]
-        language = re.sub(r"\[\[section:[^\]]*\]\]", "", match[2], flags=re.IGNORECASE).strip().lower()
+        language = re.sub(_DECOR_TOKEN_RE_STR, "", match[2], flags=re.IGNORECASE).strip().lower()
         closing = re.compile(r"(?m)^[ \t]{0,3}" + re.escape(fence[0]) + "{" + str(len(fence)) + r",}[ \t]*\r?$")
         if language != CLIENT_CALL_LANGUAGE:
             end = closing.search(text, match.end())
@@ -514,19 +519,26 @@ def parse_assistant_output(
     tool_choice: Optional[Any] = None,
     parallel_tool_calls: Optional[bool] = True,
     response_format: Optional[Dict[str, Any]] = None,
+    reject_empty: bool = False,
 ) -> ParsedAssistantTurn:
     """Parse raw web/upstream reply into OpenAI `content` + `tool_calls`."""
     text = raw_text or ""
     norm_tools = list(tools or [])
+    cleaned_full_web = clean_web_text(text)
 
-    if clean_web_text(text).strip() == _BROWSER_TASK_FAILURE:
+    if cleaned_full_web.strip() == _BROWSER_TASK_FAILURE:
         raise BrowserTaskFailure("Gemini 网页未能完成本次操作；已拒绝将失败提示当作正常答复。已执行的本机操作不会重放，下一次续接将优先在原会话纠正，连续失败再重建网页上下文。")
 
     if _thinking_prefix(text).startswith(_THINKING_PREFIXES):
         raise ToolProtocolError("网页返回了内部思考文字，未交付为答复。")
 
     if not is_tool_generation_enabled(norm_tools, tool_choice):
-        cleaned = clean_json_response(text if response_format else clean_web_text(text), response_format)
+        if not cleaned_full_web.strip():
+            if has_leaked_control_tokens(text):
+                raise DegenerateReplyError("网页仅返回了模型控制标记（如 <end_of_image>），未生成有效回复。")
+            if reject_empty:
+                raise DegenerateReplyError("网页返回了空回复，未生成有效内容。")
+        cleaned = clean_json_response(text if response_format else cleaned_full_web, response_format)
         return ParsedAssistantTurn(content=cleaned, tool_calls=[])
 
     allowed_names = {t["function"]["name"] for t in norm_tools}
@@ -551,11 +563,15 @@ def parse_assistant_output(
     unquoted = re.sub(r"(`+)[^\r\n]*?\1", "", unquoted)
     if re.search(r"\[TOOL_CALL\]|<tool_call>|```(?:tool_call|tool_use)", unquoted, re.IGNORECASE):
         raise ToolProtocolError("工具调用只接受 codex_tool_call 专用代码块，未执行旧格式请求。")
-    if not extracted_calls and (forced_fn or tool_choice == "required"):
-        raise ToolProtocolError("本轮必须返回完整的 codex_tool_call 代码块，未执行该请求。")
-
     if not extracted_calls:
-        cleaned = clean_json_response(text if response_format else clean_web_text(text), response_format)
+        if not cleaned_full_web.strip():
+            if has_leaked_control_tokens(text):
+                raise DegenerateReplyError("网页仅返回了模型控制标记（如 <end_of_image>），未生成有效回复或工具调用。")
+            if reject_empty:
+                raise DegenerateReplyError("网页返回了空回复，未生成有效内容或工具调用。")
+        if forced_fn or tool_choice == "required":
+            raise ToolProtocolError("本轮必须返回完整的 codex_tool_call 代码块，未执行该请求。")
+        cleaned = clean_json_response(text if response_format else cleaned_full_web, response_format)
         return ParsedAssistantTurn(content=cleaned, tool_calls=[])
 
     extracted_calls = _normalize_query_calls(extracted_calls)
@@ -1700,6 +1716,40 @@ def build_truncated_tool_part1_rewrite_prompt() -> str:
         "- For creating a large file, create Part 1 (imports + core structure) with `create` now, and append remaining sections with `edit` in the next turn(s) after receiving the tool result.\n"
         "- Output ONLY one complete ```codex_tool_call JSON block closed with ``` on its own line (no prose recap, no suggested_questions)."
     )
+
+
+def build_degenerate_reply_retry_prompt(
+    tools: Optional[Sequence[Dict[str, Any]]] = None,
+    tool_choice: Optional[Any] = None,
+    response_format: Optional[Dict[str, Any]] = None,
+) -> str:
+    """In-session recovery prompt when the model emits only control tokens (e.g. <end_of_image>) or empty text."""
+    norm_tools = list(tools or [])
+    lines = [
+        "[Retry Notice — Empty / Control-Token Reply Rejected]",
+        "Your immediately preceding reply in this chat contained no valid answer or tool call (only empty output or multimodal control tokens such as <end_of_image>) and was NOT delivered to the client.",
+        "Continue directly from the latest user request or tool execution results above:",
+        "- Do NOT output raw multimodal/turn control tokens such as <end_of_image>, <start_of_image>, or <end_of_turn>.",
+    ]
+    if is_tool_generation_enabled(norm_tools, tool_choice):
+        forced_fn = get_forced_function_name(tool_choice)
+        if forced_fn:
+            lines.append(
+                f'- Emit a standalone three-backtick `codex_tool_call` JSON block calling "{forced_fn}" and stop immediately after the closing fence.'
+            )
+        elif tool_choice == "required":
+            lines.append(
+                "- Emit at least one standalone three-backtick `codex_tool_call` JSON block for the next step and stop immediately after the closing fence."
+            )
+        else:
+            lines.append(
+                "- If further workspace reads, commands, or edits are needed to finish the task, emit the required standalone three-backtick `codex_tool_call` JSON block(s) now and stop immediately after the closing fence; otherwise provide the complete user-facing answer."
+            )
+    elif isinstance(response_format, dict) and str(response_format.get("type") or "").lower() in {"json_object", "json_schema"}:
+        lines.append("- Output ONLY the valid JSON object matching the requested schema.")
+    else:
+        lines.append("- Provide the complete, substantive user-facing response now.")
+    return "\n".join(lines)
 
 
 def _dedupe_nonperiodic_overlap(prefix: str, continuation: str, max_window: int = 320) -> str:

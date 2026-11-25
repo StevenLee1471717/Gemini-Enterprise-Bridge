@@ -378,3 +378,104 @@ def test_ws_reconnect_preserves_inflight_and_avoids_false_503_plus_10x_subagent_
                 th.join(timeout=5.0)
             assert len(set(ten_tabs)) == 10, f'Expected 10 distinct parallel slots, got {ten_tabs}'
             stop_drv = True
+
+
+@pytest.mark.parametrize('width', [1, 3, 19, 1000])
+def test_control_tokens_are_stripped_in_prose_but_preserved_in_code_and_tool_args(width):
+    from tool_calling import DegenerateReplyError
+    for degen in ['<end_of_image><end_of_image>', '[[section:核对]]\n<end_of_image>', '<start_of_image><end_of_turn>']:
+        p_bad = ToolStreamProcessor(PARSE_TOOLS)
+        for i in range(0, len(degen), width):
+            assert p_bad.feed(degen[i:i + width]) == []
+        with pytest.raises(DegenerateReplyError):
+            p_bad.finalize()
+
+    mixed = (
+        '<end_of_image>已定位 `<end_of_image>` 触发点。\n'
+        '```python\nraw = "<end_of_image>"\n```\n'
+        '<end_of_image>```codex_tool_call\n'
+        + json.dumps({'name': 'functions.exec_command', 'arguments': {'cmd': 'rg "<end_of_image>"'}})
+        + '\n```<end_of_image>'
+    )
+    proc = ToolStreamProcessor(PARSE_TOOLS)
+    emitted = []
+    for i in range(0, len(mixed), width):
+        emitted.extend(proc.feed(mixed[i:i + width]))
+    tail, parsed = proc.finalize()
+    expected = '已定位 `<end_of_image>` 触发点。\n```python\nraw = "<end_of_image>"\n```'
+    assert ''.join(emitted + tail).strip() == expected
+    assert parsed.content == expected
+    assert json.loads(parsed.tool_calls[0]['function']['arguments']) == {'cmd': 'rg "<end_of_image>"'}
+
+
+@pytest.mark.parametrize('stream', [False, True])
+def test_end_of_image_mid_session_seamlessly_recovers_without_exiting_session(stream):
+    from extension_exporter import render_spark_icon_png
+    import base64
+    png_url = 'data:image/png;base64,' + base64.b64encode(render_spark_icon_png(16)).decode()
+
+    # 1) Exact mid-session recovery in same web chat (reset_chat=False)
+    with browser([call('cat ost.md'), '<end_of_image><end_of_image>', call('cat voice.py'), 'All verified.']) as (client, commands):
+        payload = {'model': 'gemini-4-carbon', 'tools': PARSE_TOOLS, 'stream': stream}
+        msgs = [{'role': 'user', 'content': 'Check OST and voice script'}]
+        r1 = client.post('/v1/chat/completions', headers={'X-Session-Id': 'promo-s1'}, json={**payload, 'messages': msgs})
+        if stream:
+            pkts1 = packets(r1.text[:-12] if r1.text.endswith('data: [DONE]\n\n') else r1.text)
+            tc_id = next(p['choices'][0]['delta']['tool_calls'][0]['id'] for p in pkts1 if p.get('choices') and p['choices'][0].get('delta', {}).get('tool_calls'))
+            msgs += [{'role': 'assistant', 'content': None, 'tool_calls': [{'id': tc_id, 'type': 'function', 'function': {'name': 'functions.exec_command', 'arguments': '{"cmd": "cat ost.md"}'}}]},
+                     {'role': 'tool', 'tool_call_id': tc_id, 'content': 'BPM=86.8'}]
+        else:
+            m1 = r1.json()['choices'][0]['message']
+            msgs += [m1, {'role': 'tool', 'tool_call_id': m1['tool_calls'][0]['id'], 'content': 'BPM=86.8'}]
+
+        r2 = client.post('/v1/chat/completions', headers={'X-Session-Id': 'promo-s1'}, json={**payload, 'messages': msgs})
+        assert '<end_of_image>' not in r2.text
+        if stream:
+            raw_lines = [json.loads(ln[6:]) for ln in r2.text.splitlines() if ln.startswith('data: ') and ln != 'data: [DONE]']
+            assert raw_lines[-1]['choices'][0]['finish_reason'] == 'tool_calls'
+        else:
+            assert r2.json()['choices'][0]['finish_reason'] == 'tool_calls'
+        assert len(commands) == 3
+        assert commands[2]['reset_chat'] is False
+        assert '[Retry Notice — Empty / Control-Token Reply Rejected]' in commands[2]['prompt']
+        if stream:
+            tc2_id = next(p['choices'][0]['delta']['tool_calls'][0]['id'] for p in raw_lines if p.get('choices') and p['choices'][0].get('delta', {}).get('tool_calls'))
+        else:
+            tc2_id = r2.json()['choices'][0]['message']['tool_calls'][0]['id']
+        msgs += [{'role': 'assistant', 'content': None, 'tool_calls': [{'id': tc2_id, 'type': 'function', 'function': {'name': 'functions.exec_command', 'arguments': '{"cmd": "cat voice.py"}'}}]},
+                 {'role': 'tool', 'tool_call_id': tc2_id, 'content': 'aura-2-callista-en'}]
+        r3 = client.post('/v1/chat/completions', headers={'X-Session-Id': 'promo-s1'}, json={**payload, 'stream': False, 'messages': msgs})
+        assert r3.json()['choices'][0]['message']['content'] == 'All verified.'
+        assert commands[3]['reset_chat'] is False
+
+    # 2) Poisoned historical image session: in-place retry ALSO emits <end_of_image>, escalates to clean reset_chat=True rebuild without historical binary attachments
+    with browser([call('cat a.py'), '<end_of_image><end_of_image>', '<end_of_image>', 'Recovered cleanly.', 'Next turn incremental.']) as (client, commands):
+        msgs = [{'role': 'user', 'content': [{'type': 'text', 'text': 'Inspect screenshot and a.py'}, {'type': 'image_url', 'image_url': {'url': png_url}}]}]
+        r1 = client.post('/v1/chat/completions', headers={'X-Session-Id': 'img-poison'}, json={'model': 'gemini-4-carbon', 'tools': PARSE_TOOLS, 'messages': msgs})
+        m1 = r1.json()['choices'][0]['message']
+        msgs += [m1, {'role': 'tool', 'tool_call_id': m1['tool_calls'][0]['id'], 'content': 'print(1)'}]
+        r2 = client.post('/v1/chat/completions', headers={'X-Session-Id': 'img-poison'}, json={'model': 'gemini-4-carbon', 'tools': PARSE_TOOLS, 'stream': stream, 'messages': msgs})
+        assert '<end_of_image>' not in r2.text
+        if stream:
+            raw_lines = [json.loads(ln[6:]) for ln in r2.text.splitlines() if ln.startswith('data: ') and ln != 'data: [DONE]']
+            text_out = ''.join(p['choices'][0]['delta'].get('content') or '' for p in raw_lines)
+            assert text_out == 'Recovered cleanly.'
+        else:
+            assert r2.json()['choices'][0]['message']['content'] == 'Recovered cleanly.'
+        assert commands[2]['reset_chat'] is False
+        assert commands[3]['reset_chat'] is True
+        assert not commands[3].get('attachments')
+        assert 'not attached this turn' in commands[3]['prompt']
+        msgs += [{'role': 'assistant', 'content': 'Recovered cleanly.'}, {'role': 'user', 'content': 'Continue'}]
+        r3 = client.post('/v1/chat/completions', headers={'X-Session-Id': 'img-poison'}, json={'model': 'gemini-4-carbon', 'tools': PARSE_TOOLS, 'messages': msgs})
+        assert r3.status_code == 200 and commands[4]['reset_chat'] is False
+
+    # 3) Exhaustion never fakes finish_reason='stop'
+    with browser(['<end_of_image>', '', '<end_of_image>']) as (client, commands):
+        res = client.post('/v1/responses', json={'model': 'gemini-4-carbon', 'tools': TOOLS, 'stream': stream, 'input': 'Run check'})
+        if stream:
+            evs = packets(res.text)
+            assert evs[-1]['type'] == 'response.failed'
+            assert not any(e['type'] == 'response.completed' for e in evs)
+        else:
+            assert res.status_code == 502

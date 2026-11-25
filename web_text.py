@@ -28,6 +28,43 @@ _FORBIDDEN_PATH_CHARS_RE = re.compile(r'[\x00-\x1f"<>|*?;&$`\t]')
 _EXT_FILENAME_RE = re.compile(
     r'^(?:\.[A-Za-z0-9][A-Za-z0-9._-]*|Makefile|Dockerfile|README|LICENSE|.+\.[A-Za-z0-9]{1,12})$'
 )
+_CONTROL_TOKENS = (
+    '<end_of_image>',
+    '<start_of_image>',
+    '<image_soft_token>',
+    '<end_of_audio>',
+    '<start_of_audio>',
+    '<audio_soft_token>',
+    '<end_of_video>',
+    '<start_of_video>',
+    '<video_soft_token>',
+    '<end_of_turn>',
+    '<start_of_turn>',
+    '<eos>',
+    '<pad>',
+)
+_MAX_CONTROL_TOKEN_LEN = max(len(tok) for tok in _CONTROL_TOKENS)
+CONTROL_TOKEN_PATTERN = r'<(?:(?:start|end)_of_(?:image|audio|video|turn)|(?:image|audio|video)_soft_token|eos|pad)>'
+_CONTROL_TOKEN_RE = re.compile(CONTROL_TOKEN_PATTERN, re.IGNORECASE)
+_LEADING_CONTROL_TOKENS_RE = re.compile(r'^(?:' + CONTROL_TOKEN_PATTERN + r')+', re.IGNORECASE)
+
+
+def has_leaked_control_tokens(text: str) -> bool:
+    return bool(text and _CONTROL_TOKEN_RE.search(text))
+
+
+def _strip_prose_control_tokens(seg: str, allow_incomplete_tail: bool) -> tuple[str, str]:
+    if not seg or '<' not in seg:
+        return seg, ''
+    cleaned = _CONTROL_TOKEN_RE.sub('', seg)
+    if not allow_incomplete_tail or '<' not in cleaned:
+        return cleaned, ''
+    last_lt = cleaned.rfind('<')
+    if len(cleaned) - last_lt < _MAX_CONTROL_TOKEN_LEN:
+        tail_low = cleaned[last_lt:].lower()
+        if any(tok.startswith(tail_low) for tok in _CONTROL_TOKENS):
+            return cleaned[:last_lt], cleaned[last_lt:]
+    return cleaned, ''
 
 
 def _format_local_file_markdown_link(raw: str) -> str | None:
@@ -89,10 +126,17 @@ def _scan_line_backticks(line: str, allow_incomplete_tail: bool) -> tuple[str, s
     while i < n:
         tick_pos = line.find('`', i)
         if tick_pos == -1:
-            if allow_incomplete_tail and line.endswith('['):
-                out.append(line[i:-1])
+            cleaned, held_ctrl = _strip_prose_control_tokens(line[i:], allow_incomplete_tail)
+            if held_ctrl:
+                if cleaned.endswith('['):
+                    out.append(cleaned[:-1])
+                    return ''.join(out), '[' + held_ctrl
+                out.append(cleaned)
+                return ''.join(out), held_ctrl
+            if allow_incomplete_tail and cleaned.endswith('['):
+                out.append(cleaned[:-1])
                 return ''.join(out), '['
-            out.append(line[i:])
+            out.append(cleaned)
             return ''.join(out), ''
         j = tick_pos
         while j < n and line[j] == '`':
@@ -100,7 +144,7 @@ def _scan_line_backticks(line: str, allow_incomplete_tail: bool) -> tuple[str, s
         tick_len = j - tick_pos
         if j == n and allow_incomplete_tail:
             hold_start = tick_pos - 1 if (tick_pos > i and line[tick_pos - 1] == '[') else tick_pos
-            out.append(line[i:hold_start])
+            out.append(_CONTROL_TOKEN_RE.sub('', line[i:hold_start]))
             return ''.join(out), line[hold_start:]
         k = j
         matched = False
@@ -109,9 +153,9 @@ def _scan_line_backticks(line: str, allow_incomplete_tail: bool) -> tuple[str, s
             if c_start == -1:
                 if allow_incomplete_tail:
                     hold_start = tick_pos - 1 if (tick_pos > i and line[tick_pos - 1] == '[') else tick_pos
-                    out.append(line[i:hold_start])
+                    out.append(_CONTROL_TOKEN_RE.sub('', line[i:hold_start]))
                     return ''.join(out), line[hold_start:]
-                out.append(line[i:j])
+                out.append(_CONTROL_TOKEN_RE.sub('', line[i:tick_pos]) + line[tick_pos:j])
                 i = j
                 matched = True
                 break
@@ -120,22 +164,23 @@ def _scan_line_backticks(line: str, allow_incomplete_tail: bool) -> tuple[str, s
                 c_end += 1
             if c_end == n and allow_incomplete_tail:
                 hold_start = tick_pos - 1 if (tick_pos > i and line[tick_pos - 1] == '[') else tick_pos
-                out.append(line[i:hold_start])
+                out.append(_CONTROL_TOKEN_RE.sub('', line[i:hold_start]))
                 return ''.join(out), line[hold_start:]
             if c_end - c_start == tick_len:
                 if tick_len == 1 and not (tick_pos > 0 and line[tick_pos - 1] == '['):
-                    out.append(line[i:tick_pos])
+                    out.append(_CONTROL_TOKEN_RE.sub('', line[i:tick_pos]))
                     repl = _format_local_file_markdown_link(line[j:c_start])
                     out.append(repl if repl is not None else line[tick_pos:c_end])
                 else:
-                    out.append(line[i:c_end])
+                    out.append(_CONTROL_TOKEN_RE.sub('', line[i:tick_pos]) + line[tick_pos:c_end])
                 i = c_end
                 matched = True
                 break
             k = c_end
         if not matched:
-            out.append(line[i:])
-            return ''.join(out), ''
+            cleaned, held_ctrl = _strip_prose_control_tokens(line[i:], allow_incomplete_tail)
+            out.append(cleaned)
+            return ''.join(out), held_ctrl
     return ''.join(out), ''
 
 
@@ -156,6 +201,13 @@ class _LocalFileLinkStream:
             return seg
         self._buf += seg
         if self._at_line_start:
+            self._buf = _LEADING_CONTROL_TOKENS_RE.sub('', self._buf)
+            if not self._buf:
+                return ''
+            if self._buf.startswith('<') and len(self._buf) < _MAX_CONTROL_TOKEN_LEN:
+                low_buf = self._buf.lower()
+                if any(tok.startswith(low_buf) for tok in _CONTROL_TOKENS):
+                    return ''
             if len(self._buf) <= 32 and _FENCE_PREFIX_HOLD_RE.match(self._buf):
                 return ''
             m_open = _FENCE_OPEN_PREFIX_RE.match(self._buf)
@@ -175,7 +227,7 @@ class _LocalFileLinkStream:
                 self._in_opening_fence_line = False
                 self._fence_line = ''
             else:
-                m_close = _FENCE.match(self._fence_line.rstrip('\r'))
+                m_close = _FENCE.match(_CONTROL_TOKEN_RE.sub('', self._fence_line.rstrip('\r')))
                 if (
                     m_close
                     and m_close[1][0] == self._fence[0]
@@ -187,13 +239,14 @@ class _LocalFileLinkStream:
                 self._fence_line = ''
             return '\n'
         if self._at_line_start:
-            m_open = _FENCE.match(self._buf.rstrip('\r'))
+            stripped_line = _LEADING_CONTROL_TOKENS_RE.sub('', self._buf.rstrip('\r'))
+            m_open = _FENCE.match(stripped_line)
             if m_open:
                 self._fence = m_open[1]
                 self._in_opening_fence_line = False
                 self._fence_line = ''
-                out, self._buf = self._buf + '\n', ''
-                return out
+                self._buf = ''
+                return stripped_line + '\n'
         emitted, _ = _scan_line_backticks(self._buf, allow_incomplete_tail=False)
         self._buf = ''
         self._at_line_start = True
@@ -225,18 +278,19 @@ class _LocalFileLinkStream:
         if self._fence:
             out, self._buf = self._buf, ''
             return out
-        m_open = _FENCE.match(self._buf.rstrip('\r')) if self._at_line_start else None
+        stripped_line = _LEADING_CONTROL_TOKENS_RE.sub('', self._buf.rstrip('\r')) if self._at_line_start else None
+        m_open = _FENCE.match(stripped_line) if stripped_line is not None else None
         if m_open:
             self._fence = m_open[1]
-            out, self._buf = self._buf, ''
-            return out
+            self._buf = ''
+            return stripped_line
         emitted, _ = _scan_line_backticks(self._buf, allow_incomplete_tail=False)
         self._buf = ''
         return emitted
 
 
 def linkify_local_files(text: str) -> str:
-    if not text or '`' not in text:
+    if not text or ('`' not in text and '<' not in text):
         return text
     stream = _LocalFileLinkStream()
     return stream.feed(text) + stream.finish()

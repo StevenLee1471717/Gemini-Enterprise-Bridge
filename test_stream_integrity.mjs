@@ -184,4 +184,11 @@ assert.equal(multiLegJob.primaryStreamToken, null, 'unclosed tool fence releases
 await state.consumeStream(stream(['[{"groundedContent":{"content":{"text":' + JSON.stringify(leg2Text) + '}}}]']), multiLegJob);
 assert.equal(multiLegJob.networkText, leg1Text + leg2Text);
 assert.equal(multiLegJob.networkDone, true);
-console.log('PASS: truncated summaryText guard and multi-leg RPC tool fence continuation');
+
+// Thought-only RPC stream with zero visible text marks emptyRpcEndedAt cleanly without hanging
+const thoughtOnlyJob = job();
+await state.consumeStream(stream([')]}\'\n[{"groundedContent":{"content":{"text":"internal reasoning","thought":true}}}]']), thoughtOnlyJob);
+assert.equal(thoughtOnlyJob.networkText, '');
+assert.ok(!thoughtOnlyJob.networkDone);
+assert.ok(typeof thoughtOnlyJob.emptyRpcEndedAt === 'number' && thoughtOnlyJob.emptyRpcEndedAt > 0);
+console.log('PASS: truncated summaryText guard, multi-leg RPC continuation, and thought-only empty RPC detection');

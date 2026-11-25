@@ -102,7 +102,9 @@ from usage_ledger import UsageLedger, estimate_attachment_input_tokens
 from tool_calling import (
     ToolStreamProcessor,
     ToolProtocolError,
+    DegenerateReplyError,
     BrowserTaskFailure,
+    build_degenerate_reply_retry_prompt,
     build_sse_tool_call_deltas,
     build_tool_system_instructions,
     build_response_format_instructions,
@@ -2648,6 +2650,22 @@ def create_app(
                 return [att for att in turn_attachments if att["id"] in pending_ids] or list(turn_attachments)
             return []
 
+        def _rebuild_clean_turn_prompt(session_key: str):
+            context_builder.invalidate_session(session_key)
+            rebuilt = context_builder.build(
+                messages=request.messages,
+                model=model_name,
+                session_key=session_key,
+                tools=norm_tools,
+                tool_choice=norm_tool_choice,
+                parallel_tool_calls=request.parallel_tool_calls,
+                response_format=request.response_format,
+            )
+            r_atts, r_skipped = _resolve_turn_attachments(rebuilt)
+            rebuilt.prompt = reference_historical_images(rebuilt.prompt, r_skipped)
+            r_sent = _select_sent_attachments(rebuilt, r_atts)
+            return rebuilt, r_sent
+
         logger.debug(
             "chat_completions model=%s upstream=%s stream=%s messages=%d tools=%d attachments=%d session=%s",
             raw_model_name,
@@ -2945,71 +2963,131 @@ def create_app(
                         pub_base_url,
                         tenant_id=principal.tenant_id,
                     )
-                    try:
-                        parsed = parse_assistant_output(
-                            raw_reply, tools=norm_tools, tool_choice=norm_tool_choice,
-                            parallel_tool_calls=request.parallel_tool_calls,
-                            response_format=request.response_format,
-                        )
-                    except ToolProtocolError as trunc_exc:
-                        if not (tools_active and is_truncated_tool_protocol_error(trunc_exc, raw_reply_unstripped)):
-                            raise
-                        logger.warning(
-                            "Truncated long tool-call JSON on slot=%s (chars=%d); running seamless continuation...",
-                            session_key,
-                            len(raw_reply_unstripped),
-                        )
-                        parsed = None
-                        accum_raw = raw_reply_unstripped.lstrip()
-                        for leg in range(2):
-                            cont_parts_sync: list[str] = []
-                            async for c_delta_sync in hub.dispatch_stream_on_slot(
-                                slot=slot,
-                                prompt=build_truncated_tool_continuation_prompt(accum_raw),
-                                target_model=target_web_model,
-                                reset_chat=False,
-                                suppress_citations=True,
-                                request_timeout=cfg.request_timeout_seconds,
-                            ):
-                                if c_delta_sync:
-                                    cont_parts_sync.append(c_delta_sync)
-                            cont_reply = "".join(cont_parts_sync).rstrip()
-                            if not cont_reply.strip():
-                                break
-                            candidates = candidate_spliced_tool_replies(accum_raw, cont_reply)
-                            for cand in candidates:
-                                try:
-                                    cand_parsed = parse_assistant_output(
-                                        cand, tools=norm_tools, tool_choice=norm_tool_choice,
-                                        parallel_tool_calls=request.parallel_tool_calls,
-                                        response_format=request.response_format,
-                                    )
-                                    if cand_parsed.has_tool_calls:
-                                        parsed = cand_parsed
-                                        break
-                                except ToolProtocolError:
-                                    continue
-                            if parsed is not None or leg == 1 or len(cont_reply) < 2000 or not candidates:
-                                break
-                            accum_raw = candidates[0]
-                        if parsed is None:
-                            logger.warning(
-                                "Continuation splice did not close cleanly on slot=%s; requesting bounded Part-1 tool call...",
-                                session_key,
+                    def _sync_refresh_outputs() -> None:
+                        nonlocal saved_outputs
+                        if raw_out_images or raw_out_files:
+                            saved_outputs = persist_browser_outputs(
+                                raw_out_images, raw_out_files, image_output_dir,
+                                file_store, pub_base_url, tenant_id=principal.tenant_id,
                             )
-                            rewrite_reply = await hub.dispatch_complete_on_slot(
-                                slot=slot,
-                                prompt=build_truncated_tool_part1_rewrite_prompt(),
-                                target_model=target_web_model,
-                                reset_chat=False,
-                                suppress_citations=True,
-                                request_timeout=cfg.request_timeout_seconds,
-                            )
-                            parsed = parse_assistant_output(
-                                rewrite_reply, tools=norm_tools, tool_choice=norm_tool_choice,
+
+                    async def _parse_or_continue_sync(raw_unstripped: str, has_media: bool):
+                        try:
+                            cand_out = parse_assistant_output(
+                                raw_unstripped.strip(), tools=norm_tools, tool_choice=norm_tool_choice,
                                 parallel_tool_calls=request.parallel_tool_calls,
                                 response_format=request.response_format,
+                                reject_empty=(not is_probe_req and not has_media),
                             )
+                            if not is_probe_req and not has_media and not cand_out.has_tool_calls and not (cand_out.content or "").strip():
+                                raise DegenerateReplyError("网页返回了空回复，未生成有效内容或工具调用。")
+                            return cand_out
+                        except ToolProtocolError as trunc_exc:
+                            if isinstance(trunc_exc, DegenerateReplyError) or not (
+                                tools_active and is_truncated_tool_protocol_error(trunc_exc, raw_unstripped)
+                            ):
+                                raise
+                            logger.warning(
+                                "Truncated long tool-call JSON on slot=%s (chars=%d); running seamless continuation...",
+                                session_key, len(raw_unstripped),
+                            )
+                            recovered_out = None
+                            accum_raw = raw_unstripped.lstrip()
+                            for leg in range(2):
+                                cont_parts_sync: list[str] = []
+                                async for c_delta_sync in hub.dispatch_stream_on_slot(
+                                    slot=slot,
+                                    prompt=build_truncated_tool_continuation_prompt(accum_raw),
+                                    target_model=target_web_model,
+                                    reset_chat=False,
+                                    suppress_citations=True,
+                                    request_timeout=cfg.request_timeout_seconds,
+                                ):
+                                    if c_delta_sync:
+                                        cont_parts_sync.append(c_delta_sync)
+                                cont_reply = "".join(cont_parts_sync).rstrip()
+                                if not cont_reply.strip():
+                                    break
+                                candidates = candidate_spliced_tool_replies(accum_raw, cont_reply)
+                                for cand in candidates:
+                                    try:
+                                        cand_parsed = parse_assistant_output(
+                                            cand, tools=norm_tools, tool_choice=norm_tool_choice,
+                                            parallel_tool_calls=request.parallel_tool_calls,
+                                            response_format=request.response_format,
+                                        )
+                                        if cand_parsed.has_tool_calls:
+                                            recovered_out = cand_parsed
+                                            break
+                                    except ToolProtocolError:
+                                        continue
+                                if recovered_out is not None or leg == 1 or len(cont_reply) < 2000 or not candidates:
+                                    break
+                                accum_raw = candidates[0]
+                            if recovered_out is None:
+                                logger.warning(
+                                    "Continuation splice did not close cleanly on slot=%s; requesting bounded Part-1 tool call...",
+                                    session_key,
+                                )
+                                rewrite_reply = await hub.dispatch_complete_on_slot(
+                                    slot=slot,
+                                    prompt=build_truncated_tool_part1_rewrite_prompt(),
+                                    target_model=target_web_model,
+                                    reset_chat=False,
+                                    suppress_citations=True,
+                                    request_timeout=cfg.request_timeout_seconds,
+                                )
+                                recovered_out = parse_assistant_output(
+                                    rewrite_reply, tools=norm_tools, tool_choice=norm_tool_choice,
+                                    parallel_tool_calls=request.parallel_tool_calls,
+                                    response_format=request.response_format,
+                                    reject_empty=(not is_probe_req and not has_media),
+                                )
+                            return recovered_out
+
+                    try:
+                        parsed = await _parse_or_continue_sync(raw_reply_unstripped, bool(saved_outputs))
+                    except DegenerateReplyError as degen_exc:
+                        if is_probe_req or saved_outputs:
+                            raise
+                        parsed = None
+                        if slot.last_dispatch_submitted:
+                            logger.warning(
+                                "Degenerate/empty reply on slot=%s (%s); retrying in-place in current web session...",
+                                session_key, degen_exc,
+                            )
+                            raw_out_images.clear()
+                            raw_out_files.clear()
+                            retry_unstripped = await hub.dispatch_complete_on_slot(
+                                slot=slot,
+                                prompt=build_degenerate_reply_retry_prompt(
+                                    tools=norm_tools, tool_choice=norm_tool_choice, response_format=request.response_format,
+                                ),
+                                target_model=target_web_model, reset_chat=False,
+                                suppress_citations=suppress_citations, request_timeout=cfg.request_timeout_seconds,
+                                output_images=raw_out_images, output_files=raw_out_files, strip_reply=False,
+                            )
+                            _sync_refresh_outputs()
+                            try:
+                                parsed = await _parse_or_continue_sync(retry_unstripped, bool(saved_outputs))
+                            except (DegenerateReplyError, ToolProtocolError, BrowserTaskFailure):
+                                parsed = None
+                        if parsed is None:
+                            logger.warning(
+                                "Rebuilding clean web session on slot=%s after degenerate/control-token reply...",
+                                session_key,
+                            )
+                            prepared, sent_attachments = _rebuild_clean_turn_prompt(session_key)
+                            raw_out_images.clear()
+                            raw_out_files.clear()
+                            rebuild_unstripped = await hub.dispatch_complete_on_slot(
+                                slot=slot, prompt=prepared.prompt, target_model=target_web_model,
+                                reset_chat=True, suppress_citations=suppress_citations,
+                                request_timeout=cfg.request_timeout_seconds, attachments=sent_attachments,
+                                output_images=raw_out_images, output_files=raw_out_files, strip_reply=False,
+                            )
+                            _sync_refresh_outputs()
+                            parsed = await _parse_or_continue_sync(rebuild_unstripped, bool(saved_outputs))
                     record_reply_protocol(parsed, session_key, request)
                     if saved_outputs and not parsed.has_tool_calls and not json_mode_active:
                         md_links = format_artifacts_markdown(saved_outputs, parsed.content or "")
@@ -3282,8 +3360,109 @@ def create_app(
                             yield f"data: {json.dumps(chunk, ensure_ascii=False)}\n\n"
                             last_sse_ts = time.monotonic()
 
+                    def _new_stream_processor() -> ToolStreamProcessor:
+                        return ToolStreamProcessor(
+                            tools=norm_tools,
+                            tool_choice=norm_tool_choice,
+                            parallel_tool_calls=request.parallel_tool_calls,
+                            response_format=request.response_format,
+                        )
+
+                    def _finalize_stream_non_empty(proc: ToolStreamProcessor):
+                        t_pieces, p_turn = proc.finalize()
+                        if (
+                            not is_probe_req
+                            and not stream_out_images
+                            and not stream_out_files
+                            and not p_turn.has_tool_calls
+                            and not (p_turn.content or "").strip()
+                            and not "".join(emitted_content).strip()
+                        ):
+                            raise DegenerateReplyError("网页返回了空回复，未生成有效内容或工具调用。")
+                        return t_pieces, p_turn
+
                     try:
-                        tail_pieces, parsed = processor.finalize()
+                        try:
+                            tail_pieces, parsed = _finalize_stream_non_empty(processor)
+                        except DegenerateReplyError as degen_exc:
+                            if is_probe_req or emitted_content or stream_out_images or stream_out_files:
+                                raise
+                            tail_pieces = []
+                            parsed = None
+                            if slot.last_dispatch_submitted:
+                                logger.warning(
+                                    "Degenerate/empty streamed reply on slot=%s (%s); retrying in-place...",
+                                    session_key, degen_exc,
+                                )
+                                processor = _new_stream_processor()
+                                retry_stream = hub.dispatch_stream_on_slot(
+                                    slot=slot,
+                                    prompt=build_degenerate_reply_retry_prompt(
+                                        tools=norm_tools, tool_choice=norm_tool_choice, response_format=request.response_format,
+                                    ),
+                                    target_model=target_web_model, reset_chat=False,
+                                    suppress_citations=suppress_citations, request_timeout=cfg.request_timeout_seconds,
+                                    output_images=stream_out_images, output_files=stream_out_files,
+                                )
+                                stream_cleanup.push_async_callback(retry_stream.aclose)
+                                async for r_delta in retry_stream:
+                                    if not r_delta:
+                                        if time.monotonic() - last_sse_ts >= 12.0:
+                                            yield ": keepalive\n\n"
+                                            last_sse_ts = time.monotonic()
+                                        continue
+                                    for safe_piece in processor.feed(r_delta):
+                                        emitted_content.append(safe_piece)
+                                        chunk = build_chat_completion_chunk(
+                                            request_id=completion_id, model=raw_model_name,
+                                            delta={"content": safe_piece}, created=created_ts,
+                                        )
+                                        yield f"data: {json.dumps(chunk, ensure_ascii=False)}\n\n"
+                                        last_sse_ts = time.monotonic()
+                                try:
+                                    tail_pieces, parsed = _finalize_stream_non_empty(processor)
+                                except ToolProtocolError as retry_exc:
+                                    if not isinstance(retry_exc, DegenerateReplyError) and (
+                                        emitted_content
+                                        or (tools_active and is_truncated_tool_protocol_error(retry_exc, processor.raw_text))
+                                    ):
+                                        raise
+                                    parsed = None
+                                except BrowserTaskFailure:
+                                    if emitted_content:
+                                        raise
+                                    parsed = None
+                            if parsed is None:
+                                logger.warning(
+                                    "Rebuilding clean web session on slot=%s after degenerate streamed reply...",
+                                    session_key,
+                                )
+                                prepared, sent_attachments = _rebuild_clean_turn_prompt(session_key)
+                                stream_out_images.clear()
+                                stream_out_files.clear()
+                                processor = _new_stream_processor()
+                                rebuild_stream = hub.dispatch_stream_on_slot(
+                                    slot=slot, prompt=prepared.prompt, target_model=target_web_model,
+                                    reset_chat=True, suppress_citations=suppress_citations,
+                                    request_timeout=cfg.request_timeout_seconds, attachments=sent_attachments,
+                                    output_images=stream_out_images, output_files=stream_out_files,
+                                )
+                                stream_cleanup.push_async_callback(rebuild_stream.aclose)
+                                async for rb_delta in rebuild_stream:
+                                    if not rb_delta:
+                                        if time.monotonic() - last_sse_ts >= 12.0:
+                                            yield ": keepalive\n\n"
+                                            last_sse_ts = time.monotonic()
+                                        continue
+                                    for safe_piece in processor.feed(rb_delta):
+                                        emitted_content.append(safe_piece)
+                                        chunk = build_chat_completion_chunk(
+                                            request_id=completion_id, model=raw_model_name,
+                                            delta={"content": safe_piece}, created=created_ts,
+                                        )
+                                        yield f"data: {json.dumps(chunk, ensure_ascii=False)}\n\n"
+                                        last_sse_ts = time.monotonic()
+                                tail_pieces, parsed = _finalize_stream_non_empty(processor)
                     except ToolProtocolError as trunc_exc:
                         stream_raw_so_far = processor.raw_text
                         if not (tools_active and is_truncated_tool_protocol_error(trunc_exc, stream_raw_so_far)):

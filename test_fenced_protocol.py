@@ -198,3 +198,148 @@ def test_call_nested_in_internal_reasoning_is_not_an_answer_or_executable_call(l
         assert processor.feed(char)==[]
     with pytest.raises(ToolProtocolError):
         processor.finalize()
+
+
+@pytest.mark.parametrize(
+    "closing_tail",
+    [
+        "```[[section:Done]]<end_of_turn>",
+        "```<end_of_image>[[section:One]][[section:Two]]<end_of_image>",
+        "```\u200b\u00a0",
+        "``` [1, 2]",
+        "``` ---",
+        "```<end_of_image>[[suggested_questions]]<end_of_turn>\nNext step?",
+    ],
+)
+@pytest.mark.parametrize("width", [1, 11, 4096])
+def test_compound_closing_decorations_and_zero_width_whitespace_parse_cleanly(closing_tail, width):
+    body = json.dumps({"name": "functions.exec_command", "arguments": {"cmd": "echo sakura_ok"}}, ensure_ascii=False)
+    raw = "正在配置免密登录。\n<end_of_image>```codex_tool_call\n" + body + "\n" + closing_tail
+    processor = ToolStreamProcessor(TOOLS)
+    emitted = []
+    for idx in range(0, len(raw), width):
+        emitted.extend(processor.feed(raw[idx : idx + width]))
+    tail, parsed = processor.finalize()
+    assert "".join(emitted + tail).strip() == "正在配置免密登录。"
+    assert len(parsed.tool_calls) == 1
+    assert json.loads(parsed.tool_calls[0]["function"]["arguments"]) == {"cmd": "echo sakura_ok"}
+
+
+def test_adjoined_tool_fences_with_interleaved_section_and_control_tokens():
+    c1 = json.dumps({"name": "functions.exec_command", "arguments": {"cmd": "cat a"}})
+    c2 = json.dumps({"name": "functions.exec_command", "arguments": {"cmd": "cat b"}})
+    raw = (
+        "```codex_tool_call\n"
+        + c1
+        + "\n```[[section:Next]]<end_of_image>```<end_of_image>[[section:Read B]]codex_tool_call\n"
+        + c2
+        + "\n```<end_of_turn>"
+    )
+    parsed = parse_assistant_output(raw, TOOLS)
+    assert [json.loads(tc["function"]["arguments"])["cmd"] for tc in parsed.tool_calls] == ["cat a", "cat b"]
+
+
+def test_closing_fence_error_recovery_prompt_teaches_exact_three_backtick_closure():
+    builder = ConversationContextBuilder()
+    msgs = [ChatMessage(role="user", content="deploy sakura")]
+    p1 = builder.build(msgs, tools=TOOLS)
+    parsed1 = parse_assistant_output(framed({"cmd": "cat id_rsa.pub"}, "functions.exec_command"), TOOLS)
+    builder.record_completed_turn("slot-sakura", p1.normalized_history, parsed1.content, parsed1.tool_calls, tools_fingerprint=p1.tools_fingerprint)
+    builder.record_failed_turn("slot-sakura", kind="protocol_error", reason="客户端工具代码块未正确结束，未执行该请求。", submitted=True)
+    msgs2 = msgs + [
+        ChatMessage(role="assistant", tool_calls=parsed1.tool_calls),
+        ChatMessage(role="tool", tool_call_id=parsed1.tool_calls[0]["id"], content="ssh-rsa AAAA"),
+    ]
+    retry_prep = builder.build(msgs2, session_key="slot-sakura", tools=TOOLS)
+    assert "CRITICAL CLOSING FENCE RULE" in retry_prep.prompt
+
+
+def test_host_interrupted_unclosed_fence_superseded_by_identical_closed_retry_recovers_once():
+    call_json = json.dumps({"name": "functions.exec_command", "arguments": {"cmd": "ssh sakura-prod echo ok"}})
+    raw_after_json = (
+        "正在写入本机公钥。\n\n```codex_tool_call\n"
+        + call_json
+        + "\n正在重新写入本机公钥：\n```codex_tool_call\n"
+        + call_json
+        + "\n```"
+    )
+    processor = ToolStreamProcessor(TOOLS)
+    emitted = []
+    for idx in range(0, len(raw_after_json), 13):
+        emitted.extend(processor.feed(raw_after_json[idx : idx + 13]))
+    tail, parsed = processor.finalize()
+    assert "".join(emitted + tail).strip() == "正在写入本机公钥。"
+    assert len(parsed.tool_calls) == 1
+    assert json.loads(parsed.tool_calls[0]["function"]["arguments"]) == {"cmd": "ssh sakura-prod echo ok"}
+
+    # Distinct unclosed tool block followed by a different closed block must still fail safely
+    other_json = json.dumps({"name": "functions.exec_command", "arguments": {"cmd": "rm -rf /tmp/x"}})
+    conflicting = "```codex_tool_call\n" + other_json + "\n```codex_tool_call\n" + call_json + "\n```"
+    with pytest.raises(ToolProtocolError):
+        parse_assistant_output(conflicting, TOOLS)
+
+
+@pytest.mark.parametrize("stream", [False, True])
+@pytest.mark.parametrize(
+    "tail_suffix",
+    [
+        "",
+        "\n\u0060\u0060",
+        "\n\u0060\u0060\u0060\u0060",
+        "<end_of_image>\n\u0060\u0060\u0060suggested_questions\n{\"questions\":[\"Deploy?\"],\"type\":\"followup\"}\n\u0060\u0060\u0060",
+    ],
+)
+def test_swallowed_or_overfenced_closing_fence_recovers_in_zero_extra_turns(stream, tail_suffix):
+    ps_schema = {
+        "type": "object",
+        "properties": {"command": {"type": "string"}, "description": {"type": "string"}},
+        "required": ["command", "description"],
+    }
+    rtools = [{"type": "function", "name": "powershell", "parameters": ps_schema}]
+    call_body = json.dumps(
+        {
+            "name": "powershell",
+            "arguments": {
+                "command": "Get-Content ~/.ssh/id_rsa.pub | ssh root@60.205.9.176 'cat >> ~/.ssh/authorized_keys'",
+                "description": "Register SSH key on sakura-prod",
+            },
+        },
+        ensure_ascii=False,
+    )
+    raw_reply = "正在为 sakura-prod 配置免密 SSH 公钥。\n\u0060\u0060\u0060codex_tool_call\n" + call_body + tail_suffix
+    with browser([raw_reply]) as (client, commands):
+        resp = client.post("/v1/responses", json={"model": "gemini-4-carbon", "tools": rtools, "stream": stream, "input": "deploy sakura"})
+        final = packets(resp.text)[-1]["response"] if stream else resp.json()
+        assert final["status"] == "completed"
+        fn_item = next(o for o in final["output"] if o["type"] == "function_call")
+        assert fn_item["name"] == "powershell"
+        assert "authorized_keys" in json.loads(fn_item["arguments"])["command"]
+        assert len(commands) == 1
+
+    # Missing required schema property ('description') must NOT be auto-repaired
+    incomplete_schema_body = json.dumps({"name": "powershell", "arguments": {"command": "ssh sakura-prod"}})
+    bad_reply = "准备连接。\n\u0060\u0060\u0060codex_tool_call\n" + incomplete_schema_body
+    with browser([bad_reply]) as (client, commands):
+        bad_resp = client.post("/v1/responses", json={"model": "gemini-4-carbon", "tools": rtools, "stream": stream, "input": "deploy"})
+        if stream:
+            assert packets(bad_resp.text)[-1]["type"] == "response.failed"
+        else:
+            assert bad_resp.status_code == 502
+
+
+@pytest.mark.parametrize("stream", [False, True])
+def test_sub_4000_char_truncated_json_triggers_seamless_continuation(stream):
+    rtools = [{"type": "function", "name": "powershell", "parameters": {"type": "object"}}]
+    cmd_str = "ssh sakura-prod \"" + ("echo deploy_step && " * 36) + "echo done\""
+    full_json = json.dumps({"name": "powershell", "arguments": {"command": cmd_str}})
+    assert 700 < len(full_json) < 1500
+    cut = len(full_json) - 120
+    leg1 = "正在执行部署链路。\n\u0060\u0060\u0060codex_tool_call\n" + full_json[:cut]
+    leg2 = full_json[cut:] + "\n\u0060\u0060\u0060"
+    with browser([leg1, leg2]) as (client, commands):
+        resp = client.post("/v1/responses", json={"model": "gemini-4-carbon", "tools": rtools, "stream": stream, "input": "run deploy"})
+        final = packets(resp.text)[-1]["response"] if stream else resp.json()
+        assert final["status"] == "completed"
+        fn_item = next(o for o in final["output"] if o["type"] == "function_call")
+        assert json.loads(fn_item["arguments"]) == {"command": cmd_str}
+        assert len(commands) == 2

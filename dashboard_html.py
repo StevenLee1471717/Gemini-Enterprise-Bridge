@@ -63,6 +63,95 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
       line-height: 1.55;
       -webkit-font-smoothing: antialiased;
       font-variant-numeric: tabular-nums;
+      accent-color: var(--primary);
+    }
+    @supports not (accent-color: auto) {
+      input[type="checkbox"]:checked {
+        background-color: var(--primary);
+      }
+    }
+    progress.cohort-progress {
+      appearance: none;
+      border: 0 solid;
+      overflow: clip;
+      --progress-bar-radius: 999px;
+      --progress-bar-track: #e8eef7;
+      --progress-bar-fill: linear-gradient(90deg, #2563eb 0%, #3b82f6 100%);
+      width: 100%;
+      height: 10px;
+      display: block;
+      border-radius: var(--progress-bar-radius);
+      background: var(--progress-bar-track);
+      box-shadow: inset 0 1px 2px rgb(15 23 42 / 0.08);
+    }
+    progress.cohort-progress.warn {
+      --progress-bar-fill: linear-gradient(90deg, #d97706 0%, #f59e0b 100%);
+    }
+    progress.cohort-progress.reserve,
+    progress.cohort-progress.exhausted {
+      --progress-bar-fill: linear-gradient(90deg, #dc2626 0%, #ef4444 100%);
+    }
+    progress.cohort-progress::-webkit-progress-bar {
+      background: transparent;
+    }
+    progress.cohort-progress::-webkit-progress-value {
+      background: var(--progress-bar-fill);
+      border-radius: var(--progress-bar-radius);
+      transition: inline-size 0.3s;
+    }
+    progress.cohort-progress::-moz-progress-bar {
+      background: var(--progress-bar-fill);
+      border-radius: var(--progress-bar-radius);
+      transition: inline-size 0.3s;
+    }
+    .cohort-quota-card {
+      display: flex;
+      flex-direction: column;
+      gap: 11px;
+      padding: 16px 20px;
+    }
+    .cohort-quota-top {
+      display: flex;
+      align-items: flex-start;
+      justify-content: space-between;
+      gap: 12px;
+      flex-wrap: wrap;
+    }
+    .cohort-quota-kpis {
+      display: flex;
+      align-items: baseline;
+      gap: 14px;
+      flex-wrap: wrap;
+    }
+    .cohort-pct-big {
+      font-size: 1.55rem;
+      font-weight: 850;
+      letter-spacing: -0.025em;
+      color: var(--primary);
+      line-height: 1.1;
+    }
+    .cohort-pct-big.warn { color: var(--warn); }
+    .cohort-pct-big.reserve, .cohort-pct-big.exhausted { color: var(--err); }
+    .cohort-pool-track {
+      width: 100%;
+      height: 8px;
+      border-radius: 999px;
+      background: #edf2f9;
+      overflow: hidden;
+      display: flex;
+    }
+    .cohort-pool-seg-used { background: #2563eb; height: 100%; transition: width 0.25s ease; }
+    .cohort-pool-seg-used.warn { background: #f59e0b; }
+    .cohort-pool-seg-used.err { background: #ef4444; }
+    .cohort-pool-seg-res { background: repeating-linear-gradient(-45deg, #cbd5e1, #cbd5e1 4px, #94a3b8 4px, #94a3b8 8px); height: 100%; transition: width 0.25s ease; }
+    .cohort-quota-meta {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 10px;
+      flex-wrap: wrap;
+      font-size: 0.78rem;
+      color: var(--muted);
     }
 
     /* App Shell: Left Sidebar + Right Workspace */
@@ -1964,11 +2053,11 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
             </button>
             <button type="button" class="ov-card" data-jump-sec="secLedger">
               <div class="ov-top">
-                <span>今日用量与折算花费</span>
-                <span class="chip purple">账本 →</span>
+                <span>本计费日配额与花费</span>
+                <span class="chip purple">16:00 刷新 →</span>
               </div>
-              <div class="ov-val" id="ovLedgerVal">¥0.00</div>
-              <div class="ov-sub" id="ovLedgerSub">今日 0 次调用 · 点击查看完整账本</div>
+              <div class="ov-val" id="ovLedgerVal">0.0% · ¥0.00</div>
+              <div class="ov-sub" id="ovLedgerSub">本计费日 0 / 1,400 次（预留同学 600）</div>
             </button>
           </div>
 
@@ -2435,13 +2524,65 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
 
         <!-- PAGE 4: Usage & Reference Cost Ledger -->
         <section class="page-panel" data-sec="ledger" id="secLedger" hidden>
+          <div class="surface-card cohort-quota-card" id="cohortQuotaCard">
+            <div class="cohort-quota-top">
+              <div>
+                <div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap;">
+                  <strong id="cohortQuotaTitle" style="font-size:0.93rem;">🎓 Cohort 共享配额水位（每日 16:00 / 加州 00:00 刷新）</strong>
+                  <span class="chip ok" id="cohortQuotaStatusChip">安全水位</span>
+                  <span class="chip" id="billingWindowChip">计费周期 16:00 → 次日 16:00</span>
+                </div>
+                <div class="muted" style="font-size:0.78rem;margin-top:3px;" id="cohortQuotaSubDesc">
+                  估算全 Cohort 共享池 2,000 次/计费日（约 50 席 EDU × 40 次），扣除给同学预留 600 次（30%）后本网关可用预算 1,400 次
+                </div>
+              </div>
+              <div class="cohort-quota-kpis">
+                <div style="text-align:right;">
+                  <div class="cohort-pct-big" id="cohortUsablePctMain">0.0%</div>
+                  <div class="muted" style="font-size:0.75rem;" id="cohortUsableCountSub">本计费日已用 0 / 可用 1,400 次</div>
+                </div>
+                <button type="button" class="btn sm soft" id="toggleQuotaCfgBtn">调整预留配额</button>
+              </div>
+            </div>
+
+            <progress class="cohort-progress" id="cohortQuotaProgress" max="100" value="0" aria-labelledby="cohortQuotaTitle"></progress>
+
+            <div>
+              <div class="cohort-pool-track" title="全 Cohort 共享总池构成：实心=本网关本计费日已用 · 斜纹=给同学预留配额 · 浅底=总池剩余安全余量">
+                <div class="cohort-pool-seg-used" id="cohortPoolSegUsed" style="width:0%;"></div>
+                <div class="cohort-pool-seg-res" id="cohortPoolSegRes" style="width:30%;"></div>
+              </div>
+              <div class="cohort-quota-meta" style="margin-top:6px;">
+                <span id="cohortPoolSplitLabel">本网关占总池 0.0% · 同学预留 30.0%（600 次） · 合计已锁定总池 30.0%</span>
+                <span id="billingResetCountdown">距下次 16:00 刷新 --</span>
+              </div>
+              <div class="cohort-quota-meta" style="margin-top:3px;font-size:0.75rem;">
+                <span id="cohortBatchEfficiencyLabel">⚡ 省次效率：按请求次数（QPD）计费，合批工具调用与长输出不额外扣减次数</span>
+                <span class="chip" id="cohortBatchEfficiencyChip" style="height:20px;font-size:0.71rem;padding:0 8px;">均 0.0 步工具/次 · 均出 0 Tok/次</span>
+              </div>
+            </div>
+
+            <div id="quotaCfgPanel" hidden style="border-top:1px dashed var(--border);padding-top:10px;display:flex;align-items:flex-end;gap:10px;flex-wrap:wrap;">
+              <div class="dist-field" style="min-width:180px;">
+                <label for="cohortTotalQuotaInput">估算全 Cohort 总额度（次/计费日）</label>
+                <input id="cohortTotalQuotaInput" class="clean-input" type="number" min="10" max="500000" step="10" value="2000" style="height:32px;" />
+              </div>
+              <div class="dist-field" style="min-width:180px;">
+                <label for="cohortReservedQuotaInput">给同学预留配额（次/计费日）</label>
+                <input id="cohortReservedQuotaInput" class="clean-input" type="number" min="0" max="499999" step="10" value="600" style="height:32px;" />
+              </div>
+              <button type="button" class="btn sm primary" id="saveQuotaCfgBtn" style="height:32px;">保存配额设置</button>
+              <span class="muted" style="font-size:0.78rem;line-height:32px;" id="quotaCfgMsg">依据：EDU 每席 40 次/日；实测 1,555~1,566 次触及全池上限</span>
+            </div>
+          </div>
+
           <div class="surface-card" style="padding:14px 18px;">
             <div class="period-bar" style="background:transparent;border:none;padding:0;">
               <div class="period-tabs" id="periodTabs">
-                <button type="button" class="period-tab" data-period="today">今日</button>
-                <button type="button" class="period-tab" data-period="yesterday">昨日</button>
-                <button type="button" class="period-tab" data-period="7d">近 7 天</button>
-                <button type="button" class="period-tab" data-period="30d">近 30 天</button>
+                <button type="button" class="period-tab" data-period="today" title="按下午 16:00（加州 00:00）刷新的当前计费日统计">本计费日</button>
+                <button type="button" class="period-tab" data-period="yesterday" title="上一计费日（前一日 16:00 → 今日 16:00）">上一计费日</button>
+                <button type="button" class="period-tab" data-period="7d">近 7 计费日</button>
+                <button type="button" class="period-tab" data-period="30d">近 30 计费日</button>
                 <button type="button" class="period-tab" data-period="session">本次启动</button>
                 <button type="button" class="period-tab active" data-period="all">全部累计</button>
               </div>
@@ -2450,7 +2591,7 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
                   <option value="all">全部汇总（本机 + 所有外部密钥）</option>
                   <option value="host">本机直连</option>
                 </select>
-                <input type="date" id="datePickerInput" class="date-input" aria-label="按日期查看统计" />
+                <input type="date" id="datePickerInput" class="date-input" aria-label="按计费日查看统计" />
                 <select id="dayFilterSelect" hidden></select>
                 <span class="chip" id="activePeriodTag">全部累计</span>
                 <div class="currency-switch" id="currencySwitch" title="切换显示币种">
@@ -3064,7 +3205,7 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
         selectEl.value = seen[prevVal] ? prevVal : 'all';
       }
 
-      const PERIOD_LABELS = { today: '今日', yesterday: '昨日', '7d': '近 7 天', '30d': '近 30 天', session: '本次启动', all: '全部累计' };
+      const PERIOD_LABELS = { today: '本计费日', yesterday: '上一计费日', '7d': '近 7 计费日', '30d': '近 30 计费日', session: '本次启动', all: '全部累计' };
       const TASK_META = {
         responses: { label: 'Copilot / 编程代理', color: '#2563eb' },
         chat: { label: '日常对话', color: '#10b981' },
@@ -3685,8 +3826,8 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
         }
         if (!baseRes && periods[selectedPeriod]) {
           let lbl = PERIOD_LABELS[selectedPeriod] || selectedPeriod;
-          if (selectedPeriod === 'today' && usage.today_date) lbl = '今日 (' + usage.today_date.slice(5) + ')';
-          if (selectedPeriod === 'yesterday' && usage.yesterday_date) lbl = '昨日 (' + usage.yesterday_date.slice(5) + ')';
+          if (selectedPeriod === 'today' && usage.today_date) lbl = '本计费日 (' + usage.today_date.slice(5) + ' 16:00~)';
+          if (selectedPeriod === 'yesterday' && usage.yesterday_date) lbl = '上一计费日 (' + usage.yesterday_date.slice(5) + ' 16:00~)';
           baseRes = {
             group: periods[selectedPeriod],
             label: lbl,
@@ -3917,7 +4058,7 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
 
       function addBucketJs(dst, src, fx) {
         if (!src) return dst;
-        const intKeys = ['requests', 'prompt_tokens', 'cached_tokens', 'delta_prompt_tokens', 'completion_tokens', 'total_tokens', 'images_generated', 'videos_generated', 'audio_requests', 'compactions'];
+        const intKeys = ['requests', 'tool_calls', 'prompt_tokens', 'cached_tokens', 'delta_prompt_tokens', 'completion_tokens', 'total_tokens', 'images_generated', 'videos_generated', 'audio_requests', 'compactions'];
         intKeys.forEach(function (k) { dst[k] = Number(dst[k] || 0) + Number(src[k] || 0); });
         dst.equivalent_cost_usd = Number(dst.equivalent_cost_usd || 0) + Number(src.equivalent_cost_usd || 0);
         dst.cached_equivalent_cost_usd = Number(dst.cached_equivalent_cost_usd || 0) + Number(src.cached_equivalent_cost_usd || 0);
@@ -4015,6 +4156,151 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
         return usage;
       }
 
+      let quotaCfgEditing = false;
+
+      function fmtCountdownSec(sec) {
+        const s = Math.max(0, Math.round(Number(sec || 0)));
+        const h = Math.floor(s / 3600);
+        const m = Math.floor((s % 3600) / 60);
+        return h > 0 ? (h + ' 小时 ' + m + ' 分') : (m + ' 分钟');
+      }
+
+      function resolveQuotaCaps(usage) {
+        const cq = (usage && usage.cohort_quota) || {};
+        const totalPool = Math.max(10, Number(cq.cohort_daily_quota || 2000));
+        const reserved = Math.max(0, Math.min(totalPool - 1, Number(cq.cohort_reserved_quota !== undefined ? cq.cohort_reserved_quota : 600)));
+        const usableBudget = Math.max(1, totalPool - reserved);
+        return { cq: cq, totalPool: totalPool, reserved: reserved, usableBudget: usableBudget };
+      }
+
+      function renderCohortQuota(usage, resolved) {
+        const caps = resolveQuotaCaps(usage);
+        const cq = caps.cq;
+        const totalPool = caps.totalPool;
+        const reserved = caps.reserved;
+        const usableBudget = caps.usableBudget;
+        const bc = (usage && usage.billing_cycle) || {};
+
+        let focusDay = (usage && usage.today_date) || '';
+        let isCurrentDay = true;
+        let usedReqs = Number(((usage.periods && usage.periods.today && usage.periods.today.summary) || {}).requests || cq.used_requests || 0);
+        if (resolved && resolved.filterDay && usage.daily && usage.daily[resolved.filterDay]) {
+          focusDay = resolved.filterDay;
+          isCurrentDay = (focusDay === usage.today_date);
+          usedReqs = Number(((usage.daily[focusDay] || {}).summary || {}).requests || 0);
+        }
+
+        const usablePct = (usedReqs / usableBudget) * 100;
+        const totalPoolPct = (usedReqs / totalPool) * 100;
+        const resPoolPct = (reserved / totalPool) * 100;
+        const committedPct = ((usedReqs + reserved) / totalPool) * 100;
+        const exhausted = Boolean(isCurrentDay && cq.upstream_quota_exhausted_today);
+        const level = (exhausted || usedReqs >= totalPool)
+          ? 'exhausted'
+          : (usedReqs >= usableBudget ? 'reserve' : (usablePct >= 80 ? 'warn' : 'ok'));
+
+        const pctEl = document.getElementById('cohortUsablePctMain');
+        if (pctEl) {
+          pctEl.textContent = usablePct.toFixed(1) + '%';
+          pctEl.className = 'cohort-pct-big' + (level !== 'ok' ? (' ' + level) : '');
+        }
+        const cntSubEl = document.getElementById('cohortUsableCountSub');
+        if (cntSubEl) {
+          const dayPrefix = isCurrentDay ? '本计费日已用 ' : (focusDay.slice(5) + ' 计费日已用 ');
+          cntSubEl.textContent = dayPrefix + usedReqs.toLocaleString() + ' / 可用 ' + usableBudget.toLocaleString() + ' 次';
+        }
+        const stChip = document.getElementById('cohortQuotaStatusChip');
+        if (stChip) {
+          if (level === 'exhausted') {
+            stChip.className = 'chip err';
+            stChip.textContent = exhausted ? '上游配额已触顶 · 等 16:00 刷新' : '已达全池估算上限';
+          } else if (level === 'reserve') {
+            stChip.className = 'chip err';
+            stChip.textContent = '已动用同学预留 (' + (usedReqs - usableBudget).toLocaleString() + ' 次)';
+          } else if (level === 'warn') {
+            stChip.className = 'chip warn';
+            stChip.textContent = '接近预留线 (剩 ' + Math.max(0, usableBudget - usedReqs).toLocaleString() + ' 次)';
+          } else {
+            stChip.className = 'chip ok';
+            stChip.textContent = '安全水位 (剩 ' + Math.max(0, usableBudget - usedReqs).toLocaleString() + ' 次)';
+          }
+        }
+        const winChip = document.getElementById('billingWindowChip');
+        if (winChip) {
+          winChip.textContent = (isCurrentDay && bc.window_label)
+            ? ('当前周期 ' + bc.window_label)
+            : (focusDay ? ('计费日 ' + focusDay + ' 16:00~') : '每日 16:00 刷新');
+        }
+        const descEl = document.getElementById('cohortQuotaSubDesc');
+        if (descEl) {
+          descEl.textContent = '估算全 Cohort 共享池 ' + totalPool.toLocaleString() + ' 次/计费日（约 ' +
+            Math.max(1, Math.round(totalPool / 40)) + ' 席 EDU × 40 次），扣除给同学预留 ' +
+            reserved.toLocaleString() + ' 次（' + resPoolPct.toFixed(1) + '%）后本网关可用预算 ' + usableBudget.toLocaleString() + ' 次';
+        }
+        const progEl = document.getElementById('cohortQuotaProgress');
+        if (progEl) {
+          progEl.max = 100;
+          progEl.value = Math.min(100, Math.max(0, Number(usablePct.toFixed(2))));
+          progEl.className = 'cohort-progress' + (level !== 'ok' ? (' ' + level) : '');
+        }
+        const segUsed = document.getElementById('cohortPoolSegUsed');
+        const segRes = document.getElementById('cohortPoolSegRes');
+        const cappedPoolUsed = Math.min(100, Math.max(0, totalPoolPct));
+        if (segUsed) {
+          segUsed.style.width = cappedPoolUsed.toFixed(2) + '%';
+          segUsed.className = 'cohort-pool-seg-used' + (level === 'warn' ? ' warn' : ((level === 'reserve' || level === 'exhausted') ? ' err' : ''));
+        }
+        if (segRes) {
+          segRes.style.width = Math.max(0, Math.min(100 - cappedPoolUsed, resPoolPct)).toFixed(2) + '%';
+        }
+        const splitLbl = document.getElementById('cohortPoolSplitLabel');
+        if (splitLbl) {
+          splitLbl.textContent = '本网关占总池 ' + totalPoolPct.toFixed(1) + '% · 同学预留 ' + resPoolPct.toFixed(1) + '%（' +
+            reserved.toLocaleString() + ' 次） · 合计已锁定总池 ' + committedPct.toFixed(1) + '%';
+        }
+        const cdEl = document.getElementById('billingResetCountdown');
+        if (cdEl) {
+          const rstLocal = bc.reset_time_local || '16:00';
+          cdEl.textContent = bc.seconds_until_reset !== undefined
+            ? ('距下次 ' + rstLocal + ' 刷新还剩 ' + fmtCountdownSec(bc.seconds_until_reset))
+            : ('每日 ' + rstLocal + ' 刷新');
+        }
+        const effChip = document.getElementById('cohortBatchEfficiencyChip');
+        const effLbl = document.getElementById('cohortBatchEfficiencyLabel');
+        if (effChip) {
+          const daySummaryObj = (focusDay && usage.daily && usage.daily[focusDay] && usage.daily[focusDay].summary)
+            || (usage.periods && usage.periods.today && usage.periods.today.summary)
+            || {};
+          let sampleReqs = Number(daySummaryObj.requests || 0);
+          let sampleTools = Number(daySummaryObj.tool_calls || 0);
+          let sampleCompTok = Number(daySummaryObj.completion_tokens || 0);
+          const recOk = (usage.recent_requests || []).filter(function (r) {
+            return r && r.status === 'ok' && (!focusDay || r.day === focusDay);
+          });
+          if (sampleTools === 0 && recOk.length > 0) {
+            sampleReqs = recOk.length;
+            sampleTools = recOk.reduce(function (a, r) { return a + Number(r.tool_calls_count || 0); }, 0);
+            sampleCompTok = recOk.reduce(function (a, r) { return a + Number(r.completion_tokens || 0); }, 0);
+          }
+          const avgTools = sampleReqs > 0 ? (sampleTools / sampleReqs) : 0;
+          const avgOutTok = sampleReqs > 0 ? Math.round(sampleCompTok / sampleReqs) : 0;
+          const savedTurnsEst = Math.max(0, sampleTools - sampleReqs);
+          effChip.textContent = '均 ' + avgTools.toFixed(2) + ' 步工具/次 · 均出 ' + fmtLedgerTok(avgOutTok) + '/次';
+          effChip.className = 'chip' + (avgTools >= 1.5 || avgOutTok >= 1200 ? ' ok' : '');
+          if (effLbl) {
+            effLbl.textContent = savedTurnsEst > 0
+              ? ('⚡ 省次效率：按请求次数（QPD）计费 · 合批已省约 ' + savedTurnsEst.toLocaleString() + ' 次请求（长输出不额外扣次数）')
+              : '⚡ 省次效率：按请求次数（QPD）计费，合批工具调用与长输出不额外扣减次数';
+          }
+        }
+        if (!quotaCfgEditing) {
+          const totInp = document.getElementById('cohortTotalQuotaInput');
+          const resInp = document.getElementById('cohortReservedQuotaInput');
+          if (totInp) totInp.value = String(totalPool);
+          if (resInp) resInp.value = String(reserved);
+        }
+      }
+
       function renderLedger(usage, ctxMon) {
         if (!usage) return;
         reconcileLiveUsage(usage);
@@ -4029,21 +4315,28 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
 
         const todaySum = (usage.periods && usage.periods.today && usage.periods.today.summary) || {};
         const allSum = (usage.periods && usage.periods.all && usage.periods.all.summary) || usage.all_time || {};
+        const qCaps = resolveQuotaCaps(usage);
+        const todayReqsNum = Number(todaySum.requests || 0);
+        const todayUsablePct = (todayReqsNum / qCaps.usableBudget) * 100;
+        const todayPoolPct = (todayReqsNum / qCaps.totalPool) * 100;
         const ovLVal = document.getElementById('ovLedgerVal');
         const ovLSub = document.getElementById('ovLedgerSub');
         if (ovLVal) {
-          ovLVal.textContent = fmtMoney(todaySum.cached_equivalent_cost_usd, todaySum.cached_equivalent_cost_cny) + ' / 前 ' + fmtMoney(todaySum.equivalent_cost_usd, todaySum.equivalent_cost_cny);
+          ovLVal.textContent = '可用 ' + todayUsablePct.toFixed(1) + '% · ' + fmtMoney(todaySum.cached_equivalent_cost_usd, todaySum.cached_equivalent_cost_cny);
         }
         if (ovLSub) {
-          ovLSub.textContent = '今日 ' + Number(todaySum.requests || 0).toLocaleString() + ' 次 · 累计折后 ' + fmtMoney(allSum.cached_equivalent_cost_usd, allSum.cached_equivalent_cost_cny) + ' / 折前 ' + fmtMoney(allSum.equivalent_cost_usd, allSum.equivalent_cost_cny);
+          ovLSub.textContent = '本计费日 ' + todayReqsNum.toLocaleString() + ' / ' + qCaps.usableBudget.toLocaleString() +
+            ' 次（预留同学 ' + qCaps.reserved.toLocaleString() + ' · 占总池 ' + todayPoolPct.toFixed(1) + '%）';
         }
         const sideLBadge = document.getElementById('sideLedgerBadge');
         if (sideLBadge) {
-          sideLBadge.textContent = fmtMoney(allSum.cached_equivalent_cost_usd, allSum.cached_equivalent_cost_cny);
-          sideLBadge.title = '累计折算后 ' + fmtMoney(allSum.cached_equivalent_cost_usd, allSum.cached_equivalent_cost_cny) + ' / 折算前 ' + fmtMoney(allSum.equivalent_cost_usd, allSum.equivalent_cost_cny);
+          sideLBadge.textContent = todayUsablePct.toFixed(0) + '% · ' + fmtMoney(todaySum.cached_equivalent_cost_usd, todaySum.cached_equivalent_cost_cny);
+          sideLBadge.className = 'side-badge' + (todayUsablePct >= 100 ? ' warn' : (todayUsablePct >= 80 ? ' warn' : ''));
+          sideLBadge.title = '本计费日可用额度已用 ' + todayUsablePct.toFixed(1) + '% (' + todayReqsNum + '/' + qCaps.usableBudget + ') · 累计折算后 ' + fmtMoney(allSum.cached_equivalent_cost_usd, allSum.cached_equivalent_cost_cny);
         }
 
         const resolved = resolveSelectedGroup(usage);
+        renderCohortQuota(usage, resolved);
         const curSummary = (resolved.group && resolved.group.summary) || {};
         const byModel = (resolved.group && resolved.group.by_model) || {};
         const byTask = (resolved.group && resolved.group.by_task) || {};
@@ -4084,7 +4377,10 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
         if (cmpCnt > 0 && mediaCnt > 0) callsThirdLabel = '专项 ' + (cmpCnt + mediaCnt);
         else if (mediaCnt > 0) callsThirdLabel = '媒体 ' + mediaCnt;
         const callsSubEl = document.getElementById('ledgerCallsSub');
-        callsSubEl.textContent = '编程 ' + respCnt + ' / 对话 ' + chatCnt + ' / ' + callsThirdLabel;
+        const dayQuotaSuffix = resolved.filterDay
+          ? (' · 可用配额 ' + ((reqCount / qCaps.usableBudget) * 100).toFixed(1) + '%')
+          : '';
+        callsSubEl.textContent = '编程 ' + respCnt + ' / 对话 ' + chatCnt + ' / ' + callsThirdLabel + dayQuotaSuffix;
 
         const sumTok = resolveTokenParts(curSummary);
         const promptTokTotal = sumTok.input + sumTok.cached;
@@ -4197,8 +4493,9 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
             if (s.videos_generated > 0) specials.push('视频 ' + s.videos_generated);
             if (s.audio_requests > 0) specials.push('音 ' + s.audio_requests);
             const dt = resolveTokenParts(s);
-            tr.appendChild(makeCell(dk));
-            tr.appendChild(makeCell((s.requests || 0) + ' 次', 'num'));
+            const dayPctStr = ((Number(s.requests || 0) / qCaps.usableBudget) * 100).toFixed(1) + '%';
+            tr.appendChild(makeCell(dk + ' (16:00~)'));
+            tr.appendChild(makeCell((s.requests || 0) + ' 次 (' + dayPctStr + ')', 'num'));
             tr.appendChild(makeCell(fmtLedgerTok(dt.total), 'num'));
             tr.appendChild(makeCell(fmtLedgerTok(dt.input) + ' / ' + fmtLedgerTok(dt.output) + ' / ' + fmtLedgerTok(dt.cached)));
             tr.appendChild(makeCell(specials.length ? specials.join(' · ') : '-'));
@@ -4520,6 +4817,47 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
         const val = ev.target.value;
         selectedPeriod = val ? ('day:' + val) : 'all';
         if (lastUsageSnapshot) renderLedger(lastUsageSnapshot, lastCtxSnapshot);
+      });
+      document.getElementById('toggleQuotaCfgBtn').addEventListener('click', function () {
+        const panel = document.getElementById('quotaCfgPanel');
+        if (!panel) return;
+        panel.hidden = !panel.hidden;
+        quotaCfgEditing = !panel.hidden;
+        document.getElementById('toggleQuotaCfgBtn').textContent = panel.hidden ? '调整预留配额' : '收起设置';
+      });
+      document.getElementById('saveQuotaCfgBtn').addEventListener('click', async function () {
+        const totEl = document.getElementById('cohortTotalQuotaInput');
+        const resEl = document.getElementById('cohortReservedQuotaInput');
+        const msgEl = document.getElementById('quotaCfgMsg');
+        const btn = document.getElementById('saveQuotaCfgBtn');
+        const totalVal = parseInt(totEl && totEl.value ? totEl.value : '2000', 10);
+        const resVal = parseInt(resEl && resEl.value ? resEl.value : '600', 10);
+        if (!Number.isFinite(totalVal) || totalVal < 10 || !Number.isFinite(resVal) || resVal < 0 || resVal >= totalVal) {
+          if (msgEl) msgEl.textContent = '⚠ 预留配额须为非负整数且小于全 Cohort 总额度';
+          return;
+        }
+        btn.disabled = true;
+        try {
+          const headers = { 'Content-Type': 'application/json' };
+          const kEl = document.getElementById('apiKeyInput');
+          if (kEl && kEl.value && kEl.value.trim()) headers['Authorization'] = 'Bearer ' + kEl.value.trim();
+          const resp = await fetch('/api/usage/quota-config', {
+            method: 'POST',
+            headers: headers,
+            body: JSON.stringify({ cohort_daily_quota: totalVal, cohort_reserved_quota: resVal })
+          });
+          const data = await resp.json();
+          if (!resp.ok || !data.ok) throw new Error(data.detail || ('HTTP ' + resp.status));
+          quotaCfgEditing = false;
+          if (data.usage) {
+            renderLedger(data.usage, lastCtxSnapshot);
+          }
+          if (msgEl) msgEl.textContent = '✓ 已保存：可用预算 ' + (totalVal - resVal).toLocaleString() + ' 次/计费日（预留同学 ' + resVal.toLocaleString() + ' 次）';
+        } catch (err) {
+          if (msgEl) msgEl.textContent = '✕ 保存失败：' + String(err.message || err);
+        } finally {
+          btn.disabled = false;
+        }
       });
       document.getElementById('ledgerTenantSelect').addEventListener('change', function (ev) {
         selectedTenant = ev.target.value || 'all';

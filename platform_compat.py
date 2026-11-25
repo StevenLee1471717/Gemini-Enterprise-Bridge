@@ -23,6 +23,38 @@ from zoneinfo import ZoneInfo
 IS_WINDOWS = os.name == "nt"
 
 _UTC_PLUS_8 = timezone(timedelta(hours=8), name="Asia/Shanghai")
+BILLING_TIMEZONE = "America/Los_Angeles"
+
+
+class _USPacificFallbackTz(tzinfo):
+    """Stdlib US Pacific (PST/PDT) fallback when IANA tzdata is absent on bare Windows."""
+
+    @staticmethod
+    def _nth_sunday(year: int, month: int, n: int) -> int:
+        first_weekday = datetime(year, month, 1).weekday()  # Mon=0 .. Sun=6
+        first_sunday = 1 + ((6 - first_weekday) % 7)
+        return first_sunday + (n - 1) * 7
+
+    def _is_dst(self, dt: Optional[datetime]) -> bool:
+        if dt is None:
+            return False
+        year = dt.year
+        dst_start = datetime(year, 3, self._nth_sunday(year, 3, 2), 2, 0)
+        dst_end = datetime(year, 11, self._nth_sunday(year, 11, 1), 2, 0)
+        naive = dt.replace(tzinfo=None)
+        return dst_start <= naive < dst_end
+
+    def utcoffset(self, dt: Optional[datetime]) -> timedelta:
+        return timedelta(hours=-7 if self._is_dst(dt) else -8)
+
+    def dst(self, dt: Optional[datetime]) -> timedelta:
+        return timedelta(hours=1 if self._is_dst(dt) else 0)
+
+    def tzname(self, dt: Optional[datetime]) -> str:
+        return "PDT" if self._is_dst(dt) else "PST"
+
+
+_PACIFIC_FALLBACK_TZ = _USPacificFallbackTz()
 
 
 def resolve_timezone(name: str = "Asia/Shanghai") -> tzinfo:
@@ -30,6 +62,8 @@ def resolve_timezone(name: str = "Asia/Shanghai") -> tzinfo:
     try:
         return ZoneInfo(name)
     except Exception:
+        if name in {"America/Los_Angeles", "US/Pacific", "PST8PDT"}:
+            return _PACIFIC_FALLBACK_TZ
         if name in {"Asia/Shanghai", "Asia/Hong_Kong", "Asia/Taipei", "Asia/Singapore", "PRC"}:
             return _UTC_PLUS_8
         if name.upper() == "UTC":
@@ -41,6 +75,59 @@ try:
     SHANGHAI_TZ: tzinfo = ZoneInfo("Asia/Shanghai")
 except Exception:
     SHANGHAI_TZ = _UTC_PLUS_8
+
+try:
+    PACIFIC_TZ: tzinfo = ZoneInfo(BILLING_TIMEZONE)
+except Exception:
+    PACIFIC_TZ = _PACIFIC_FALLBACK_TZ
+
+
+def billing_day_key(ts: Optional[float] = None, billing_tz_name: str = BILLING_TIMEZONE) -> str:
+    """Return YYYY-MM-DD billing day anchored to 00:00 California (16:00 PST / 15:00 PDT in Shanghai)."""
+    eff_ts = float(time.time() if ts is None else ts)
+    tz_obj = PACIFIC_TZ if billing_tz_name == BILLING_TIMEZONE else resolve_timezone(billing_tz_name)
+    return datetime.fromtimestamp(eff_ts, tz=tz_obj).strftime("%Y-%m-%d")
+
+
+def billing_window_info(
+    now_ts: Optional[float] = None,
+    billing_tz_name: str = BILLING_TIMEZONE,
+    local_tz_name: str = "Asia/Shanghai",
+) -> dict[str, Any]:
+    """Compute current billing day boundaries and local reset time (16:00 PST / 15:00 PDT)."""
+    eff_ts = float(time.time() if now_ts is None else now_ts)
+    b_tz = PACIFIC_TZ if billing_tz_name == BILLING_TIMEZONE else resolve_timezone(billing_tz_name)
+    l_tz = SHANGHAI_TZ if local_tz_name == "Asia/Shanghai" else resolve_timezone(local_tz_name)
+
+    now_b = datetime.fromtimestamp(eff_ts, tz=b_tz)
+    cur_date = now_b.date()
+    prev_date = cur_date - timedelta(days=1)
+    next_date = cur_date + timedelta(days=1)
+
+    start_b = datetime(cur_date.year, cur_date.month, cur_date.day, 0, 0, 0, tzinfo=b_tz)
+    end_b = datetime(next_date.year, next_date.month, next_date.day, 0, 0, 0, tzinfo=b_tz)
+    start_ts = int(start_b.timestamp())
+    end_ts = int(end_b.timestamp())
+
+    start_local = datetime.fromtimestamp(start_ts, tz=l_tz)
+    end_local = datetime.fromtimestamp(end_ts, tz=l_tz)
+    span = max(1, end_ts - start_ts)
+    elapsed_pct = round(min(100.0, max(0.0, ((eff_ts - start_ts) / span) * 100.0)), 1)
+
+    return {
+        "billing_day": cur_date.isoformat(),
+        "yesterday_billing_day": prev_date.isoformat(),
+        "billing_timezone": billing_tz_name,
+        "display_timezone": local_tz_name,
+        "window_start_ts": start_ts,
+        "window_end_ts": end_ts,
+        "window_start_local": start_local.strftime("%m-%d %H:%M"),
+        "window_end_local": end_local.strftime("%m-%d %H:%M"),
+        "window_label": f"{start_local.strftime('%m-%d %H:%M')} → {end_local.strftime('%m-%d %H:%M')}",
+        "reset_time_local": start_local.strftime("%H:%M"),
+        "seconds_until_reset": max(0, int(round(end_ts - eff_ts))),
+        "elapsed_pct": elapsed_pct,
+    }
 
 
 def reconfigure_stdio_utf8(*, force_utf8: bool = False, errors: str = "replace") -> None:

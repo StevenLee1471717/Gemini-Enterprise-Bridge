@@ -366,12 +366,128 @@ def test_pre_update_backfill_and_host_tenant_reconciliation(tmp_path: Path) -> N
         copilot_dir=cp_dir,
         cutoff_day="2026-11-17",
     )
-    assert res["backfilled_days"] == ["2026-11-11", "2026-11-16"]
+    # 2026-11-11T02:00:00Z is 10:00 Shanghai (before 16:00 reset) -> 2026-11-10 18:00 PST billing day
+    assert res["backfilled_days"] == ["2026-11-10", "2026-11-16"]
 
     ledger = UsageLedger(storage_path=ledger_path)
     snap = ledger.snapshot(as_of_date="2026-11-17")
     assert snap["all_time"]["requests"] == 14
     assert snap["by_tenant"]["host"]["summary"]["requests"] == 14
-    assert snap["daily"]["2026-11-11"]["summary"]["cached_tokens"] == 105_000
+    assert snap["daily"]["2026-11-10"]["summary"]["cached_tokens"] == 105_000
     assert snap["daily"]["2026-11-16"]["summary"]["equivalent_cost_usd"] == pytest.approx(0.70)
     assert snap["daily"]["2026-11-16"]["summary"]["cached_equivalent_cost_usd"] == pytest.approx(0.32)
+
+
+def test_pacific_billing_day_16pm_cutoff_and_cohort_quota(tmp_path: Path) -> None:
+    from datetime import datetime
+    from platform_compat import SHANGHAI_TZ
+    from usage_ledger import compute_cohort_quota_metrics
+
+    ledger_path = tmp_path / "quota_ledger.json"
+    ledger = UsageLedger(
+        storage_path=ledger_path,
+        cohort_daily_quota=2000,
+        cohort_reserved_quota=600,
+    )
+
+    # 2026-11-25 15:59:59+08:00 -> 2026-11-24 23:59:59 PST -> billing day 2026-11-24
+    before_reset = datetime(2026, 11, 25, 15, 59, 59, tzinfo=SHANGHAI_TZ)
+    rec_prev = ledger.record_request(
+        requested_model="gemini-4-carbon",
+        prompt_tokens=10_000,
+        completion_tokens=1_000,
+        as_of_date=before_reset,
+    )
+    assert rec_prev["day"] == "2026-11-24"
+
+    # 2026-11-25 16:00:00+08:00 -> 2026-11-25 00:00:00 PST -> billing day 2026-11-25
+    after_reset = datetime(2026, 11, 25, 16, 0, 0, tzinfo=SHANGHAI_TZ)
+    for _ in range(7):
+        rec_cur = ledger.record_request(
+            requested_model="gemini-4-carbon",
+            prompt_tokens=10_000,
+            completion_tokens=1_000,
+            as_of_date=after_reset,
+        )
+        assert rec_cur["day"] == "2026-11-25"
+
+    snap = ledger.snapshot(as_of_date=after_reset)
+    assert snap["today_date"] == "2026-11-25"
+    assert snap["yesterday_date"] == "2026-11-24"
+    assert snap["today"]["requests"] == 7
+    assert snap["yesterday"]["requests"] == 1
+    cq = snap["cohort_quota"]
+    assert cq["cohort_daily_quota"] == 2000
+    assert cq["cohort_reserved_quota"] == 600
+    assert cq["usable_daily_budget"] == 1400
+    assert cq["usable_used_pct"] == pytest.approx(0.5)
+    assert cq["total_pool_used_pct"] == pytest.approx(0.35)
+    assert cq["reserved_pool_pct"] == pytest.approx(30.0)
+    assert cq["status_level"] == "ok"
+
+    # Verify reserve consumption & upstream exhaustion metrics
+    m_res = compute_cohort_quota_metrics(1470, 2000, 600)
+    assert m_res["usable_used_pct"] == pytest.approx(105.0)
+    assert m_res["reserve_consumed_requests"] == 70
+    assert m_res["status_level"] == "reserve"
+
+    ledger.record_failed_request(
+        requested_model="gemini-4-carbon",
+        status="rate_limited",
+        status_code=429,
+        error_code="quota_exceeded",
+        error_message="Daily quota limit reached",
+        as_of_date=after_reset,
+    )
+    snap_ex = ledger.snapshot(as_of_date=after_reset)
+    assert snap_ex["cohort_quota"]["upstream_quota_exhausted_today"] is True
+    assert snap_ex["cohort_quota"]["status_level"] == "exhausted"
+
+
+def test_quota_config_api_and_dashboard_progress(tmp_path: Path) -> None:
+    settings = BridgeSettings(
+        api_key="",
+        backend_mode="browser",
+        generated_dir=str(tmp_path),
+        usage_ledger_path=str(tmp_path / "usage_ledger.json"),
+        auto_export_extension=False,
+        auto_update=False,
+    )
+    app = create_app(settings)
+    with TestClient(app) as client:
+        bad = client.post(
+            "/api/usage/quota-config",
+            json={"cohort_daily_quota": 1000, "cohort_reserved_quota": 1000},
+        )
+        assert bad.status_code == 400
+
+        ok = client.post(
+            "/api/usage/quota-config",
+            json={"cohort_daily_quota": 1600, "cohort_reserved_quota": 500},
+        )
+        assert ok.status_code == 200
+        cq = ok.json()["usage"]["cohort_quota"]
+        assert cq["cohort_daily_quota"] == 1600
+        assert cq["cohort_reserved_quota"] == 500
+        assert cq["usable_daily_budget"] == 1100
+
+        dash_html = client.get("/").text
+        assert "cohortQuotaProgress" in dash_html
+        assert "cohortUsablePctMain" in dash_html
+        assert "cohortPoolSplitLabel" in dash_html
+        assert "cohortBatchEfficiencyChip" in dash_html
+
+    # Reload ledger from disk and verify quota_config + tool_calls batching metrics persisted
+    reloaded = UsageLedger(storage_path=tmp_path / "usage_ledger.json")
+    assert reloaded.cohort_daily_quota == 1600
+    assert reloaded.cohort_reserved_quota == 500
+    reloaded.record_request(
+        requested_model="gemini-4-carbon",
+        prompt_tokens=20_000,
+        completion_tokens=4_000,
+        tool_calls_count=5,
+    )
+    snap_eff = reloaded.snapshot()
+    assert snap_eff["today"]["tool_calls"] == 5
+    assert snap_eff["today"]["avg_tools_per_req"] == pytest.approx(5.0)
+    assert snap_eff["today"]["avg_completion_tokens_per_req"] == pytest.approx(4000.0)

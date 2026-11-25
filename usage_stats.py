@@ -31,6 +31,7 @@ from datetime import date, datetime
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Union
 
+from platform_compat import PACIFIC_TZ
 from schemas import (
     format_gemini_display_name,
     normalize_web_label_to_model_spec,
@@ -159,8 +160,10 @@ def resolve_canonical_billing_model(
 
 def _coerce_date(val: Optional[Union[date, datetime, str]]) -> date:
     if val is None:
-        return datetime.now().date()
+        return datetime.now(PACIFIC_TZ).date()
     if isinstance(val, datetime):
+        if val.tzinfo is not None:
+            return val.astimezone(PACIFIC_TZ).date()
         return val.date()
     if isinstance(val, date):
         return val
@@ -170,7 +173,7 @@ def _coerce_date(val: Optional[Union[date, datetime, str]]) -> date:
             return date.fromisoformat(s)
         except ValueError:
             pass
-    return datetime.now().date()
+    return datetime.now(PACIFIC_TZ).date()
 
 
 def get_context_window_for_model(

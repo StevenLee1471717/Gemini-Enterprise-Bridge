@@ -825,6 +825,10 @@ class ConversationContextBuilder:
                     lines.append(
                         "- CRITICAL LENGTH RULE: Your previous `codex_tool_call` JSON was cut off before closing because the single tool payload was too long for one web response turn. Do NOT write an oversized file or multi-script payload (>12,000 chars) in a single tool call — split it into bounded steps (<12,000 chars / ~150-220 lines per turn), close the ``` fence cleanly now, and append remaining parts in the next turn(s)."
                     )
+                if ("未正确结束" in clean_reason) or ("三个反引号" in clean_reason) or ("独立成行" in clean_reason):
+                    lines.append(
+                        "- CRITICAL CLOSING FENCE RULE: Open each tool block with ` ```codex_tool_call ` on its own line and ALWAYS close it with EXACTLY three backticks (` ``` `) on its own dedicated line right after `}` (NEVER use 4+ backticks ` ```` ` or `~~~` even when JSON strings contain backticks, never omit the closing ` ``` ` line, and never place prose on the closing fence line)."
+                    )
                 lines.extend(
                     [
                         '- For client tool calls, use a standalone three-backtick `codex_tool_call` code block on its own line containing valid RFC 8259 JSON `{"name": "...", "arguments": {...}}` (never backslash-escape Markdown characters inside JSON strings), close with three backticks on its own line, and stop immediately without `suggested_questions`.',

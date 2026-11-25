@@ -290,11 +290,16 @@ def test_github_copilot_selective_tool_batching():
     )
     assert len(parse_assistant_output(disjoint, copilot_tools).tool_calls) == 2
 
-    # 3. Same-file Copilot edits must be rejected
+    # 3. Non-overlapping same-file Copilot `edit` blocks batch sequentially in one turn, while overlapping blocks reject
+    same_file_non_overlapping = (
+        _call('edit', {'path': r'I:\repo\a.py', 'old_str': 'ALPHA = 1', 'new_str': 'ALPHA = 2'})
+        + _call('edit', {'path': r'I:\repo\a.py', 'old_str': 'BETA = 3', 'new_str': 'BETA = 4'})
+    )
+    assert len(parse_assistant_output(same_file_non_overlapping, copilot_tools).tool_calls) == 2
     with pytest.raises(ToolProtocolError):
         parse_assistant_output(
-            _call('edit', {'path': r'I:\repo\a.py', 'old_str': '1', 'new_str': '2'})
-            + _call('edit', {'path': r'I:\repo\a.py', 'old_str': '3', 'new_str': '4'}),
+            _call('edit', {'path': r'I:\repo\a.py', 'old_str': 'ALPHA = 1', 'new_str': 'ALPHA = 2'})
+            + _call('edit', {'path': r'I:\repo\a.py', 'old_str': 'ALPHA = 1\nBETA = 3', 'new_str': 'ALPHA = 9\nBETA = 4'}),
             copilot_tools,
         )
 

@@ -391,3 +391,57 @@ def test_system_diagnostic_reads_conflict_reason_and_turn1_retry_notice():
         assert commands[-1]['reset_chat'] is True
         assert '[Retry Notice — Previous Reply Had a Format Error; Please Rewrite]' in commands[-1]['prompt']
         assert "exec_command('python3 -c" in commands[-1]['prompt']
+
+
+def test_qpd_batching_allows_non_overlapping_same_file_edits_and_discovery_reads():
+    edit_tools = [
+        {'type': 'function', 'function': {'name': 'edit', 'parameters': {'type': 'object'}}},
+        {'type': 'function', 'function': {'name': 'create', 'parameters': {'type': 'object'}}},
+        {'type': 'function', 'function': {'name': 'view', 'parameters': {'type': 'object'}}},
+        {'type': 'function', 'function': {'name': 'tool_search_tool', 'parameters': {'type': 'object'}}},
+        {'type': 'function', 'function': {'name': 'session_store_sql', 'parameters': {'type': 'object'}}},
+    ]
+
+    def fc(name, args):
+        return '```codex_tool_call\n' + json.dumps({'name': name, 'arguments': args}, ensure_ascii=False) + '\n```\n'
+
+    # 1. Multiple non-overlapping `edit` blocks on the SAME file + another file in one turn succeed
+    batched_edits = (
+        fc('edit', {'path': 'I:\\repo\\app.py', 'old_str': 'PORT = 8000', 'new_str': 'PORT = 9000'})
+        + fc('edit', {'path': 'I:\\repo\\app.py', 'old_str': 'DEBUG = False', 'new_str': 'DEBUG = True'})
+        + fc('create', {'path': 'I:\\repo\\helper.py', 'file_text': 'def ok():\n    return True\n'})
+    )
+    parsed = parse_assistant_output(batched_edits, edit_tools)
+    assert len(parsed.tool_calls) == 3
+
+    # 2. Overlapping `old_str` or `new_str` colliding with subsequent `old_str` on the same file must reject
+    overlapping_old = (
+        fc('edit', {'path': 'I:\\repo\\app.py', 'old_str': 'PORT = 8000', 'new_str': 'PORT = 9000'})
+        + fc('edit', {'path': 'I:\\repo\\app.py', 'old_str': 'PORT = 8000\nDEBUG = False', 'new_str': 'PORT = 9001\nDEBUG = True'})
+    )
+    with pytest.raises(ToolProtocolError):
+        parse_assistant_output(overlapping_old, edit_tools)
+
+    chained_collision = (
+        fc('edit', {'path': 'I:\\repo\\app.py', 'old_str': 'ALPHA = 1', 'new_str': 'BETA = 2'})
+        + fc('edit', {'path': 'I:\\repo\\app.py', 'old_str': 'BETA = 2', 'new_str': 'GAMMA = 3'})
+    )
+    with pytest.raises(ToolProtocolError):
+        parse_assistant_output(chained_collision, edit_tools)
+
+    # 3. `create` + `edit` on the same file in one turn must still reject
+    create_plus_edit_same = (
+        fc('create', {'path': 'I:\\repo\\new.py', 'file_text': 'X = 1\n'})
+        + fc('edit', {'path': 'I:\\repo\\new.py', 'old_str': 'X = 1', 'new_str': 'X = 2'})
+    )
+    with pytest.raises(ToolProtocolError):
+        parse_assistant_output(create_plus_edit_same, edit_tools)
+
+    # 4. Read-only discovery tools (`tool_search_tool`, `session_store_sql`) batch cleanly with `view`
+    batched_reads = (
+        fc('tool_search_tool', {'query': 'github issue'})
+        + fc('session_store_sql', {'description': 'recent sessions', 'query': 'SELECT id FROM sessions LIMIT 5'})
+        + fc('view', {'path': 'I:\\repo\\app.py', 'view_range': [1, 600]})
+        + fc('view', {'path': 'I:\\repo\\app.py', 'view_range': [601, 1200]})
+    )
+    assert len(parse_assistant_output(batched_reads, edit_tools).tool_calls) == 4

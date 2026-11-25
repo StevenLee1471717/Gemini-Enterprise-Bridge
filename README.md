@@ -35,7 +35,7 @@ flowchart LR
 
 | 能力模块 | 核心实现与运行机制 |
 |---|---|
-| **选择性批量工具调用 (`tool_calling.py`)** | 原生适配 **GitHub Copilot** 工具集（`view` / `grep` / `glob` / `lsp` / `edit` / `create` / `powershell` / `bash` / `task` 等）与通用编程工具：支持同轮并行批处理只读查询、非冲突文件的并行编辑及独立子代理派发；自动拦截同文件编辑冲突及写命令与读工具混批，确保执行安全与速度兼得 |
+| **面向 QPD 按次配额的批量工具调用与长输出优化 (`tool_calling.py` / `agent_policy.py`)** | 针对 Gemini Enterprise 按请求次数（QPD）而非 Token 计费的特性深度优化：支持同轮大批量只读查询（4～10 路并发 `view`/`grep`/`glob`/`tool_search_tool` 及分段并发读大文件）、跨文件并行修改与**同文件多处非重叠 `edit` 顺序批处理**、单次终端命令串联（`&&`/`;`）及 ~40K 字符单轮完整长输出；自动拦截重叠修改块与读写混批，并在控制台实时展示「均步工具/次 · 均出 Token/次」省次效率 |
 | **实时并发席位调控与严格会话亲和 (`bridge_hub.py`)** | 支持在 Web 控制台与扩展弹窗中实时动态调整最大并行席位上限（`_DynamicParallelLimiter` + `set_max_parallel_tabs`，热生效不断流）；引入每会话独立串行锁（`_thread_locks`）与严格会话亲和，并支持浏览器重进续聊与残留附件自动清理（`clearComposerAttachments`） |
 | **1M 上下文窗口与 GitHub Copilot 上限自动同步** | `/v1/models` 默认提供精简去重的核心模型（**Gemini 4 Carbon**、**4 Argon**、**3.1 Pro**、**3.8 Flash**），同时 `/v1/models/{model_id}` 兼容所有别名与 `@会话名`，全量声明 **`1,048,576` 输入 / `65,536` 输出**；启动时自动运行 `sync_client_limits.py` 修复本地 GitHub Copilot App (`~/.copilot/data.db`) BYOK 模型的 `128K` 默认回退限制 |
 | **全链路多模态与跨平台格式归一化 (`multimodal.py` / `media_inputs.py`)** | 原生支持图片、视频、音频、PDF、Office 文档与代码文件；内置纯标准库跨平台 BMP/ICO→PNG 与 RTF→DOCX 转换、多轮 SHA-256 增量去重、以及网页输入框剪贴板粘贴/拖放兜底与重复附件清理 |

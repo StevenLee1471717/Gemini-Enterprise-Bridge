@@ -192,3 +192,77 @@ assert.equal(thoughtOnlyJob.networkText, '');
 assert.ok(!thoughtOnlyJob.networkDone);
 assert.ok(typeof thoughtOnlyJob.emptyRpcEndedAt === 'number' && thoughtOnlyJob.emptyRpcEndedAt > 0);
 console.log('PASS: truncated summaryText guard, multi-leg RPC continuation, and thought-only empty RPC detection');
+
+// Multimodal <end_of_image> control tokens around fences must not break closing detection or duplicate summaryText
+const eoiClosedJob = job();
+const sshTool = { name: 'powershell', arguments: { command: 'ssh sakura-prod "echo ok"', description: 'Verify SSH' } };
+const streamedEoiClosed =
+  '<end_of_image>正在将本机公钥写入 60.205.9.176 的 authorized_keys。\n' +
+  '<end_of_image>' + ticks3 + 'codex_tool_call\n' +
+  JSON.stringify(sshTool) + '\n' +
+  ticks3 + '<end_of_image>';
+await state.consumeStream(stream(['[{"groundedContent":{"content":{"text":' + JSON.stringify(streamedEoiClosed) + '}}}]']), eoiClosedJob);
+assert.ok(eoiClosedJob.primaryStreamToken !== null, 'closed fence with <end_of_image> must not be misclassified as unclosed');
+state.parsePacket({
+  summaryText:
+    '正在将本机公钥写入 `60.205.9.176` 的 `authorized_keys`。\n\n' +
+    ticks3 + 'codex_tool_call\n' +
+    JSON.stringify(sshTool, null, 2) + '\n' +
+    ticks3 + '\n' +
+    ticks3 + 'suggested_questions\n{"questions":["Deploy now?"],"type":"followup"}\n' + ticks3
+}, eoiClosedJob);
+assert.equal((eoiClosedJob.networkText.match(/codex_tool_call/g) || []).length, 1, 'summaryText after <end_of_image> stream must never duplicate tool call');
+
+// Unclosed streamed tool call where closing ``` only arrives in reformatted summaryText must close cleanly without pasting prose
+const eoiUnclosedJob = job();
+const streamedUnclosed =
+  '<end_of_image>正在配置 authorized_keys。\n' +
+  ticks3 + 'codex_tool_call\n' +
+  JSON.stringify(sshTool);
+state.parsePacket({ groundedContent: { content: { text: streamedUnclosed } } }, eoiUnclosedJob);
+state.parsePacket({
+  summaryText:
+    '正在配置 `authorized_keys`。\n\n' +
+    ticks3 + 'codex_tool_call\n' +
+    JSON.stringify(sshTool, null, 2) + '\n' +
+    ticks3
+}, eoiUnclosedJob);
+assert.equal(eoiUnclosedJob.networkText, streamedUnclosed + '\n' + ticks3, 'closing fence from reformatted summaryText must close open tool block cleanly');
+
+// Host internal parser intercept swallowing closing ``` when Leg 2 emits nothing auto-closes complete JSON fence
+const hostInterceptEmptyLeg2 = job();
+await state.consumeStream(
+  stream([
+    '[{"groundedContent":{"content":{"text":' + JSON.stringify(streamedUnclosed) + '}}},' +
+      '{"functionCall":{"name":"invalid_tool_call_notifier","args":{"tool_name":"unknown"}}},' +
+      '{"groundedContent":{"content":{"text":""}}}]'
+  ]),
+  hostInterceptEmptyLeg2
+);
+assert.equal(hostInterceptEmptyLeg2.networkText, streamedUnclosed + '\n' + ticks3, 'host parser intercept with empty continuation must restore swallowed closing fence');
+
+// Host internal parser intercept where Leg 2 re-emits prose + identical closed fence must be recognized as closed & deduplicated
+const hostInterceptRetryLeg2 = job();
+await state.consumeStream(
+  stream([
+    '[{"groundedContent":{"content":{"text":' + JSON.stringify(streamedUnclosed) + '}}},' +
+      '{"functionCall":{"name":"invalid_tool_call_notifier","args":{"tool_name":"unknown"}}},' +
+      '{"groundedContent":{"content":{"text":' +
+      JSON.stringify('\n我将重新配置 authorized_keys：\n' + ticks3 + 'codex_tool_call\n' + JSON.stringify(sshTool) + '\n' + ticks3) +
+      '}}}]'
+  ]),
+  hostInterceptRetryLeg2
+);
+assert.ok(hostInterceptRetryLeg2.primaryStreamToken !== null, 'superseded unclosed fence followed by valid closed retry must count as closed');
+
+const api = sandbox.__GEB_MAIN_API__;
+const bgSrc = fs.readFileSync(new URL('./background.js', import.meta.url), 'utf8');
+const expectedMatch = bgSrc.match(/const\s+EXPECTED_DRIVER_VERSION\s*=\s*"([^"]+)"/);
+assert.ok(expectedMatch, 'background.js must declare EXPECTED_DRIVER_VERSION');
+assert.equal(api.version, expectedMatch[1], 'page-driver.js DRIVER_VERSION must stay in sync with background.js EXPECTED_DRIVER_VERSION');
+
+assert.equal(api.computePureAppendToolCloseSuffix(streamedUnclosed), '\n' + ticks3);
+assert.equal(api.computePureAppendToolCloseSuffix(streamedUnclosed + '\n'), ticks3);
+assert.equal(api.computePureAppendToolCloseSuffix(streamedUnclosed + '\n\u0060\u0060'), '\u0060');
+assert.equal(api.computePureAppendToolCloseSuffix(leg1Text), '', 'incomplete JSON must never receive premature closing fence');
+console.log('PASS: <end_of_image> fence recognition, host parser intercept recovery, pure-append closure, and driver version sync');

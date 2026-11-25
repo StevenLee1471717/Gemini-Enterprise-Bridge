@@ -19,7 +19,7 @@ const UPDATE_CHECK_ALARM_NAME = "geb-update-check-alarm";
 const VERTEX_MATCH_PATTERN = "https://vertexaisearch.cloud.google.com/*";
 const DEFAULT_VERTEX_HOME_URL =
   "https://vertexaisearch.cloud.google.com/home/cid/f8a26a7c-0f51-4098-bf58-52506661472b?hl=en_US";
-const EXPECTED_DRIVER_VERSION = "2.8.9";
+const EXPECTED_DRIVER_VERSION = "2.9.1";
 const DEFAULT_GITHUB_REPO = "StevenLee1471717/Gemini-Enterprise-Bridge";
 const BUSY_REQUEST_SESSION_TTL_MS = 45 * 60 * 1000;
 
@@ -1238,9 +1238,9 @@ const swReplyReassembly = new Map();
 function getExtensionVersion() {
   try {
     const mf = chrome.runtime?.getManifest?.();
-    return mf && mf.version ? String(mf.version) : "1.5.2";
+    return mf && mf.version ? String(mf.version) : "1.5.4";
   } catch (_) {
-    return "1.5.2";
+    return "1.5.4";
   }
 }
 

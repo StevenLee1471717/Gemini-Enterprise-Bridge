@@ -21,7 +21,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, AsyncIterator, Callable, Deque, Dict, List, Optional, Sequence
 
-from platform_compat import SHANGHAI_TZ, atomic_write_json
+from platform_compat import SHANGHAI_TZ, atomic_write_json, billing_day_key
 from schemas import normalize_default_model, parse_model_and_session, resolve_target_web_model
 
 logger = logging.getLogger("gemini_bridge.distribution")
@@ -195,7 +195,8 @@ def _mask_key(secret: str) -> str:
 
 
 def _today_shanghai() -> str:
-    return datetime.now(DEFAULT_TZ).strftime("%Y-%m-%d")
+    """Return current daily quota window key (resets at 00:00 PT / 16:00 PST Shanghai)."""
+    return billing_day_key()
 
 
 def _ip_matches_allowlist(client_ip: str, allowed_ips: Sequence[str]) -> bool:

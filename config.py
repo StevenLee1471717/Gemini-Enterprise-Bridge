@@ -103,6 +103,9 @@ class BridgeSettings:
     tunnel_state_path: str = ""
     host_reserved_slots: int = 2
     usd_to_cny_rate: float = 6.8
+    billing_timezone: str = "America/Los_Angeles"
+    cohort_daily_quota: int = 2000
+    cohort_reserved_quota: int = 600
     price_overrides_json: str = ""
     generated_dir: str = ""
     response_store_dir: str = ""
@@ -183,6 +186,10 @@ class BridgeSettings:
             ).strip(),
             host_reserved_slots=max(0, _env_int("BRIDGE_HOST_RESERVED_SLOTS", 2)),
             usd_to_cny_rate=_env_float("BRIDGE_USD_TO_CNY_RATE", 6.8),
+            billing_timezone=os.getenv("BRIDGE_BILLING_TIMEZONE", "America/Los_Angeles").strip()
+            or "America/Los_Angeles",
+            cohort_daily_quota=max(10, _env_int("BRIDGE_COHORT_DAILY_QUOTA", 2000)),
+            cohort_reserved_quota=max(0, _env_int("BRIDGE_COHORT_RESERVED_QUOTA", 600)),
             price_overrides_json=os.getenv("BRIDGE_PRICE_OVERRIDES_JSON", "").strip(),
             generated_dir=os.getenv("BRIDGE_GENERATED_DIR", "").strip(),
             response_store_dir=os.getenv(

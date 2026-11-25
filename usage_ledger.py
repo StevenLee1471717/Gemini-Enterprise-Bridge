@@ -21,7 +21,13 @@ from datetime import date, datetime, timedelta
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Union
 
-from platform_compat import atomic_write_json, resolve_timezone
+from platform_compat import (
+    BILLING_TIMEZONE,
+    atomic_write_json,
+    billing_day_key,
+    billing_window_info,
+    resolve_timezone,
+)
 from schemas import (
     format_gemini_display_name,
     normalize_web_label_to_model_spec,
@@ -34,10 +40,20 @@ DEFAULT_CONTEXT_WINDOW = 1_048_576
 DEFAULT_COMPACT_BUDGET = 300_000
 DEFAULT_USD_TO_CNY = 6.8
 DEFAULT_TIMEZONE = "Asia/Shanghai"
+DEFAULT_BILLING_TIMEZONE = BILLING_TIMEZONE
+# Empirical + Google Cloud Gemini Enterprise EDU pooled quota defaults:
+# - Upstream metric: discoveryengine.googleapis.com/text_answer_gen_tier_edu_regional
+# - Resets daily at 00:00 America/Los_Angeles (16:00 PST / 15:00 PDT in Asia/Shanghai)
+# - EDU edition grants 40 Assistant queries / seat / day; ~50 cohort seats => 2,000 QPD shared pool
+#   (verified against observed bridge ceiling: 1,566 OK on 11-23; 1,555 + classmate usage hit quota on 11-24)
+# - Default classmate reserve: 600 QPD (30% of pool, ~15 full EDU seats), leaving 1,400 QPD safe budget.
+DEFAULT_COHORT_DAILY_QUOTA = 2000
+DEFAULT_COHORT_RESERVED_QUOTA = 600
 DEFAULT_IMAGE_UNIT_USD = 0.04
 DEFAULT_VIDEO_UNIT_USD = 0.35
 MAX_RECENT_REQUESTS = 300
 MAX_STORED_DAYS = 180
+LEDGER_SCHEMA_VERSION = 2
 
 TASK_LABELS: Dict[str, str] = {
     "chat": "普通对话",
@@ -328,6 +344,7 @@ def estimate_attachment_input_tokens(attachments: Optional[Sequence[Dict[str, An
 
 _BUCKET_INT_KEYS = (
     "requests",
+    "tool_calls",
     "prompt_tokens",
     "cached_tokens",
     "delta_prompt_tokens",
@@ -516,7 +533,11 @@ def enrich_bucket(bucket: Dict[str, Any], usd_to_cny: float) -> Dict[str, Any]:
     uncached_usd = float(bucket.get("equivalent_cost_usd") or 0.0)
     cached_usd = float(bucket.get("cached_equivalent_cost_usd") or 0.0)
     saved_usd = max(0.0, uncached_usd - cached_usd)
+    reqs = int(bucket.get("requests") or 0)
+    t_calls = int(bucket.get("tool_calls") or 0)
     p_tok = int(bucket.get("prompt_tokens") or 0)
+    c_tok = int(bucket.get("completion_tokens") or 0)
+    tot_tok = int(bucket.get("total_tokens") or 0)
     c_hit = int(bucket.get("cached_tokens") or 0)
     out: Dict[str, Any] = {k: int(bucket.get(k) or 0) for k in _BUCKET_INT_KEYS}
     out.update(
@@ -528,13 +549,84 @@ def enrich_bucket(bucket: Dict[str, Any], usd_to_cny: float) -> Dict[str, Any]:
             "cached_equivalent_cost_cny": round(cached_usd * usd_to_cny, 4),
             "saved_cost_cny": round(saved_usd * usd_to_cny, 4),
             "cache_hit_pct": round((c_hit / p_tok) * 100.0, 1) if p_tok > 0 else 0.0,
+            "avg_tools_per_req": round(t_calls / reqs, 2) if reqs > 0 else 0.0,
+            "avg_completion_tokens_per_req": round(c_tok / reqs, 1) if reqs > 0 else 0.0,
+            "avg_total_tokens_per_req": round(tot_tok / reqs, 1) if reqs > 0 else 0.0,
         }
     )
     return out
 
 
+_LOCAL_CLIENT_QUOTA_CODES = {
+    "daily_quota_exceeded",
+    "total_quota_exceeded",
+    "rate_limit_exceeded",
+    "client_queue_full",
+    "concurrency_timeout",
+}
+
+
+def compute_cohort_quota_metrics(
+    used_requests: int,
+    cohort_daily_quota: int = DEFAULT_COHORT_DAILY_QUOTA,
+    cohort_reserved_quota: int = DEFAULT_COHORT_RESERVED_QUOTA,
+    *,
+    upstream_exhausted: bool = False,
+    last_upstream_quota_error: str = "",
+) -> Dict[str, Any]:
+    """Compute shared Cohort daily quota percentages accounting for classmate reserve."""
+    total_pool = max(10, int(cohort_daily_quota or DEFAULT_COHORT_DAILY_QUOTA))
+    raw_reserved = DEFAULT_COHORT_RESERVED_QUOTA if cohort_reserved_quota is None else int(cohort_reserved_quota)
+    reserved = max(0, min(total_pool - 1, raw_reserved))
+    usable_budget = max(1, total_pool - reserved)
+    used = max(0, int(used_requests or 0))
+
+    usable_used_pct = round((used / usable_budget) * 100.0, 2)
+    total_pool_used_pct = round((used / total_pool) * 100.0, 2)
+    reserved_pool_pct = round((reserved / total_pool) * 100.0, 2)
+    effective_committed_requests = used + reserved
+    effective_committed_pct = round((effective_committed_requests / total_pool) * 100.0, 2)
+    remaining_usable = max(0, usable_budget - used)
+    dipping_into_reserve = max(0, used - usable_budget)
+
+    if upstream_exhausted or used >= total_pool:
+        status_level = "exhausted"
+    elif used >= usable_budget:
+        status_level = "reserve"
+    elif usable_used_pct >= 80.0:
+        status_level = "warn"
+    else:
+        status_level = "ok"
+
+    return {
+        "cohort_daily_quota": total_pool,
+        "cohort_reserved_quota": reserved,
+        "usable_daily_budget": usable_budget,
+        "used_requests": used,
+        "usable_used_pct": usable_used_pct,
+        "total_pool_used_pct": total_pool_used_pct,
+        "reserved_pool_pct": reserved_pool_pct,
+        "effective_committed_requests": effective_committed_requests,
+        "effective_committed_pct": effective_committed_pct,
+        "remaining_usable_requests": remaining_usable,
+        "dipping_into_reserve_requests": dipping_into_reserve,
+        "reserve_consumed_requests": dipping_into_reserve,
+        "upstream_quota_exhausted_today": bool(upstream_exhausted),
+        "last_upstream_quota_error": last_upstream_quota_error,
+        "status_level": status_level,
+        "estimation_basis": {
+            "metric": "discoveryengine.googleapis.com/text_answer_gen_tier_edu_regional",
+            "edition": "EDU",
+            "per_seat_qpd": 40,
+            "estimated_seats": max(1, round(total_pool / 40)),
+            "observed_max_ok_requests": 1566,
+            "observed_exhaustion_requests": 1555,
+        },
+    }
+
+
 class UsageLedger:
-    """Thread-safe persistent ledger with day-sourced double-entry consistency."""
+    """Thread-safe persistent ledger with Pacific-midnight (16:00 Shanghai) billing-day consistency."""
 
     def __init__(
         self,
@@ -544,10 +636,23 @@ class UsageLedger:
         price_overrides: Optional[Dict[str, Dict[str, Any]]] = None,
         image_unit_usd: float = DEFAULT_IMAGE_UNIT_USD,
         video_unit_usd: float = DEFAULT_VIDEO_UNIT_USD,
+        billing_timezone_name: str = DEFAULT_BILLING_TIMEZONE,
+        cohort_daily_quota: int = DEFAULT_COHORT_DAILY_QUOTA,
+        cohort_reserved_quota: int = DEFAULT_COHORT_RESERVED_QUOTA,
     ) -> None:
         self.storage_path: Optional[Path] = Path(storage_path) if storage_path else None
         self.usd_to_cny_rate = usd_to_cny_rate if usd_to_cny_rate > 0 else DEFAULT_USD_TO_CNY
         self.timezone_name = timezone_name or DEFAULT_TIMEZONE
+        self.billing_timezone_name = billing_timezone_name or DEFAULT_BILLING_TIMEZONE
+        self.cohort_daily_quota = max(10, int(cohort_daily_quota or DEFAULT_COHORT_DAILY_QUOTA))
+        self.cohort_reserved_quota = max(
+            0,
+            min(
+                self.cohort_daily_quota - 1,
+                int(DEFAULT_COHORT_RESERVED_QUOTA if cohort_reserved_quota is None else cohort_reserved_quota),
+            ),
+        )
+        self._quota_config_override: Dict[str, int] = {}
         self.price_overrides = copy.deepcopy(price_overrides) if isinstance(price_overrides, dict) else {}
         media_ov = self.price_overrides.get("_media") if isinstance(self.price_overrides.get("_media"), dict) else {}
         self.image_unit_usd = max(0.0, float(media_ov.get("image_unit_usd", image_unit_usd)))
@@ -563,9 +668,17 @@ class UsageLedger:
         self._backfill_mtime_ns: int = 0
         self._load_from_disk()
 
-    def _day_key(self, as_of_date: Optional[Union[date, datetime, str]] = None) -> str:
+    def _day_key(
+        self,
+        as_of_date: Optional[Union[date, datetime, str]] = None,
+        *,
+        now_ts: Optional[float] = None,
+    ) -> str:
         if isinstance(as_of_date, datetime):
-            return as_of_date.date().isoformat()
+            b_tz = resolve_timezone(self.billing_timezone_name)
+            if as_of_date.tzinfo is None:
+                as_of_date = as_of_date.replace(tzinfo=resolve_timezone(self.timezone_name))
+            return as_of_date.astimezone(b_tz).date().isoformat()
         if isinstance(as_of_date, date):
             return as_of_date.isoformat()
         if isinstance(as_of_date, str) and as_of_date.strip():
@@ -574,9 +687,81 @@ class UsageLedger:
             except ValueError:
                 pass
         try:
-            return datetime.now(resolve_timezone(self.timezone_name)).date().isoformat()
+            return billing_day_key(now_ts, self.billing_timezone_name)
         except Exception:
             return datetime.now().date().isoformat()
+
+    def update_quota_config(
+        self,
+        *,
+        cohort_daily_quota: Optional[int] = None,
+        cohort_reserved_quota: Optional[int] = None,
+    ) -> Dict[str, Any]:
+        with self._lock:
+            if cohort_daily_quota is not None:
+                self.cohort_daily_quota = max(10, min(500_000, int(cohort_daily_quota)))
+            if cohort_reserved_quota is not None:
+                self.cohort_reserved_quota = max(0, int(cohort_reserved_quota))
+            self.cohort_reserved_quota = min(self.cohort_daily_quota - 1, self.cohort_reserved_quota)
+            self._quota_config_override = {
+                "cohort_daily_quota": self.cohort_daily_quota,
+                "cohort_reserved_quota": self.cohort_reserved_quota,
+            }
+            self._save_to_disk_unlocked(skip_external_sync=True)
+            today_key = self._day_key()
+            today_reqs = int(((self._days.get(today_key) or {}).get("summary") or {}).get("requests") or 0)
+            exhausted, err_msg = self._detect_upstream_quota_exhausted_unlocked(today_key)
+            return compute_cohort_quota_metrics(
+                today_reqs,
+                self.cohort_daily_quota,
+                self.cohort_reserved_quota,
+                upstream_exhausted=exhausted,
+                last_upstream_quota_error=err_msg,
+            )
+
+    def _detect_upstream_quota_exhausted_unlocked(self, day_key: str) -> tuple[bool, str]:
+        last_ok_ts = 0
+        last_quota_err_ts = 0
+        last_quota_msg = ""
+        for rec in self._recent_requests:
+            if not isinstance(rec, dict):
+                continue
+            ts = int(rec.get("ts") or 0)
+            rec_day = str(rec.get("day") or "")
+            if not rec_day and ts > 0:
+                rec_day = self._day_key(now_ts=float(ts))
+            if rec_day != day_key:
+                continue
+            st = str(rec.get("status") or "ok")
+            code = int(rec.get("status_code") or 200)
+            if st == "ok" and code < 400:
+                if ts >= last_ok_ts:
+                    last_ok_ts = ts
+                continue
+            err_code = str(rec.get("error_code") or "").strip().lower()
+            if err_code in _LOCAL_CLIENT_QUOTA_CODES:
+                continue
+            raw_msg = str(rec.get("error_message") or rec.get("reply_preview") or "").strip()
+            low_msg = raw_msg.lower()
+            if (
+                err_code in {"quota_exceeded", "upstream_quota_exceeded", "resource_exhausted"}
+                or any(
+                    kw in low_msg
+                    for kw in (
+                        "text_answer_gen_tier",
+                        "quota exceeded",
+                        "quota limit",
+                        "resource_exhausted",
+                        "配额已用尽",
+                        "额度已用完",
+                    )
+                )
+            ):
+                if ts >= last_quota_err_ts:
+                    last_quota_err_ts = ts
+                    last_quota_msg = raw_msg[:180]
+        exhausted = bool(last_quota_err_ts > 0 and last_quota_err_ts >= last_ok_ts)
+        return exhausted, (last_quota_msg if exhausted else "")
 
     def _backfill_sidecar_path(self) -> Optional[Path]:
         return (self.storage_path.parent / "usage_backfill.json") if self.storage_path else None
@@ -638,6 +823,23 @@ class UsageLedger:
                 st_ns = self.storage_path.stat().st_mtime_ns
                 raw = json.loads(self.storage_path.read_text(encoding="utf-8"))
                 if isinstance(raw, dict):
+                    raw_ver = int(raw.get("version") or 1)
+                    q_cfg = raw.get("quota_config")
+                    if isinstance(q_cfg, dict):
+                        try:
+                            if q_cfg.get("cohort_daily_quota") is not None:
+                                self.cohort_daily_quota = max(10, min(500_000, int(q_cfg["cohort_daily_quota"])))
+                            if q_cfg.get("cohort_reserved_quota") is not None:
+                                self.cohort_reserved_quota = max(
+                                    0,
+                                    min(self.cohort_daily_quota - 1, int(q_cfg["cohort_reserved_quota"])),
+                                )
+                            self._quota_config_override = {
+                                "cohort_daily_quota": self.cohort_daily_quota,
+                                "cohort_reserved_quota": self.cohort_reserved_quota,
+                            }
+                        except (TypeError, ValueError):
+                            pass
                     self._archived = sanitize_group(raw.get("archived"))
                     reconcile_unattributed_host_tenant(self._archived)
                     if isinstance(raw.get("days"), dict):
@@ -648,9 +850,18 @@ class UsageLedger:
                                     dirty = True
                                 self._days[str(dk)] = grp
                     if isinstance(raw.get("recent_requests"), list):
-                        self._recent_requests = [
-                            x for x in raw["recent_requests"][-MAX_RECENT_REQUESTS:] if isinstance(x, dict)
-                        ]
+                        loaded_recents: List[Dict[str, Any]] = []
+                        for x in raw["recent_requests"][-MAX_RECENT_REQUESTS:]:
+                            if not isinstance(x, dict):
+                                continue
+                            item = dict(x)
+                            if raw_ver < LEDGER_SCHEMA_VERSION and isinstance(item.get("ts"), (int, float)) and item["ts"] > 0:
+                                new_dk = self._day_key(now_ts=float(item["ts"]))
+                                if item.get("day") != new_dk:
+                                    item["day"] = new_dk
+                                    dirty = True
+                            loaded_recents.append(item)
+                        self._recent_requests = loaded_recents
                 self._disk_mtime_ns = st_ns
             except Exception as exc:
                 logger.warning("读取本地账本 %s 失败（将重新初始化）: %s", self.storage_path, exc)
@@ -673,13 +884,16 @@ class UsageLedger:
                     old_group = self._days.pop(old_k, None)
                     if old_group:
                         merge_group_into(self._archived, old_group)
-            payload = {
-                "version": 1,
+            payload: Dict[str, Any] = {
+                "version": LEDGER_SCHEMA_VERSION,
+                "billing_timezone": self.billing_timezone_name,
                 "updated_at": int(time.time()),
                 "archived": self._archived,
                 "days": self._days,
                 "recent_requests": self._recent_requests[-MAX_RECENT_REQUESTS:],
             }
+            if self._quota_config_override:
+                payload["quota_config"] = dict(self._quota_config_override)
             atomic_write_json(self.storage_path, payload, mode=0o600, dir_mode=0o755)
             if self.storage_path.is_file():
                 self._disk_mtime_ns = self.storage_path.stat().st_mtime_ns
@@ -765,13 +979,15 @@ class UsageLedger:
         ctx_limit = int(context_limit or rate.context_window or DEFAULT_CONTEXT_WINDOW)
         ctx_tokens = int(context_tokens if context_tokens is not None else (p_tokens + c_tokens))
         util_pct = round(min(100.0, (ctx_tokens / max(ctx_limit, 1)) * 100.0), 2)
-        day_key = self._day_key(as_of_date)
         now_ts = int(time.time())
+        day_key = self._day_key(as_of_date, now_ts=float(now_ts))
         eff_tid = (tenant_id or "host").strip() or "host"
         eff_tname = (tenant_name or "本机直连").strip() or "本机直连"
 
+        eff_tool_calls = max(0, int(tool_calls_count or 0))
         entry_delta: Dict[str, Any] = {
             "requests": 1,
+            "tool_calls": eff_tool_calls,
             "prompt_tokens": p_tokens,
             "cached_tokens": eff_cached,
             "delta_prompt_tokens": eff_delta,
@@ -958,8 +1174,8 @@ class UsageLedger:
     ) -> Dict[str, Any]:
         """Record a blocked, rate-limited, or failed request into the task audit log without billing tokens."""
         norm_task = task_type if task_type in TASK_LABELS else "chat"
-        day_key = self._day_key(as_of_date)
         now_ts = int(time.time())
+        day_key = self._day_key(as_of_date, now_ts=float(now_ts))
         eff_tid = (tenant_id or "host").strip() or "host"
         eff_tname = (tenant_name or "本机直连").strip() or "本机直连"
         canonical_model = resolve_canonical_billing_model(requested_model=requested_model)
@@ -1031,7 +1247,8 @@ class UsageLedger:
         include_catalog: bool = False,
     ) -> Dict[str, Any]:
         """Build a consistent snapshot across all time windows, models, tasks, and daily series."""
-        day_key = self._day_key(as_of_date)
+        now_ts = time.time()
+        day_key = self._day_key(as_of_date, now_ts=now_ts)
         try:
             anchor_date = date.fromisoformat(day_key)
         except ValueError:
@@ -1039,6 +1256,15 @@ class UsageLedger:
         yesterday_key = (anchor_date - timedelta(days=1)).isoformat()
         start_7d_key = (anchor_date - timedelta(days=6)).isoformat()
         start_30d_key = (anchor_date - timedelta(days=29)).isoformat()
+
+        billing_info = billing_window_info(
+            now_ts=now_ts,
+            billing_tz_name=self.billing_timezone_name,
+            local_tz_name=self.timezone_name,
+        )
+        if as_of_date is not None:
+            billing_info["billing_day"] = day_key
+            billing_info["yesterday_billing_day"] = yesterday_key
 
         canonical_active = resolve_canonical_billing_model(
             default_model if not active_model_hint else None,
@@ -1077,19 +1303,58 @@ class UsageLedger:
             last_30d_enriched = self._enrich_group(last_30d_group)
             session_enriched = self._enrich_group(session_group)
 
+            exhausted_today, exhausted_msg = self._detect_upstream_quota_exhausted_unlocked(day_key)
+            cohort_quota = compute_cohort_quota_metrics(
+                int(today_enriched["summary"].get("requests") or 0),
+                self.cohort_daily_quota,
+                self.cohort_reserved_quota,
+                upstream_exhausted=exhausted_today,
+                last_upstream_quota_error=exhausted_msg,
+            )
+            today_enriched["summary"]["usable_quota_pct"] = cohort_quota["usable_used_pct"]
+            today_enriched["summary"]["total_pool_pct"] = cohort_quota["total_pool_used_pct"]
+            yest_q = compute_cohort_quota_metrics(
+                int(yesterday_enriched["summary"].get("requests") or 0),
+                self.cohort_daily_quota,
+                self.cohort_reserved_quota,
+            )
+            yesterday_enriched["summary"]["usable_quota_pct"] = yest_q["usable_used_pct"]
+            yesterday_enriched["summary"]["total_pool_pct"] = yest_q["total_pool_used_pct"]
+
             by_day_recent: Dict[str, Dict[str, Any]] = {}
             daily_details: Dict[str, Dict[str, Any]] = {}
             sorted_days_desc = sorted(self._days.keys(), reverse=True)
             for dk in sorted_days_desc[:14]:
-                by_day_recent[dk] = enrich_bucket(self._days[dk]["summary"], self.usd_to_cny_rate)
+                eb = enrich_bucket(self._days[dk]["summary"], self.usd_to_cny_rate)
+                dq = compute_cohort_quota_metrics(
+                    int(eb.get("requests") or 0),
+                    self.cohort_daily_quota,
+                    self.cohort_reserved_quota,
+                )
+                eb["usable_quota_pct"] = dq["usable_used_pct"]
+                eb["total_pool_pct"] = dq["total_pool_used_pct"]
+                by_day_recent[dk] = eb
             for dk in sorted_days_desc:
-                daily_details[dk] = self._enrich_group(self._days[dk])
+                eg = self._enrich_group(self._days[dk])
+                dq = compute_cohort_quota_metrics(
+                    int(eg["summary"].get("requests") or 0),
+                    self.cohort_daily_quota,
+                    self.cohort_reserved_quota,
+                    upstream_exhausted=(exhausted_today if dk == day_key else False),
+                )
+                eg["summary"]["usable_quota_pct"] = dq["usable_used_pct"]
+                eg["summary"]["total_pool_pct"] = dq["total_pool_used_pct"]
+                eg["quota"] = dq
+                daily_details[dk] = eg
 
             result: Dict[str, Any] = {
                 "token_count_source": "local_estimate_not_google_billing",
                 "today_date": day_key,
                 "yesterday_date": yesterday_key,
                 "timezone": self.timezone_name,
+                "billing_timezone": self.billing_timezone_name,
+                "billing_cycle": billing_info,
+                "cohort_quota": cohort_quota,
                 "started_at": self._started_at,
                 "usd_to_cny_rate": self.usd_to_cny_rate,
                 "media_unit_rates_usd": {
@@ -1142,7 +1407,7 @@ def backfill_pre_update_usage(
     root_dir = l_path.resolve().parent.parent if l_path.parent.name == ".cache" else l_path.resolve().parent
     us_path = Path(legacy_stats_path) if legacy_stats_path else (root_dir / "usage_stats.json")
     cp_dir = Path(copilot_dir) if copilot_dir else (Path.home() / ".copilot")
-    tz_obj = resolve_timezone(DEFAULT_TIMEZONE)
+    tz_obj = resolve_timezone(DEFAULT_BILLING_TIMEZONE)
 
     reconstructed_days: Dict[str, Dict[str, Any]] = {}
 
@@ -1312,7 +1577,8 @@ def backfill_pre_update_usage(
     sidecar_path = l_path.parent / "usage_backfill.json"
     sidecar_path.parent.mkdir(parents=True, exist_ok=True)
     sidecar_payload = {
-        "version": 1,
+        "version": LEDGER_SCHEMA_VERSION,
+        "billing_timezone": DEFAULT_BILLING_TIMEZONE,
         "generated_at": int(time.time()),
         "cutoff_day": cutoff_day,
         "days": {k: reconstructed_days[k] for k in sorted(reconstructed_days.keys())},
@@ -1331,17 +1597,249 @@ def backfill_pre_update_usage(
     }
 
 
+def migrate_ledger_to_billing_days(
+    ledger_path: Union[Path, str],
+    copilot_dir: Optional[Union[Path, str]] = None,
+    cutoff_day: str = "2026-11-17",
+    bridge_provider_ids: Sequence[str] = ("3126a75e-77bb-4baa-b663-6abcc2cdb5a7",),
+    excluded_provider_ids: Sequence[str] = (
+        "695be4fc-bb13-4327-8c59-6bd91242b42d",
+        "9877533f-9a89-4594-b562-9f70eea0ee41",
+    ),
+    price_overrides: Optional[Dict[str, Dict[str, Any]]] = None,
+) -> Dict[str, Any]:
+    """Re-bucket historical local usage into 00:00 America/Los_Angeles (16:00 Shanghai) billing days."""
+    import sqlite3
+
+    l_path = Path(ledger_path)
+    cp_dir = Path(copilot_dir) if copilot_dir else (Path.home() / ".copilot")
+    b_tz = resolve_timezone(DEFAULT_BILLING_TIMEZONE)
+    img_usd = DEFAULT_IMAGE_UNIT_USD
+    vid_usd = DEFAULT_VIDEO_UNIT_USD
+
+    old_raw: Dict[str, Any] = {}
+    if l_path.is_file():
+        try:
+            old_raw = json.loads(l_path.read_text(encoding="utf-8"))
+        except Exception:
+            old_raw = {}
+
+    old_days = (old_raw.get("days") or {}) if isinstance(old_raw, dict) else {}
+    old_recents = (old_raw.get("recent_requests") or []) if isinstance(old_raw, dict) else []
+    quota_cfg = old_raw.get("quota_config") if isinstance(old_raw, dict) else None
+
+    # Reconstruct timestamp-accurate billing days from Copilot session-store.db
+    rebuilt_days: Dict[str, Dict[str, Any]] = {}
+    copilot_shanghai_days: Dict[str, Dict[str, Any]] = {}
+    sh_tz = resolve_timezone(DEFAULT_TIMEZONE)
+    ss_db = cp_dir / "session-store.db"
+    data_db = cp_dir / "data.db"
+    sess_pid: Dict[str, Optional[str]] = {}
+    if data_db.is_file():
+        try:
+            con_d = sqlite3.connect(f"file:{data_db}?mode=ro", uri=True)
+            for sid, pid in con_d.execute("SELECT id, provider_id FROM sessions").fetchall():
+                sess_pid[str(sid)] = str(pid) if pid else None
+            con_d.close()
+        except Exception as exc:
+            logger.warning("读取 Copilot data.db 失败: %s", exc)
+
+    max_copilot_ts_by_day: Dict[str, float] = {}
+    if ss_db.is_file():
+        con_s = sqlite3.connect(f"file:{ss_db}?mode=ro", uri=True)
+        rows = con_s.execute(
+            """
+            SELECT session_id, created_at, model, api_endpoint, input_tokens, output_tokens
+            FROM assistant_usage_events
+            WHERE token_details_json IS NULL
+              AND (total_nano_aiu IS NULL OR total_nano_aiu = 0)
+              AND lower(COALESCE(model, '')) LIKE '%gemini%'
+            ORDER BY created_at, id
+            """
+        ).fetchall()
+        con_s.close()
+        excluded_set = set(excluded_provider_ids)
+        bridge_set = set(bridge_provider_ids)
+        sess_state: Dict[str, Dict[str, Any]] = {}
+        for sid_raw, ca_raw, m_raw, ep_raw, inp_raw, out_raw in rows:
+            sid = str(sid_raw or "")
+            pid = sess_pid.get(sid)
+            m_str = str(m_raw or "")
+            if pid in excluded_set:
+                continue
+            if bridge_set and pid is not None and pid not in bridge_set and not m_str.lower().startswith("gemini-enterprise"):
+                continue
+            s_ca = str(ca_raw or "").strip()
+            if not s_ca:
+                continue
+            raw_dt = datetime.fromisoformat((s_ca.replace("Z", "+00:00") if "T" in s_ca else s_ca + "+00:00"))
+            dt = raw_dt.astimezone(b_tz)
+            sh_dk = raw_dt.astimezone(sh_tz).strftime("%Y-%m-%d")
+            dk = dt.strftime("%Y-%m-%d")
+            ts = dt.timestamp()
+            max_copilot_ts_by_day[dk] = max(max_copilot_ts_by_day.get(dk, 0.0), ts)
+            p_tok = max(0, int(inp_raw or 0))
+            c_tok = max(0, int(out_raw or 0))
+            canon_m = resolve_canonical_billing_model(m_str)
+            task_k = "responses" if str(ep_raw or "").strip() == "/responses" else "chat"
+            prev = sess_state.get(sid)
+            if (
+                prev
+                and prev["model"] == canon_m
+                and p_tok >= prev["p"] * 0.85
+                and prev["ctx"] < DEFAULT_CONTEXT_WINDOW
+                and (ts - prev["ts"]) <= 1800
+            ):
+                eff_cached = min(p_tok, prev["ctx"])
+                eff_delta = max(0, p_tok - eff_cached)
+            else:
+                eff_cached = 0
+                eff_delta = p_tok
+            sess_state[sid] = {"p": p_tok, "ctx": p_tok + c_tok, "ts": ts, "model": canon_m}
+            rate = get_model_pricing(canon_m, prompt_tokens=p_tok, overrides=price_overrides)
+            uncached_usd = (p_tok / 1_000_000.0) * rate.input_per_1m + (c_tok / 1_000_000.0) * rate.output_per_1m
+            cached_usd = (
+                (eff_cached / 1_000_000.0) * rate.cached_input_per_1m
+                + (eff_delta / 1_000_000.0) * rate.input_per_1m
+                + (c_tok / 1_000_000.0) * rate.output_per_1m
+            )
+            delta_b = {
+                "requests": 1,
+                "prompt_tokens": p_tok,
+                "cached_tokens": eff_cached,
+                "delta_prompt_tokens": eff_delta,
+                "completion_tokens": c_tok,
+                "total_tokens": p_tok + c_tok,
+                "images_generated": 0,
+                "videos_generated": 0,
+                "audio_requests": 0,
+                "compactions": 0,
+                "equivalent_cost_usd": round(uncached_usd, 8),
+                "cached_equivalent_cost_usd": round(cached_usd, 8),
+            }
+            ev_grp = {
+                "summary": delta_b,
+                "by_model": {canon_m: dict(delta_b)},
+                "by_task": {task_k: dict(delta_b)},
+                "by_tenant": {
+                    "host": {
+                        "tenant_name": "本机直连",
+                        "errors": 0,
+                        "summary": dict(delta_b),
+                        "by_model": {canon_m: dict(delta_b)},
+                        "by_task": {task_k: dict(delta_b)},
+                    }
+                },
+            }
+            merge_group_into(rebuilt_days.setdefault(dk, empty_group()), ev_grp)
+            merge_group_into(copilot_shanghai_days.setdefault(sh_dk, empty_group()), ev_grp)
+
+    # Preserve non-Copilot residual usage & special media counts from legacy Shanghai day buckets
+    for old_dk, old_dg_raw in old_days.items():
+        if not isinstance(old_dg_raw, dict):
+            continue
+        old_dg = sanitize_group(old_dg_raw)
+        cp_sh_dg = copilot_shanghai_days.get(str(old_dk)) or empty_group()
+        rem_sum = _subtract_bucket(old_dg["summary"], cp_sh_dg["summary"])
+        has_extra = any(int(rem_sum.get(k) or 0) > 0 for k in _BUCKET_INT_KEYS)
+        if has_extra:
+            rem_grp = empty_group()
+            rem_grp["summary"] = rem_sum
+            for mk, mb in old_dg["by_model"].items():
+                rb = _subtract_bucket(mb, cp_sh_dg["by_model"].get(mk) or empty_bucket())
+                if any(int(rb.get(k) or 0) > 0 for k in _BUCKET_INT_KEYS):
+                    rem_grp["by_model"][mk] = rb
+            for tk, tb in old_dg["by_task"].items():
+                rb = _subtract_bucket(tb, cp_sh_dg["by_task"].get(tk) or empty_bucket())
+                if any(int(rb.get(k) or 0) > 0 for k in _BUCKET_INT_KEYS):
+                    rem_grp["by_task"][tk] = rb
+            for tid, t_grp in old_dg["by_tenant"].items():
+                cp_t = cp_sh_dg["by_tenant"].get(tid) or empty_tenant_group(t_grp.get("tenant_name") or tid)
+                rt_sum = _subtract_bucket(t_grp["summary"], cp_t["summary"])
+                if any(int(rt_sum.get(k) or 0) > 0 for k in _BUCKET_INT_KEYS):
+                    nt = empty_tenant_group(t_grp.get("tenant_name") or tid)
+                    nt["summary"] = rt_sum
+                    rem_grp["by_tenant"][tid] = nt
+            reconcile_unattributed_host_tenant(rem_grp)
+            merge_group_into(rebuilt_days.setdefault(str(old_dk), empty_group()), rem_grp)
+
+    # Normalize recent_requests day keys and fold error counts into rebuilt_days
+    normalized_recents: List[Dict[str, Any]] = []
+    for rec in old_recents:
+        if not isinstance(rec, dict):
+            continue
+        item = dict(rec)
+        ts_val = float(item.get("ts") or 0)
+        if ts_val > 0:
+            item["day"] = billing_day_key(ts_val, DEFAULT_BILLING_TIMEZONE)
+        b_dk = str(item.get("day") or "")
+        if b_dk and str(item.get("status") or "ok") != "ok":
+            tid = str(item.get("tenant_id") or "host")
+            tname = str(item.get("tenant_name") or "本机直连")
+            dg = rebuilt_days.setdefault(b_dk, empty_group())
+            tg = dg.setdefault("by_tenant", {}).setdefault(tid, empty_tenant_group(tname))
+            tg["errors"] = int(tg.get("errors") or 0) + 1
+        normalized_recents.append(item)
+
+    sidecar_path = l_path.parent / "usage_backfill.json"
+    sidecar_days = {k: rebuilt_days[k] for k in sorted(rebuilt_days.keys()) if k < cutoff_day}
+    atomic_write_json(
+        sidecar_path,
+        {
+            "version": LEDGER_SCHEMA_VERSION,
+            "billing_timezone": DEFAULT_BILLING_TIMEZONE,
+            "generated_at": int(time.time()),
+            "cutoff_day": cutoff_day,
+            "days": sidecar_days,
+        },
+        mode=0o600,
+        dir_mode=0o755,
+    )
+
+    new_payload: Dict[str, Any] = {
+        "version": LEDGER_SCHEMA_VERSION,
+        "billing_timezone": DEFAULT_BILLING_TIMEZONE,
+        "updated_at": int(time.time()),
+        "archived": sanitize_group(old_raw.get("archived") if isinstance(old_raw, dict) else None),
+        "days": {k: rebuilt_days[k] for k in sorted(rebuilt_days.keys())},
+        "recent_requests": normalized_recents[-MAX_RECENT_REQUESTS:],
+    }
+    if isinstance(quota_cfg, dict):
+        new_payload["quota_config"] = quota_cfg
+    bak_path = l_path.parent / "usage_ledger.v1.bak.json"
+    if l_path.is_file() and not bak_path.exists():
+        atomic_write_json(bak_path, old_raw, mode=0o600, dir_mode=0o755)
+    atomic_write_json(l_path, new_payload, mode=0o600, dir_mode=0o755)
+
+    reloaded = UsageLedger(storage_path=l_path, price_overrides=price_overrides)
+    snap = reloaded.snapshot()
+    return {
+        "migrated_days": sorted(rebuilt_days.keys()),
+        "today_billing_day": snap["today_date"],
+        "today_requests": snap["today"]["requests"],
+        "cohort_quota": snap["cohort_quota"],
+    }
+
+
 if __name__ == "__main__":
     import argparse
 
     parser = argparse.ArgumentParser(description="UsageLedger maintenance & historical backfill")
     parser.add_argument("--backfill", action="store_true", help="Backtest and merge pre-update usage history")
     parser.add_argument(
+        "--migrate-billing-day",
+        action="store_true",
+        help="Re-bucket ledger into 00:00 America/Los_Angeles (16:00 Shanghai) billing days",
+    )
+    parser.add_argument(
         "--ledger",
         default=str(Path(__file__).resolve().parent / ".cache" / "usage_ledger.json"),
         help="Path to usage_ledger.json",
     )
     args = parser.parse_args()
-    if args.backfill:
+    if args.migrate_billing_day:
+        res = migrate_ledger_to_billing_days(args.ledger)
+        print(json.dumps(res, ensure_ascii=False, indent=2))
+    elif args.backfill:
         res = backfill_pre_update_usage(args.ledger)
         print(json.dumps(res, ensure_ascii=False, indent=2))

@@ -116,6 +116,7 @@ from tool_calling import (
     normalize_request_tools,
     normalize_tool_choice,
     parse_assistant_output,
+    repair_swallowed_closing_tool_fence,
     split_text_slices,
 )
 
@@ -198,6 +199,9 @@ def create_app(
     usage_ledger = UsageLedger(
         storage_path=ledger_file,
         usd_to_cny_rate=cfg.usd_to_cny_rate,
+        billing_timezone_name=cfg.billing_timezone,
+        cohort_daily_quota=cfg.cohort_daily_quota,
+        cohort_reserved_quota=cfg.cohort_reserved_quota,
         price_overrides=price_overrides,
     )
     dist_file = cfg.distribution_path or (
@@ -1285,6 +1289,36 @@ def create_app(
             "tunnel": live_ledger["tunnel"],
             "sessions_overview": live_ledger["sessions_overview"],
         }
+
+    @app.post("/api/usage/quota-config", dependencies=[Depends(require_local_admin), Depends(verify_api_key)])
+    async def api_update_usage_quota_config(request: Request) -> JSONResponse:
+        try:
+            body = await request.json()
+        except Exception:
+            body = {}
+        if not isinstance(body, dict):
+            return JSONResponse(status_code=400, content={"ok": False, "detail": "请求体格式错误"})
+        raw_total = body.get("cohort_daily_quota")
+        raw_reserved = body.get("cohort_reserved_quota")
+        try:
+            parsed_total = int(raw_total) if raw_total is not None else None
+            parsed_reserved = int(raw_reserved) if raw_reserved is not None else None
+        except (TypeError, ValueError):
+            return JSONResponse(status_code=400, content={"ok": False, "detail": "配额数值必须为整数"})
+        if parsed_total is not None and (parsed_total < 10 or parsed_total > 500_000):
+            return JSONResponse(status_code=400, content={"ok": False, "detail": "总额度范围应为 10 ~ 500,000 次/日"})
+        if parsed_reserved is not None and parsed_reserved < 0:
+            return JSONResponse(status_code=400, content={"ok": False, "detail": "同学预留配额不能为负数"})
+        eff_total = parsed_total if parsed_total is not None else usage_ledger.cohort_daily_quota
+        eff_reserved = parsed_reserved if parsed_reserved is not None else usage_ledger.cohort_reserved_quota
+        if eff_reserved >= eff_total:
+            return JSONResponse(status_code=400, content={"ok": False, "detail": "给同学预留的配额必须小于全 Cohort 每日总额度"})
+        usage_ledger.update_quota_config(
+            cohort_daily_quota=parsed_total,
+            cohort_reserved_quota=parsed_reserved,
+        )
+        live_ledger = build_live_ledger_snapshot(include_catalog=False)
+        return JSONResponse(status_code=200, content={"ok": True, "usage": live_ledger["usage"]})
 
     @app.post("/api/slots/reset", dependencies=[Depends(require_local_admin), Depends(verify_api_key)])
     async def api_reset_worker_slot(request: Request) -> JSONResponse:
@@ -2983,6 +3017,20 @@ def create_app(
                                 raise DegenerateReplyError("网页返回了空回复，未生成有效内容或工具调用。")
                             return cand_out
                         except ToolProtocolError as trunc_exc:
+                            if not isinstance(trunc_exc, DegenerateReplyError) and tools_active:
+                                repaired_sync = repair_swallowed_closing_tool_fence(
+                                    raw_unstripped,
+                                    tools=norm_tools,
+                                    tool_choice=norm_tool_choice,
+                                    parallel_tool_calls=request.parallel_tool_calls,
+                                    response_format=request.response_format,
+                                )
+                                if repaired_sync is not None and repaired_sync.has_tool_calls:
+                                    logger.info(
+                                        "Recovered sync tool reply with swallowed/non-standard closing fence on slot=%s (calls=%d, chars=%d)",
+                                        session_key, len(repaired_sync.tool_calls), len(raw_unstripped),
+                                    )
+                                    return repaired_sync
                             if isinstance(trunc_exc, DegenerateReplyError) or not (
                                 tools_active and is_truncated_tool_protocol_error(trunc_exc, raw_unstripped)
                             ):
@@ -3422,12 +3470,35 @@ def create_app(
                                 try:
                                     tail_pieces, parsed = _finalize_stream_non_empty(processor)
                                 except ToolProtocolError as retry_exc:
-                                    if not isinstance(retry_exc, DegenerateReplyError) and (
+                                    repaired_retry = (
+                                        repair_swallowed_closing_tool_fence(
+                                            processor.raw_text,
+                                            tools=norm_tools,
+                                            tool_choice=norm_tool_choice,
+                                            parallel_tool_calls=request.parallel_tool_calls,
+                                            response_format=request.response_format,
+                                        )
+                                        if (not isinstance(retry_exc, DegenerateReplyError) and tools_active)
+                                        else None
+                                    )
+                                    if repaired_retry is not None and repaired_retry.has_tool_calls:
+                                        emitted_r = "".join(emitted_content)
+                                        if repaired_retry.content and not emitted_r:
+                                            tail_pieces = [repaired_retry.content]
+                                        elif repaired_retry.content and repaired_retry.content.startswith(emitted_r):
+                                            rem_r = repaired_retry.content[len(emitted_r) :]
+                                            tail_pieces = [rem_r] if rem_r else []
+                                        else:
+                                            tail_pieces = []
+                                        repaired_retry.content = (emitted_r + "".join(tail_pieces)).strip() or None
+                                        parsed = repaired_retry
+                                    elif not isinstance(retry_exc, DegenerateReplyError) and (
                                         emitted_content
                                         or (tools_active and is_truncated_tool_protocol_error(retry_exc, processor.raw_text))
                                     ):
                                         raise
-                                    parsed = None
+                                    else:
+                                        parsed = None
                                 except BrowserTaskFailure:
                                     if emitted_content:
                                         raise
@@ -3465,17 +3536,48 @@ def create_app(
                                 tail_pieces, parsed = _finalize_stream_non_empty(processor)
                     except ToolProtocolError as trunc_exc:
                         stream_raw_so_far = processor.raw_text
-                        if not (tools_active and is_truncated_tool_protocol_error(trunc_exc, stream_raw_so_far)):
-                            raise
-                        logger.warning(
-                            "Truncated streamed tool-call JSON on slot=%s (chars=%d); running seamless continuation...",
-                            session_key,
-                            len(stream_raw_so_far),
+                        repaired_stream = (
+                            repair_swallowed_closing_tool_fence(
+                                stream_raw_so_far,
+                                tools=norm_tools,
+                                tool_choice=norm_tool_choice,
+                                parallel_tool_calls=request.parallel_tool_calls,
+                                response_format=request.response_format,
+                            )
+                            if (not isinstance(trunc_exc, DegenerateReplyError) and tools_active)
+                            else None
                         )
-                        tail_pieces = []
-                        parsed = None
+                        if repaired_stream is not None and repaired_stream.has_tool_calls:
+                            logger.info(
+                                "Recovered streamed tool reply with swallowed/non-standard closing fence on slot=%s (calls=%d, chars=%d)",
+                                session_key, len(repaired_stream.tool_calls), len(stream_raw_so_far),
+                            )
+                            emitted_str = "".join(emitted_content)
+                            if repaired_stream.content and not emitted_str:
+                                tail_pieces = [repaired_stream.content]
+                            elif repaired_stream.content and repaired_stream.content.startswith(emitted_str):
+                                rem_t = repaired_stream.content[len(emitted_str) :]
+                                tail_pieces = [rem_t] if rem_t else []
+                            else:
+                                tail_pieces = []
+                            repaired_stream.content = (emitted_str + "".join(tail_pieces)).strip() or None
+                            parsed = repaired_stream
+                        elif not (tools_active and is_truncated_tool_protocol_error(trunc_exc, stream_raw_so_far)):
+                            logger.warning(
+                                "Unrecoverable ToolProtocolError on slot=%s (chars=%d, tail=%r): %s",
+                                session_key, len(stream_raw_so_far), stream_raw_so_far[-180:], trunc_exc,
+                            )
+                            raise
+                        else:
+                            logger.warning(
+                                "Truncated streamed tool-call JSON on slot=%s (chars=%d); running seamless continuation...",
+                                session_key,
+                                len(stream_raw_so_far),
+                            )
+                            tail_pieces = []
+                            parsed = None
                         accum_raw = stream_raw_so_far
-                        for leg in range(2):
+                        for leg in (range(2) if parsed is None else ()): 
                             cont_chunks: list[str] = []
                             cont_stream = hub.dispatch_stream_on_slot(
                                 slot=slot,
@@ -3532,13 +3634,25 @@ def create_app(
                                 elif time.monotonic() - last_sse_ts >= 12.0:
                                     yield ": keepalive\n\n"
                                     last_sse_ts = time.monotonic()
-                            parsed = parse_assistant_output(
-                                "".join(rw_chunks), tools=norm_tools, tool_choice=norm_tool_choice,
-                                parallel_tool_calls=request.parallel_tool_calls,
-                                response_format=request.response_format,
-                            )
-                        emitted_preamble = "".join(emitted_content).strip()
-                        parsed.content = emitted_preamble or (None if parsed.has_tool_calls else "")
+                            rw_raw = "".join(rw_chunks)
+                            try:
+                                parsed = parse_assistant_output(
+                                    rw_raw, tools=norm_tools, tool_choice=norm_tool_choice,
+                                    parallel_tool_calls=request.parallel_tool_calls,
+                                    response_format=request.response_format,
+                                )
+                            except ToolProtocolError:
+                                rw_repaired = repair_swallowed_closing_tool_fence(
+                                    rw_raw, tools=norm_tools, tool_choice=norm_tool_choice,
+                                    parallel_tool_calls=request.parallel_tool_calls,
+                                    response_format=request.response_format,
+                                )
+                                if rw_repaired is None:
+                                    raise
+                                parsed = rw_repaired
+                        if repaired_stream is None:
+                            emitted_preamble = "".join(emitted_content).strip()
+                            parsed.content = emitted_preamble or (None if parsed.has_tool_calls else "")
 
                     if not handoff_cleanup_triggered and superseded_compactions:
                         handoff_cleanup_triggered = True

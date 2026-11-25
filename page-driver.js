@@ -1,7 +1,7 @@
 // MAIN-world driver: DOM controls the composer; the original RPC is the only reply source.
 
 (() => {
-  const DRIVER_VERSION = "2.8.9";
+  const DRIVER_VERSION = "2.9.1";
 
   // Optional Trusted Types policy (gracefully guarded if CSP `trusted-types` header restricts custom policy names;
   // all DOM mutations below strictly use `replaceChildren` + `createElement` + `textContent` and ZERO `innerHTML`!)
@@ -267,21 +267,54 @@
     }
   }
 
+  const CONTROL_TOKEN_SRC = "<(?:(?:start|end)_of_(?:image|audio|video|turn)|(?:image|audio|video)_soft_token|eos|pad)>";
+  const CONTROL_TOKEN_RE = new RegExp(CONTROL_TOKEN_SRC, "gi");
+  const HSPACE_SRC = "[ \\t\\u00a0\\u200b\\u200c\\u200d\\ufeff]*";
+  const DECOR_TOKEN_SRC = "(?:\\[\\[section:[^\\r\\n]*?\\]\\]|" + CONTROL_TOKEN_SRC + ")";
+  const CLOSING_INLINE_DECOR_SRC =
+    "(?:\\[\\[(?!suggested_questions\\b|section:suggested_questions\\b)section:[^\\r\\n]*?\\]\\]|" +
+    CONTROL_TOKEN_SRC +
+    "|\\[\\d+(?:[ \\t]*,[ \\t]*\\d+)*\\])";
+  const CLOSING_ANY_DECOR_SRC =
+    "(?:\\[\\[(?:section:[^\\r\\n]*?|suggested_questions|section:suggested_questions)\\]\\]|" +
+    CONTROL_TOKEN_SRC +
+    "|\\[\\d+(?:[ \\t]*,[ \\t]*\\d+)*\\])";
+  const ADJOINED_NEXT_CALL_SRC =
+    "`{3,}" + HSPACE_SRC + "(?:" + DECOR_TOKEN_SRC + HSPACE_SRC + ")*codex_tool_call\\b";
+  const ADJOINED_NEXT_CALL_HEAD_RE = new RegExp("^" + ADJOINED_NEXT_CALL_SRC, "i");
+
+  function stableToolValue(value) {
+    if (Array.isArray(value)) return value.map(stableToolValue);
+    if (value && typeof value === "object") {
+      return Object.fromEntries(Object.keys(value).sort().map((key) => [key, stableToolValue(value[key])]));
+    }
+    return value;
+  }
+
   function stripTrailingWebSuggestions(text) {
-    const raw = String(text || "").replace(
-      /(^[ \t]{0,3}```[ \t]*)(?=(?:`{3,}|~{3,})[ \t]*suggested_questions\b|\[\[(?:suggested_questions|section:suggested_questions)\]\])/gim,
-      "$1\n"
+    const adjoinedSuggestRe = new RegExp(
+      "(^[ \\t]{0,3}```" +
+        HSPACE_SRC +
+        "(?:" +
+        DECOR_TOKEN_SRC +
+        HSPACE_SRC +
+        ")*)(?=(?:`{3,}|~{3,})" +
+        HSPACE_SRC +
+        "suggested_questions\\b|\\[\\[(?:suggested_questions|section:suggested_questions)\\]\\])",
+      "gim"
     );
+    const raw = String(text || "").replace(adjoinedSuggestRe, "$1\n");
     const lines = raw.split("\n");
     const kept = [];
     let outerFence = "";
     let skipSuggestionFence = "";
-    const fenceLineRe = /^[ \t]{0,3}(`{3,}|~{3,})([^\r\n]*)\r?$/;
+    const fenceLineRe = /^[ \t ​‌‍﻿]{0,3}(`{3,}|~{3,})([^\r\n]*)\r?$/;
 
     for (let i = 0; i < lines.length; i += 1) {
       const line = lines[i];
+      const cleanedLine = line.replace(/\[\[section:[^\]]*\]\]/gi, "").replace(CONTROL_TOKEN_RE, "");
       if (skipSuggestionFence) {
-        const mClose = line.match(fenceLineRe);
+        const mClose = cleanedLine.match(fenceLineRe);
         if (
           mClose &&
           mClose[1][0] === skipSuggestionFence[0] &&
@@ -292,10 +325,14 @@
         }
         continue;
       }
-      if (!outerFence && /^[ \t]*\[\[(?:suggested_questions|section:suggested_questions)\]\]/i.test(line)) {
+      if (
+        !outerFence &&
+        /^[ \t ​‌‍﻿]*\[\[(?:suggested_questions|section:suggested_questions)\]\]/i.test(
+          line.replace(CONTROL_TOKEN_RE, "")
+        )
+      ) {
         break;
       }
-      const cleanedLine = line.replace(/\[\[section:[^\]]*\]\]/gi, "");
       const mFence = cleanedLine.match(fenceLineRe);
       if (!outerFence) {
         if (mFence && /^suggested_questions(?:\b|$)/i.test(mFence[2].trim())) {
@@ -319,14 +356,61 @@
   }
 
   function stripExplicitWebDecorations(text) {
-    return stripTrailingWebSuggestions(text).replace(/\[\[section:[^\]]*\]\]/gi, "\n\n");
+    return stripTrailingWebSuggestions(text)
+      .replace(/\[\[section:[^\]]*\]\]/gi, "\n\n")
+      .replace(CONTROL_TOKEN_RE, "");
   }
 
-  function replaceClientToolFences(text, replace) {
-    const opening = /(?:^[ \t]{0,3}|(?:\[\[section:[^\r\n]*?\]\][ \t]*)+)(?:\[\[section:[^\r\n]*?\]\][ \t]*)*(`{3,}|~{3,})([^\r\n]*)\r?$/gmi;
-    const adjoinedHeadRe = /[ \t]*(?:\[\[section:[^\r\n]*?\]\][ \t]*)*(`{3,}|~{3,})([^\r\n]*)\r?$/ymi;
-    const wsOrSectionRe = /(?:\s+|\[\[section:[^\r\n]*?\]\])+/yi;
-    const exactCloseRe = /(?:```[ \t]*(?:\[\[section:[^\r\n]*?\]\][ \t]*)*(?:(?:`{3,}|~{3,})[ \t]*)?suggested_questions\b[^\r\n]*(?:\r?\n[\s\S]*?^[ \t]{0,3}(?:`{3,}|~{3,})[ \t]*\r?$|\r?\n[\s\S]*$|\r?$)|```[ \t]*(?:\[\[section:[^\r\n]*?\]\][ \t]*)*(?=`{3}[ \t]*codex_tool_call\b)|```[ \t]*(?=(?:\[\[(?:section:[^\r\n]*?|suggested_questions|section:suggested_questions)\]\][ \t]*(?:\r?$|\r?\n)|\r?$|\r?\n)))/ymi;
+  function replaceClientToolFences(text, replace, onSpan = null) {
+    const opening = new RegExp(
+      "(?:^[ \\t\\u00a0\\u200b\\u200c\\u200d\\ufeff]{0,3}|(?:" +
+        DECOR_TOKEN_SRC +
+        HSPACE_SRC +
+        ")+)(?:" +
+        DECOR_TOKEN_SRC +
+        HSPACE_SRC +
+        ")*(`{3,}|~{3,})([^\\r\\n]*)\\r?$",
+      "gmi"
+    );
+    const adjoinedHeadRe = new RegExp(
+      HSPACE_SRC + "(?:" + DECOR_TOKEN_SRC + HSPACE_SRC + ")*(`{3,}|~{3,})([^\\r\\n]*)\\r?$",
+      "ymi"
+    );
+    const wsOrSectionRe = new RegExp("(?:[\\s\\u00a0\\u200b\\u200c\\u200d\\ufeff]+|" + DECOR_TOKEN_SRC + ")+", "yi");
+    const exactCloseRe = new RegExp(
+      "(?:```" +
+        HSPACE_SRC +
+        "(?:" +
+        CLOSING_ANY_DECOR_SRC +
+        HSPACE_SRC +
+        ")*(?:(?:`{3,}|~{3,})" +
+        HSPACE_SRC +
+        ")?suggested_questions\\b[^\\r\\n]*(?:\\r?\\n[\\s\\S]*?^[ \\t]{0,3}(?:`{3,}|~{3,})[ \\t]*\\r?$|\\r?\\n[\\s\\S]*$|\\r?$)|```" +
+        HSPACE_SRC +
+        "(?:" +
+        CLOSING_ANY_DECOR_SRC +
+        HSPACE_SRC +
+        ")*(?=" +
+        ADJOINED_NEXT_CALL_SRC +
+        ")|```" +
+        HSPACE_SRC +
+        "(?:" +
+        CLOSING_INLINE_DECOR_SRC +
+        HSPACE_SRC +
+        ")*(?:---+" +
+        HSPACE_SRC +
+        "(?:" +
+        CLOSING_INLINE_DECOR_SRC +
+        HSPACE_SRC +
+        ")*)?(?=(?:\\[\\[(?:suggested_questions|section:suggested_questions)\\]\\]" +
+        HSPACE_SRC +
+        "(?:" +
+        CLOSING_ANY_DECOR_SRC +
+        HSPACE_SRC +
+        ")*(?:\\r?$|\\r?\\n)|\\r?$|\\r?\\n)))",
+      "ymi"
+    );
+    const decorCleanRe = new RegExp(DECOR_TOKEN_SRC, "gi");
     let cursor = 0, searchFrom = 0, adjoinedNext = false, output = "";
     while (true) {
       let match = null;
@@ -344,7 +428,7 @@
       }
       if (!match) break;
       const fence = match[1];
-      const language = match[2].replace(/\[\[section:[^\]]*\]\]/gi, "").trim().toLowerCase();
+      const language = match[2].replace(decorCleanRe, "").trim().toLowerCase();
       const closing = new RegExp("^[ \\t]{0,3}" + fence[0] + "{" + fence.length + ",}[ \\t]*\\r?$", "gm");
       closing.lastIndex = matchEnd;
       if (language !== "codex_tool_call" || fence !== "```") {
@@ -386,41 +470,109 @@
         const midWs = wsOrSectionRe.exec(text);
         if (midWs) pos = wsOrSectionRe.lastIndex;
       }
+      const findSupersededRetryStart = (fromIdx, candidateValues, rawPrefix) => {
+        const probeOpen = new RegExp(opening.source, "gmi");
+        probeOpen.lastIndex = fromIdx;
+        let nxt;
+        while ((nxt = probeOpen.exec(text))) {
+          const nxtLang = nxt[2].replace(decorCleanRe, "").trim().toLowerCase();
+          if (nxtLang !== "codex_tool_call" || nxt[1] !== "```") continue;
+          const tailSlice = text.slice(nxt.index);
+          const laterSpans = [];
+          const strippedTail = replaceClientToolFences(
+            tailSlice,
+            () => "",
+            (sStart, sEnd, sVals) => {
+              laterSpans.push({
+                start: sStart,
+                end: sEnd,
+                fps: sVals.map((v) => JSON.stringify(stableToolValue(v)))
+              });
+            }
+          );
+          if (laterSpans.length === 0 || /`{3,}[ \t]*codex_tool_call\b/i.test(strippedTail)) {
+            return -1;
+          }
+          const laterSet = new Set(laterSpans.flatMap((s) => s.fps));
+          if (candidateValues && candidateValues.length > 0) {
+            const allPresent = candidateValues.every(
+              (v) => v && typeof v === "object" && laterSet.has(JSON.stringify(stableToolValue(v)))
+            );
+            if (allPresent) return nxt.index;
+          } else if (rawPrefix && rawPrefix.startsWith("{") && rawPrefix.length >= 12) {
+            let innerIdx = nxt.index + nxt[0].length;
+            wsOrSectionRe.lastIndex = innerIdx;
+            const innerLead = wsOrSectionRe.exec(text);
+            if (innerLead) innerIdx = wsOrSectionRe.lastIndex;
+            if (text.slice(innerIdx).startsWith(rawPrefix)) return nxt.index;
+          }
+        }
+        return -1;
+      };
+
       if (!parseOk || parsedValues.length === 0) {
+        const rawPrefix = parsedValues.length === 0 ? text.slice(pos).split(/\r?\n/)[0].trim() : "";
+        const retryIdx = rawPrefix ? findSupersededRetryStart(pos, null, rawPrefix) : -1;
+        if (retryIdx >= 0) {
+          output += text.slice(cursor, match.index);
+          cursor = retryIdx;
+          searchFrom = retryIdx;
+          continue;
+        }
         searchFrom = matchEnd;
         continue;
       }
       exactCloseRe.lastIndex = pos;
       const close = exactCloseRe.exec(text);
       if (!close) {
+        const retryIdx = findSupersededRetryStart(pos, parsedValues, "");
+        if (retryIdx >= 0) {
+          output += text.slice(cursor, match.index);
+          cursor = retryIdx;
+          searchFrom = retryIdx;
+          continue;
+        }
         searchFrom = matchEnd;
         continue;
       }
+      const closeEnd = exactCloseRe.lastIndex;
+      if (typeof onSpan === "function") {
+        onSpan(match.index, closeEnd, parsedValues);
+      }
       output += text.slice(cursor, match.index) + parsedValues.map((v) => replace(v)).join("\n");
-      cursor = exactCloseRe.lastIndex;
+      cursor = closeEnd;
       searchFrom = cursor;
-      if (/^`{3}[ \t]*codex_tool_call\b/i.test(text.slice(cursor))) {
+      if (ADJOINED_NEXT_CALL_HEAD_RE.test(text.slice(cursor))) {
         adjoinedNext = true;
       }
     }
     return output + text.slice(cursor);
   }
 
-  function replyFingerprint(text) {
-    const stable = (value) => {
-      if (Array.isArray(value)) return value.map(stable);
-      if (value && typeof value === "object") {
-        return Object.fromEntries(Object.keys(value).sort().map((key) => [key, stable(value[key])]));
+  function collectClientToolSpans(text) {
+    const spans = [];
+    replaceClientToolFences(
+      String(text || ""),
+      () => "",
+      (start, end, values) => {
+        spans.push({
+          start,
+          end,
+          fingerprints: values.map((v) => "CLIENT_CALL:" + JSON.stringify(stableToolValue(v)))
+        });
       }
-      return value;
-    };
+    );
+    return spans;
+  }
+
+  function replyFingerprint(text) {
     text = String(text || "");
     // Protect command strings before stripping webpage decorations from prose.
     let marker = "\0GEB_CALL";
     while (text.includes(marker)) marker += "_";
     const calls = [];
     const remember = (value) => {
-      calls.push(JSON.stringify(stable(value)));
+      calls.push(JSON.stringify(stableToolValue(value)));
       return marker + (calls.length - 1) + "\0";
     };
     text = replaceClientToolFences(text, remember);
@@ -436,7 +588,26 @@
   }
 
   function findLastUnclosedToolFence(text) {
-    const opening = /(?:^[ \t]{0,3}|(?:\[\[section:[^\r\n]*?\]\][ \t]*)+)```[ \t]*(?:\[\[section:[^\r\n]*?\]\][ \t]*)*codex_tool_call(?:[ \t]*\[\[section:[^\r\n]*?\]\])*[ \t]*\r?$/gmi;
+    const opening = new RegExp(
+      "(?:^[ \\t\\u00a0\\u200b\\u200c\\u200d\\ufeff]{0,3}|(?:" +
+        DECOR_TOKEN_SRC +
+        HSPACE_SRC +
+        ")+)(?:" +
+        DECOR_TOKEN_SRC +
+        HSPACE_SRC +
+        ")*```" +
+        HSPACE_SRC +
+        "(?:" +
+        DECOR_TOKEN_SRC +
+        HSPACE_SRC +
+        ")*codex_tool_call(?:" +
+        HSPACE_SRC +
+        DECOR_TOKEN_SRC +
+        ")*" +
+        HSPACE_SRC +
+        "\\r?$",
+      "gmi"
+    );
     let m, lastOpen = -1;
     while ((m = opening.exec(text))) {
       const tailProbe = text.slice(m.index);
@@ -445,6 +616,89 @@
       }
     }
     return lastOpen;
+  }
+
+  function computePureAppendToolCloseSuffix(text) {
+    const raw = String(text || "");
+    const unclosedIdx = findLastUnclosedToolFence(raw);
+    if (unclosedIdx < 0) return "";
+    const tail = raw.slice(unclosedIdx);
+    const openRe = new RegExp(
+      "^(?:[ \\t\\u00a0\\u200b\\u200c\\u200d\\ufeff]{0,3}|(?:" +
+        DECOR_TOKEN_SRC +
+        HSPACE_SRC +
+        ")+)(?:" +
+        DECOR_TOKEN_SRC +
+        HSPACE_SRC +
+        ")*\u0060\u0060\u0060" +
+        HSPACE_SRC +
+        "(?:" +
+        DECOR_TOKEN_SRC +
+        HSPACE_SRC +
+        ")*codex_tool_call(?:" +
+        HSPACE_SRC +
+        DECOR_TOKEN_SRC +
+        ")*" +
+        HSPACE_SRC +
+        "\\r?(?:\\n|$)",
+      "i"
+    );
+    const openMatch = tail.match(openRe);
+    if (!openMatch) return "";
+    const wsOrSectionRe = new RegExp("(?:[\\s\\u00a0\\u200b\\u200c\\u200d\\ufeff]+|" + DECOR_TOKEN_SRC + ")+", "yi");
+    let pos = openMatch[0].length;
+    wsOrSectionRe.lastIndex = pos;
+    if (wsOrSectionRe.exec(tail)) pos = wsOrSectionRe.lastIndex;
+    if (tail[pos] !== "{") return "";
+    let count = 0;
+    while (pos < tail.length && tail[pos] === "{") {
+      let depth = 0, quoted = false, escaped = false, end = pos;
+      for (; end < tail.length; end += 1) {
+        const ch = tail[end];
+        if (quoted) {
+          if (escaped) escaped = false;
+          else if (ch === "\\") escaped = true;
+          else if (ch === '"') quoted = false;
+        } else if (ch === '"') quoted = true;
+        else if (ch === "{" || ch === "[") depth += 1;
+        else if ((ch === "}" || ch === "]") && --depth === 0) { end += 1; break; }
+      }
+      if (depth !== 0) return "";
+      let parsed;
+      try {
+        parsed = JSON.parse(tail.slice(pos, end));
+      } catch (_) {
+        return "";
+      }
+      if (
+        !parsed ||
+        typeof parsed !== "object" ||
+        Array.isArray(parsed) ||
+        typeof parsed.name !== "string" ||
+        !parsed.name.trim() ||
+        !parsed.arguments ||
+        typeof parsed.arguments !== "object" ||
+        Array.isArray(parsed.arguments)
+      ) {
+        return "";
+      }
+      count += 1;
+      pos = end;
+      wsOrSectionRe.lastIndex = pos;
+      if (wsOrSectionRe.exec(tail)) pos = wsOrSectionRe.lastIndex;
+    }
+    if (count === 0) return "";
+    const rem = tail.slice(pos);
+    let candidate = "";
+    if (!rem) {
+      candidate = raw.endsWith("\n") ? "\u0060\u0060\u0060" : "\n\u0060\u0060\u0060";
+    } else if (/^\u0060{1,2}$/.test(rem) && /(?:^|\n)[ \t]{0,3}$/.test(raw.slice(0, raw.length - rem.length))) {
+      candidate = "\u0060".repeat(3 - rem.length);
+    }
+    if (candidate && findLastUnclosedToolFence(raw + candidate) < 0) {
+      return candidate;
+    }
+    return "";
   }
 
   function extractSnapshotSuffixCore(snapshotText, existingText) {
@@ -503,10 +757,19 @@
     if (unclosedIdx >= 0) {
       const closeToken = existingText.endsWith("\n") ? "```" : "\n```";
       const closedProbe = existingText + closeToken;
-      if (replaceClientToolFences(closedProbe.slice(unclosedIdx), () => "") !== closedProbe.slice(unclosedIdx)) {
+      const probeSpans = collectClientToolSpans(closedProbe.slice(unclosedIdx));
+      if (probeSpans.length > 0) {
         const afterClose = extractSnapshotSuffixCore(cleanSnapshot, closedProbe);
         if (afterClose !== null) {
           return stripExplicitWebDecorations(afterClose).trim() ? closeToken + afterClose : closeToken;
+        }
+        const targetFp = probeSpans[probeSpans.length - 1].fingerprints.join("\n");
+        const snapSpans = collectClientToolSpans(cleanSnapshot);
+        for (let idx = snapSpans.length - 1; idx >= 0; idx -= 1) {
+          if (snapSpans[idx].fingerprints.join("\n") === targetFp) {
+            const tailAfter = cleanSnapshot.slice(snapSpans[idx].end);
+            return stripExplicitWebDecorations(tailAfter).trim() ? closeToken + tailAfter : closeToken;
+          }
         }
       }
       const prefixBefore = existingText.slice(0, unclosedIdx);
@@ -525,8 +788,42 @@
         }
         searchFrom = pos + 1;
       }
+      if (unclosedTail.length >= 24) {
+        const uniquePos = cleanSnapshot.indexOf(unclosedTail);
+        if (uniquePos >= 0 && cleanSnapshot.indexOf(unclosedTail, uniquePos + 1) === -1) {
+          return cleanSnapshot.slice(uniquePos + unclosedTail.length);
+        }
+      }
     }
     return null;
+  }
+
+  function hasHostToolParserIntercept(node) {
+    if (!node || typeof node !== "object") {
+      return false;
+    }
+    if (Array.isArray(node)) {
+      return node.some(hasHostToolParserIntercept);
+    }
+    for (const fnKey of ["functionCall", "functionResponse", "toolCall", "toolResponse"]) {
+      const callObj = node[fnKey];
+      if (callObj && typeof callObj === "object") {
+        const fnName = String(callObj.name || callObj.toolName || "").toLowerCase();
+        if (fnName.includes("invalid_tool_call_notifier")) {
+          return true;
+        }
+      }
+    }
+    for (const key of Object.keys(node)) {
+      if (key === "groundedContent" || key === "summaryText" || key === "parts") {
+        continue;
+      }
+      const child = node[key];
+      if (child && typeof child === "object" && hasHostToolParserIntercept(child)) {
+        return true;
+      }
+    }
+    return false;
   }
 
   function parseJsonPacketIntoJob(jsonObj, job, streamToken = null) {
@@ -535,6 +832,12 @@
     }
     if (streamToken && job.primaryStreamToken && job.primaryStreamToken !== streamToken) {
       return;
+    }
+    if (hasHostToolParserIntercept(jsonObj)) {
+      job.sawHostToolIntercept = true;
+      if (!job.primaryStreamToken && streamToken) {
+        job.primaryStreamToken = streamToken;
+      }
     }
     const texts = [];
     const refs = [];
@@ -556,17 +859,37 @@
           job.sawIncrementalDelta = true;
         }
         if (piece.snapshot && job.networkText) {
+          const hadUnclosedBefore = findLastUnclosedToolFence(job.networkText) >= 0;
           const snapshotSuffix = extractSnapshotSuffix(combined, job.networkText);
           if (snapshotSuffix !== null) {
-            if (snapshotSuffix && stripExplicitWebDecorations(snapshotSuffix).trim()) {
+            if (snapshotSuffix && (stripExplicitWebDecorations(snapshotSuffix).trim() || hadUnclosedBefore)) {
               job.networkText += snapshotSuffix;
               job.onNetworkDelta(snapshotSuffix);
             }
             continue;
           }
-          // Guard: never append a truncated/unclosed `summaryText` echo onto an already-streamed reply!
-          if (findLastUnclosedToolFence(combined) >= 0) {
+          // Guard: never append a truncated/unclosed `summaryText` echo or paste full prose inside an unclosed tool fence!
+          if (findLastUnclosedToolFence(combined) >= 0 || hadUnclosedBefore) {
             continue;
+          }
+          if (job.sawIncrementalDelta) {
+            const cleanSnap = stripTrailingWebSuggestions(combined);
+            const snapSpans = collectClientToolSpans(cleanSnap);
+            const existingSpans = collectClientToolSpans(job.networkText);
+            if (snapSpans.length > 0 && existingSpans.length > 0) {
+              const existingCallSet = new Set(existingSpans.flatMap((s) => s.fingerprints));
+              const snapCalls = snapSpans.flatMap((s) => s.fingerprints);
+              if (snapCalls.length > 0 && snapCalls.every((fp) => existingCallSet.has(fp))) {
+                const tailAfterTools = cleanSnap.slice(snapSpans[snapSpans.length - 1].end);
+                const cleanTail = stripExplicitWebDecorations(tailAfterTools).trim();
+                if (cleanTail && !stripExplicitWebDecorations(job.networkText).trim().endsWith(cleanTail)) {
+                  const tailSep = job.networkText.endsWith("\n") || tailAfterTools.startsWith("\n") ? "" : "\n";
+                  job.networkText += tailSep + tailAfterTools;
+                  job.onNetworkDelta(tailSep + tailAfterTools);
+                }
+                continue;
+              }
+            }
           }
         }
         // Distinguish cumulative full-text snapshots from incremental token deltas
@@ -755,6 +1078,16 @@
           !invalidPacket &&
           job.networkText
         ) {
+          if (job.sawHostToolIntercept) {
+            const unclosedAtEnd = findLastUnclosedToolFence(job.networkText);
+            if (unclosedAtEnd >= 0) {
+              const autoClose = job.networkText.endsWith("\n") ? "```" : "\n```";
+              if (collectClientToolSpans((job.networkText + autoClose).slice(unclosedAtEnd)).length > 0) {
+                job.networkText += autoClose;
+                job.onNetworkDelta(autoClose);
+              }
+            }
+          }
           if (findLastUnclosedToolFence(job.networkText) >= 0) {
             // Allow a continuation RPC leg to attach if the page is still streaming a long tool block
             job.primaryStreamToken = null;
@@ -3467,6 +3800,26 @@
         const activeStreamsOpen = Boolean(job.activeStreams && job.activeStreams.size > 0);
         const pageGen = isPageStillGenerating();
         const sinceDone = Date.now() - (job.networkDoneAt || lastActivityAt);
+        const pureCloseSuffix = computePureAppendToolCloseSuffix(job.networkText);
+        if (pureCloseSuffix) {
+          if (activeStreamsOpen && sinceDone < 8000) {
+            return false;
+          }
+          if (pageGen && sinceDone < 1500) {
+            return false;
+          }
+          if (latestDomCandidate) {
+            const domSuffix = extractSnapshotSuffix(latestDomCandidate, job.networkText);
+            if (domSuffix && findLastUnclosedToolFence(job.networkText + domSuffix) < 0) {
+              job.networkText += domSuffix;
+              job.onNetworkDelta(domSuffix);
+              return true;
+            }
+          }
+          job.networkText += pureCloseSuffix;
+          job.onNetworkDelta(pureCloseSuffix);
+          return true;
+        }
         if ((activeStreamsOpen || pageGen) && Date.now() - lastActivityAt < 25000 && sinceDone < 45000) {
           return false;
         }
@@ -3865,6 +4218,7 @@
     ensureWebModelSelected,
     executePromptJob,
     collectAssistantReplyTexts,
+    computePureAppendToolCloseSuffix,
     diagnoseCurrentPage
   };
 

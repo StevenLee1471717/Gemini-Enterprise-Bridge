@@ -246,3 +246,132 @@ def test_end_to_end_api_ledger_covers_all_task_types(tmp_path: Path) -> None:
             assert "periodTabs" in dash_html
         finally:
             hub.dispatch_stream_on_slot = orig_stream
+
+
+def test_pre_update_backfill_and_host_tenant_reconciliation(tmp_path: Path) -> None:
+    import sqlite3
+    from usage_ledger import backfill_pre_update_usage
+
+    cache_dir = tmp_path / ".cache"
+    cache_dir.mkdir()
+    ledger_path = cache_dir / "usage_ledger.json"
+
+    # Pre-v1.5.0 day without by_tenant entry
+    ledger_path.write_text(
+        json.dumps(
+            {
+                "version": 1,
+                "updated_at": 1794900000,
+                "archived": {},
+                "days": {
+                    "2026-11-17": {
+                        "summary": {
+                            "requests": 10,
+                            "prompt_tokens": 1_000_000,
+                            "cached_tokens": 800_000,
+                            "delta_prompt_tokens": 200_000,
+                            "completion_tokens": 50_000,
+                            "total_tokens": 1_050_000,
+                            "equivalent_cost_usd": 2.5,
+                            "cached_equivalent_cost_usd": 0.98,
+                        },
+                        "by_model": {
+                            "gemini-4-carbon": {
+                                "requests": 10,
+                                "prompt_tokens": 1_000_000,
+                                "cached_tokens": 800_000,
+                                "delta_prompt_tokens": 200_000,
+                                "completion_tokens": 50_000,
+                                "total_tokens": 1_050_000,
+                                "equivalent_cost_usd": 2.5,
+                                "cached_equivalent_cost_usd": 0.98,
+                            }
+                        },
+                        "by_task": {
+                            "chat": {
+                                "requests": 10,
+                                "prompt_tokens": 1_000_000,
+                                "cached_tokens": 800_000,
+                                "delta_prompt_tokens": 200_000,
+                                "completion_tokens": 50_000,
+                                "total_tokens": 1_050_000,
+                                "equivalent_cost_usd": 2.5,
+                                "cached_equivalent_cost_usd": 0.98,
+                            }
+                        },
+                        "by_tenant": {},
+                    }
+                },
+                "recent_requests": [],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    # Legacy usage_stats.json (2026-11-16) + local Copilot BYOK SQLite (2026-11-11 & 2026-11-12)
+    legacy_path = tmp_path / "usage_stats.json"
+    legacy_path.write_text(
+        json.dumps(
+            {
+                "by_day": {
+                    "2026-11-16": {
+                        "requests": 2,
+                        "prompt_tokens": 300_000,
+                        "cached_tokens": 200_000,
+                        "delta_prompt_tokens": 100_000,
+                        "completion_tokens": 10_000,
+                        "total_tokens": 310_000,
+                        "equivalent_cost_usd": 0.70,
+                        "cached_equivalent_cost_usd": 0.32,
+                    }
+                },
+                "by_model": {},
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    cp_dir = tmp_path / "copilot"
+    cp_dir.mkdir()
+    con_d = sqlite3.connect(str(cp_dir / "data.db"))
+    con_d.execute("CREATE TABLE sessions (id TEXT PRIMARY KEY, provider_id TEXT)")
+    con_d.execute("INSERT INTO sessions VALUES ('s-bridge', '3126a75e-77bb-4baa-b663-6abcc2cdb5a7')")
+    con_d.execute("INSERT INTO sessions VALUES ('s-other', '695be4fc-bb13-4327-8c59-6bd91242b42d')")
+    con_d.commit()
+    con_d.close()
+
+    con_s = sqlite3.connect(str(cp_dir / "session-store.db"))
+    con_s.execute(
+        "CREATE TABLE assistant_usage_events (id INTEGER PRIMARY KEY, session_id TEXT, created_at TEXT, model TEXT, api_endpoint TEXT, input_tokens INTEGER, output_tokens INTEGER, token_details_json TEXT, total_nano_aiu INTEGER)"
+    )
+    con_s.execute(
+        "INSERT INTO assistant_usage_events VALUES (1, 's-bridge', '2026-11-11T02:00:00Z', 'gemini-4-carbon', '/chat/completions', 100000, 5000, NULL, 0)"
+    )
+    con_s.execute(
+        "INSERT INTO assistant_usage_events VALUES (2, 's-bridge', '2026-11-11T02:02:00Z', 'gemini-4-carbon', '/chat/completions', 120000, 5000, NULL, 0)"
+    )
+    # Non-bridge provider and native Copilot event must be ignored
+    con_s.execute(
+        "INSERT INTO assistant_usage_events VALUES (3, 's-other', '2026-11-11T02:03:00Z', 'gemini-4-carbon', '/chat/completions', 500000, 5000, NULL, 0)"
+    )
+    con_s.execute(
+        "INSERT INTO assistant_usage_events VALUES (4, 's-bridge', '2026-11-11T02:04:00Z', 'gemini-4-carbon', '/chat/completions', 500000, 5000, '[{}]', 100)"
+    )
+    con_s.commit()
+    con_s.close()
+
+    res = backfill_pre_update_usage(
+        ledger_path=ledger_path,
+        legacy_stats_path=legacy_path,
+        copilot_dir=cp_dir,
+        cutoff_day="2026-11-17",
+    )
+    assert res["backfilled_days"] == ["2026-11-11", "2026-11-16"]
+
+    ledger = UsageLedger(storage_path=ledger_path)
+    snap = ledger.snapshot(as_of_date="2026-11-17")
+    assert snap["all_time"]["requests"] == 14
+    assert snap["by_tenant"]["host"]["summary"]["requests"] == 14
+    assert snap["daily"]["2026-11-11"]["summary"]["cached_tokens"] == 105_000
+    assert snap["daily"]["2026-11-16"]["summary"]["equivalent_cost_usd"] == pytest.approx(0.70)
+    assert snap["daily"]["2026-11-16"]["summary"]["cached_equivalent_cost_usd"] == pytest.approx(0.32)

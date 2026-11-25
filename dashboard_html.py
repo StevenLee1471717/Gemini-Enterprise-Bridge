@@ -1254,9 +1254,40 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
       max-height: 460px;
       overflow-y: auto;
       overflow-x: auto;
+      container-type: inline-size;
       border: 1px solid var(--border);
       border-radius: 12px;
       background: #ffffff;
+    }
+    .price-dual-cell {
+      display: inline-flex;
+      flex-direction: column;
+      align-items: flex-end;
+      justify-content: center;
+      gap: 2px;
+      white-space: nowrap;
+    }
+    .price-dual-cell .price-after {
+      font-weight: 700;
+      color: var(--text);
+      font-size: 0.83rem;
+      line-height: 1.25;
+    }
+    .price-dual-cell .price-before {
+      font-size: 0.72rem;
+      color: var(--muted);
+      line-height: 1.2;
+    }
+    .hero-price-dual {
+      display: flex;
+      align-items: baseline;
+      flex-wrap: wrap;
+      gap: 8px;
+    }
+    .hero-price-before {
+      font-size: 0.84rem;
+      font-weight: 600;
+      color: var(--muted);
     }
     .table-viewport.compact {
       max-height: 220px;
@@ -2372,7 +2403,7 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
                 </select>
               </div>
 
-              <div class="table-viewport">
+              <div class="table-viewport" tabindex="0" role="region" aria-label="任务调用审计记录">
                 <table class="clean-table" id="auditLogTable">
                   <thead>
                     <tr>
@@ -2380,7 +2411,7 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
                       <th>调用方 · 来源</th>
                       <th>用途 · 模型</th>
                       <th>内容摘要（点击展开完整问答/原因）</th>
-                      <th>Token · 折算花费</th>
+                      <th>Token · 折算后/前花费</th>
                       <th class="num">耗时</th>
                     </tr>
                   </thead>
@@ -2433,11 +2464,11 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
           <div class="ledger-hero">
             <div class="stat-tile">
               <div class="stat-head">
-                <span id="cardActualLabel">预估等效花费</span>
+                <span id="cardActualLabel">等效花费（折算后 / 折算前）</span>
                 <div class="stat-icon-box emerald" aria-hidden="true">¥</div>
               </div>
-              <div class="stat-big" id="ledgerActualMain">¥0.00</div>
-              <div class="stat-sub" id="ledgerActualSub">输入 / 缓存 / 输出单价折算</div>
+              <div class="stat-big hero-price-dual" id="ledgerActualMain">¥0.00</div>
+              <div class="stat-sub" id="ledgerActualSub">折算前 ¥0.00 · 输入 / 缓存 / 输出单价折算</div>
             </div>
 
             <div class="stat-tile">
@@ -2471,9 +2502,9 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
           <div class="charts-grid">
             <div class="chart-box">
               <div class="chart-title-row">
-                <span>每日花费趋势（点击柱子可筛选当天）</span>
+                <span>每日 Token 趋势（点击柱子可筛选当天）</span>
                 <div class="chart-legend">
-                  <span><i class="leg-dot" style="background:#2563eb;"></i>等效折算花费（非 Google 实际扣费）</span>
+                  <span><i class="leg-dot" style="background:#2563eb;"></i>累计 Token</span>
                 </div>
               </div>
               <div class="bars-stage" id="dailyBarsStage"></div>
@@ -2502,7 +2533,7 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
             </div>
 
             <div id="ledgerPaneTenants">
-              <div class="table-viewport">
+              <div class="table-viewport" tabindex="0" role="region" aria-label="各密钥对比排行">
                 <table class="clean-table" id="ledgerTenantTable">
                   <thead>
                     <tr>
@@ -2511,7 +2542,7 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
                       <th class="num">拦截/报错</th>
                       <th class="num">累计 Token</th>
                       <th>输入 / 输出 / 缓存</th>
-                      <th class="num">等效花费</th>
+                      <th class="num">折算后 / 折算前花费</th>
                       <th>单独筛选</th>
                     </tr>
                   </thead>
@@ -2523,7 +2554,7 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
             </div>
 
             <div id="ledgerPaneModels" hidden>
-              <div class="table-viewport">
+              <div class="table-viewport" tabindex="0" role="region" aria-label="按模型汇总">
                 <table class="clean-table">
                   <thead>
                     <tr>
@@ -2532,7 +2563,7 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
                       <th class="num">累计 Token</th>
                       <th>输入 / 输出 / 缓存</th>
                       <th>专项生成</th>
-                      <th class="num">等效花费</th>
+                      <th class="num">折算后 / 折算前花费</th>
                     </tr>
                   </thead>
                   <tbody id="ledgerModelBody">
@@ -2543,7 +2574,7 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
             </div>
 
             <div id="ledgerPaneDaily" hidden>
-              <div class="table-viewport">
+              <div class="table-viewport" tabindex="0" role="region" aria-label="按日期汇总">
                 <table class="clean-table">
                   <thead>
                     <tr>
@@ -2552,7 +2583,7 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
                       <th class="num">累计 Token</th>
                       <th>输入 / 输出 / 缓存</th>
                       <th>专项统计</th>
-                      <th class="num">等效花费</th>
+                      <th class="num">折算后 / 折算前花费</th>
                     </tr>
                   </thead>
                   <tbody id="ledgerDailyBody">
@@ -2563,7 +2594,7 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
             </div>
 
             <div id="ledgerPaneRecent" hidden>
-              <div class="table-viewport">
+              <div class="table-viewport" tabindex="0" role="region" aria-label="最近调用流水">
                 <table class="clean-table">
                   <thead>
                     <tr>
@@ -2572,7 +2603,7 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
                       <th>模型 · 工作席位</th>
                       <th>对话方式</th>
                       <th>总计（输入 / 输出 / 缓存）</th>
-                      <th class="num">等效花费</th>
+                      <th class="num">折算后 / 折算前花费</th>
                       <th class="num">耗时</th>
                     </tr>
                   </thead>
@@ -3713,7 +3744,14 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
           return;
         }
 
-        let maxTotal = 0.0001;
+        function fmtBarTok(n) {
+          const v = Number(n || 0);
+          if (v >= 1000000000) return (v / 1000000000).toFixed(v >= 10000000000 ? 1 : 2) + 'B';
+          if (v >= 1000000) return (v / 1000000).toFixed(v >= 10000000 ? 1 : 2) + 'M';
+          if (v >= 1000) return (v / 1000).toFixed(v >= 100000 ? 0 : 1) + 'K';
+          return String(Math.round(v));
+        }
+        let maxTokens = 1;
         function pickDaySummary(dk) {
           const dObj = dailyMap[dk] || {};
           if (selectedTenant && selectedTenant !== 'all') {
@@ -3723,34 +3761,34 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
           return dObj.summary || {};
         }
         days.forEach(function (dk) {
-          const s = pickDaySummary(dk);
-          const tot = selectedCurrency === 'USD' ? Number(s.cached_equivalent_cost_usd || 0) : Number(s.cached_equivalent_cost_cny || 0);
-          if (tot > maxTotal) maxTotal = tot;
+          const tp = resolveTokenParts(pickDaySummary(dk));
+          if (tp.total > maxTokens) maxTokens = tp.total;
         });
 
         days.forEach(function (dk) {
           const s = pickDaySummary(dk);
-          const actual = selectedCurrency === 'USD' ? Number(s.cached_equivalent_cost_usd || 0) : Number(s.cached_equivalent_cost_cny || 0);
           const reqCnt = Number(s.requests || 0);
-          const actualH = reqCnt > 0 ? Math.max(8, (actual / maxTotal) * 100) : 3;
           const tp = resolveTokenParts(s);
+          const hasActivity = reqCnt > 0 || tp.total > 0;
+          const barH = tp.total > 0 ? Math.max(8, (tp.total / maxTokens) * 100) : (reqCnt > 0 ? 6 : 3);
 
           const col = document.createElement('div');
           col.className = 'bar-col' + (activeFilterDay === dk ? ' selected' : '');
-          col.title = reqCnt > 0
-            ? (dk + ' · ' + reqCnt + ' 次调用\n等效花费: ' + fmtMoney(s.cached_equivalent_cost_usd, s.cached_equivalent_cost_cny) +
-              '\n缓存命中率: ' + Number(s.cache_hit_pct || 0).toFixed(1) + '%\n累计 Token: ' + fmtLedgerTok(tp.total))
+          col.title = hasActivity
+            ? (dk + ' · ' + reqCnt + ' 次调用\n累计 Token: ' + fmtLedgerTok(tp.total) +
+              '（输入 ' + fmtLedgerTok(tp.input) + ' / 输出 ' + fmtLedgerTok(tp.output) + ' / 缓存 ' + fmtLedgerTok(tp.cached) + '）' +
+              '\n缓存命中率: ' + Number(s.cache_hit_pct || 0).toFixed(1) + '%')
             : (dk + ' · 无调用记录');
 
           const valTop = document.createElement('span');
           valTop.className = 'bar-val';
-          valTop.textContent = reqCnt > 0 ? fmtMoney(s.cached_equivalent_cost_usd, s.cached_equivalent_cost_cny) : '';
+          valTop.textContent = hasActivity ? fmtBarTok(tp.total) : '';
 
           const stack = document.createElement('div');
           stack.className = 'bar-stack';
           const segActual = document.createElement('div');
           segActual.className = 'bar-seg-actual';
-          segActual.style.height = actualH.toFixed(1) + '%';
+          segActual.style.height = barH.toFixed(1) + '%';
           stack.appendChild(segActual);
 
           const lbl = document.createElement('span');
@@ -3760,7 +3798,7 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
           col.appendChild(valTop);
           col.appendChild(stack);
           col.appendChild(lbl);
-          if (reqCnt > 0) {
+          if (hasActivity) {
             col.addEventListener('click', function () {
               selectedPeriod = (selectedPeriod === 'day:' + dk) ? 'all' : ('day:' + dk);
               if (lastUsageSnapshot) renderLedger(lastUsageSnapshot, lastCtxSnapshot);
@@ -3772,23 +3810,48 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
         });
       }
 
+      function makeDualPriceNode(b, fxRate) {
+        const fx = Number(fxRate || (lastUsageSnapshot && lastUsageSnapshot.usd_to_cny_rate) || 6.8);
+        const item = b || {};
+        const cUsd = Number(item.cached_equivalent_cost_usd || 0);
+        const cCny = item.cached_equivalent_cost_cny !== undefined ? Number(item.cached_equivalent_cost_cny) : (cUsd * fx);
+        const uUsd = Number(item.equivalent_cost_usd !== undefined ? item.equivalent_cost_usd : cUsd);
+        const uCny = item.equivalent_cost_cny !== undefined ? Number(item.equivalent_cost_cny) : (uUsd * fx);
+        const wrap = document.createElement('div');
+        wrap.className = 'price-dual-cell';
+        const afterEl = document.createElement('span');
+        afterEl.className = 'price-after';
+        afterEl.textContent = '折算后 ' + fmtMoney(cUsd, cCny);
+        const beforeEl = document.createElement('span');
+        beforeEl.className = 'price-before';
+        beforeEl.textContent = '折算前 ' + fmtMoney(uUsd, uCny);
+        wrap.appendChild(afterEl);
+        wrap.appendChild(beforeEl);
+        return wrap;
+      }
+
       function renderTaskBreakdown(byTask, totalRequests) {
         const bar = document.getElementById('taskRatioBar');
         const list = document.getElementById('taskBreakdownList');
         bar.replaceChildren();
         list.replaceChildren();
+        const fx = Number((lastUsageSnapshot && lastUsageSnapshot.usd_to_cny_rate) || 6.8);
 
         const entries = Object.keys(byTask || {})
           .map(function (k) {
             const item = byTask[k] || {};
             const meta = TASK_META[k] || { label: item.label || k, color: '#94a3b8' };
+            const cUsd = Number(item.cached_equivalent_cost_usd || 0);
+            const uUsd = Number(item.equivalent_cost_usd !== undefined ? item.equivalent_cost_usd : cUsd);
             return {
               key: k,
               label: meta.label,
               color: meta.color,
               requests: Number(item.requests || 0),
-              usd: Number(item.cached_equivalent_cost_usd || 0),
-              cny: Number(item.cached_equivalent_cost_cny || (Number(item.cached_equivalent_cost_usd || 0) * 6.8))
+              usd: cUsd,
+              cny: Number(item.cached_equivalent_cost_cny !== undefined ? item.cached_equivalent_cost_cny : (cUsd * fx)),
+              preUsd: uUsd,
+              preCny: Number(item.equivalent_cost_cny !== undefined ? item.equivalent_cost_cny : (uUsd * fx))
             };
           })
           .filter(function (x) { return x.requests > 0; })
@@ -3825,15 +3888,136 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
 
           const right = document.createElement('div');
           right.className = 'task-row-right';
-          right.textContent = e.requests + ' 次 (' + Math.round((e.requests / totalRequests) * 100) + '%) · ' + fmtMoney(e.usd, e.cny);
+          right.textContent = e.requests + ' 次 (' + Math.round((e.requests / totalRequests) * 100) + '%) · 折算后 ' + fmtMoney(e.usd, e.cny) + ' / 折算前 ' + fmtMoney(e.preUsd, e.preCny);
           row.appendChild(left);
           row.appendChild(right);
           list.appendChild(row);
         });
       }
 
+      const PRE_UPDATE_BACKFILL = /*__GEB_BACKFILL_JSON__*/null;
+
+      function enrichBucketJs(b, fx) {
+        const src = b || {};
+        const uUsd = Number(src.equivalent_cost_usd || 0);
+        const cUsd = Number(src.cached_equivalent_cost_usd || 0);
+        const sUsd = Math.max(0, uUsd - cUsd);
+        const pTok = Number(src.prompt_tokens || 0);
+        const cTok = Number(src.cached_tokens || 0);
+        return Object.assign({}, src, {
+          equivalent_cost_usd: Number(uUsd.toFixed(6)),
+          cached_equivalent_cost_usd: Number(cUsd.toFixed(6)),
+          saved_cost_usd: Number(sUsd.toFixed(6)),
+          equivalent_cost_cny: Number((uUsd * fx).toFixed(4)),
+          cached_equivalent_cost_cny: Number((cUsd * fx).toFixed(4)),
+          saved_cost_cny: Number((sUsd * fx).toFixed(4)),
+          cache_hit_pct: pTok > 0 ? Number(((cTok / pTok) * 100).toFixed(1)) : 0
+        });
+      }
+
+      function addBucketJs(dst, src, fx) {
+        if (!src) return dst;
+        const intKeys = ['requests', 'prompt_tokens', 'cached_tokens', 'delta_prompt_tokens', 'completion_tokens', 'total_tokens', 'images_generated', 'videos_generated', 'audio_requests', 'compactions'];
+        intKeys.forEach(function (k) { dst[k] = Number(dst[k] || 0) + Number(src[k] || 0); });
+        dst.equivalent_cost_usd = Number(dst.equivalent_cost_usd || 0) + Number(src.equivalent_cost_usd || 0);
+        dst.cached_equivalent_cost_usd = Number(dst.cached_equivalent_cost_usd || 0) + Number(src.cached_equivalent_cost_usd || 0);
+        return enrichBucketJs(dst, fx);
+      }
+
+      function reconcileLiveUsage(usage) {
+        if (!usage || usage.__reconciled) return usage;
+        const daily = usage.daily;
+        if (!daily || typeof daily !== 'object') return usage;
+        const fx = Number(usage.usd_to_cny_rate || 6.8);
+        let mutated = false;
+        if (PRE_UPDATE_BACKFILL && PRE_UPDATE_BACKFILL.days && daily['2026-11-17']) {
+          Object.keys(PRE_UPDATE_BACKFILL.days).forEach(function (dk) {
+            if (!daily[dk]) {
+              daily[dk] = JSON.parse(JSON.stringify(PRE_UPDATE_BACKFILL.days[dk]));
+              mutated = true;
+            }
+          });
+        }
+        Object.keys(daily).forEach(function (dk) {
+          const dg = daily[dk];
+          if (!dg || !dg.summary) return;
+          const sReq = Number(dg.summary.requests || 0);
+          if (sReq <= 0) return;
+          dg.by_tenant = dg.by_tenant || {};
+          let tReq = 0;
+          const sumTen = {};
+          Object.keys(dg.by_tenant).forEach(function (tid) {
+            const ts = (dg.by_tenant[tid] && dg.by_tenant[tid].summary) || {};
+            tReq += Number(ts.requests || 0);
+            ['requests', 'prompt_tokens', 'cached_tokens', 'delta_prompt_tokens', 'completion_tokens', 'total_tokens', 'images_generated', 'videos_generated', 'audio_requests', 'compactions', 'equivalent_cost_usd', 'cached_equivalent_cost_usd'].forEach(function (k) {
+              sumTen[k] = Number(sumTen[k] || 0) + Number(ts[k] || 0);
+            });
+          });
+          if (sReq > tReq) {
+            const hostTen = dg.by_tenant.host || { tenant_id: 'host', tenant_name: '本机直连', errors: 0, summary: {}, by_model: {}, by_task: {} };
+            const rem = {};
+            ['requests', 'prompt_tokens', 'cached_tokens', 'delta_prompt_tokens', 'completion_tokens', 'total_tokens', 'images_generated', 'videos_generated', 'audio_requests', 'compactions'].forEach(function (k) {
+              rem[k] = Math.max(0, Number(dg.summary[k] || 0) - Number(sumTen[k] || 0));
+            });
+            rem.equivalent_cost_usd = Math.max(0, Number(dg.summary.equivalent_cost_usd || 0) - Number(sumTen.equivalent_cost_usd || 0));
+            rem.cached_equivalent_cost_usd = Math.max(0, Number(dg.summary.cached_equivalent_cost_usd || 0) - Number(sumTen.cached_equivalent_cost_usd || 0));
+            hostTen.summary = addBucketJs(hostTen.summary || {}, rem, fx);
+            hostTen.summary.errors = Number(hostTen.errors || 0);
+            dg.by_tenant.host = hostTen;
+            mutated = true;
+          }
+          dg.summary = enrichBucketJs(dg.summary, fx);
+        });
+        if (mutated) {
+          const todayStr = usage.today_date || Object.keys(daily).sort().slice(-1)[0] || '';
+          const anchorMs = todayStr ? Date.parse(todayStr + 'T00:00:00Z') : NaN;
+          const cut7 = !isNaN(anchorMs) ? new Date(anchorMs - 6 * 86400000).toISOString().slice(0, 10) : '';
+          const cut30 = !isNaN(anchorMs) ? new Date(anchorMs - 29 * 86400000).toISOString().slice(0, 10) : '';
+          function buildPeriod(filterFn) {
+            const out = { summary: enrichBucketJs({}, fx), by_model: {}, by_task: {}, by_tenant: {} };
+            Object.keys(daily).forEach(function (dk) {
+              if (!filterFn(dk)) return;
+              const dg = daily[dk] || {};
+              out.summary = addBucketJs(out.summary, dg.summary, fx);
+              Object.keys(dg.by_model || {}).forEach(function (mk) {
+                const srcM = dg.by_model[mk] || {};
+                const dstM = addBucketJs(out.by_model[mk] || { display_name: srcM.display_name }, srcM, fx);
+                if (srcM.display_name) dstM.display_name = srcM.display_name;
+                out.by_model[mk] = dstM;
+              });
+              Object.keys(dg.by_task || {}).forEach(function (tk) {
+                const srcT = dg.by_task[tk] || {};
+                const dstT = addBucketJs(out.by_task[tk] || { label: srcT.label }, srcT, fx);
+                if (srcT.label) dstT.label = srcT.label;
+                out.by_task[tk] = dstT;
+              });
+              Object.keys(dg.by_tenant || {}).forEach(function (tid) {
+                const st = dg.by_tenant[tid] || {};
+                const dt = out.by_tenant[tid] || { tenant_id: tid, tenant_name: st.tenant_name || (tid === 'host' ? '本机直连' : tid), errors: 0, summary: enrichBucketJs({}, fx), by_model: {}, by_task: {} };
+                dt.errors = Number(dt.errors || 0) + Number(st.errors || 0);
+                dt.summary = addBucketJs(dt.summary, st.summary, fx);
+                dt.summary.errors = dt.errors;
+                out.by_tenant[tid] = dt;
+              });
+            });
+            return out;
+          }
+          usage.periods = usage.periods || {};
+          usage.periods.all = buildPeriod(function () { return true; });
+          if (cut7) usage.periods['7d'] = buildPeriod(function (dk) { return dk >= cut7 && dk <= todayStr; });
+          if (cut30) usage.periods['30d'] = buildPeriod(function (dk) { return dk >= cut30 && dk <= todayStr; });
+          usage.all_time = usage.periods.all.summary;
+          usage.by_model = usage.periods.all.by_model;
+          usage.by_task = usage.periods.all.by_task;
+          usage.by_tenant = usage.periods.all.by_tenant;
+        }
+        usage.__reconciled = true;
+        return usage;
+      }
+
       function renderLedger(usage, ctxMon) {
         if (!usage) return;
+        reconcileLiveUsage(usage);
         lastUsageSnapshot = usage;
         lastCtxSnapshot = ctxMon;
         syncPeriodControls(usage);
@@ -3847,10 +4031,17 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
         const allSum = (usage.periods && usage.periods.all && usage.periods.all.summary) || usage.all_time || {};
         const ovLVal = document.getElementById('ovLedgerVal');
         const ovLSub = document.getElementById('ovLedgerSub');
-        if (ovLVal) ovLVal.textContent = fmtMoney(todaySum.cached_equivalent_cost_usd, todaySum.cached_equivalent_cost_cny);
-        if (ovLSub) ovLSub.textContent = '今日 ' + Number(todaySum.requests || 0).toLocaleString() + ' 次 · 累计 ' + Number(allSum.requests || 0).toLocaleString() + ' 次';
+        if (ovLVal) {
+          ovLVal.textContent = fmtMoney(todaySum.cached_equivalent_cost_usd, todaySum.cached_equivalent_cost_cny) + ' / 前 ' + fmtMoney(todaySum.equivalent_cost_usd, todaySum.equivalent_cost_cny);
+        }
+        if (ovLSub) {
+          ovLSub.textContent = '今日 ' + Number(todaySum.requests || 0).toLocaleString() + ' 次 · 累计折后 ' + fmtMoney(allSum.cached_equivalent_cost_usd, allSum.cached_equivalent_cost_cny) + ' / 折前 ' + fmtMoney(allSum.equivalent_cost_usd, allSum.equivalent_cost_cny);
+        }
         const sideLBadge = document.getElementById('sideLedgerBadge');
-        if (sideLBadge) sideLBadge.textContent = fmtMoney(allSum.cached_equivalent_cost_usd, allSum.cached_equivalent_cost_cny);
+        if (sideLBadge) {
+          sideLBadge.textContent = fmtMoney(allSum.cached_equivalent_cost_usd, allSum.cached_equivalent_cost_cny);
+          sideLBadge.title = '累计折算后 ' + fmtMoney(allSum.cached_equivalent_cost_usd, allSum.cached_equivalent_cost_cny) + ' / 折算前 ' + fmtMoney(allSum.equivalent_cost_usd, allSum.equivalent_cost_cny);
+        }
 
         const resolved = resolveSelectedGroup(usage);
         const curSummary = (resolved.group && resolved.group.summary) || {};
@@ -3867,10 +4058,21 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
         }
 
         document.getElementById('activePeriodTag').textContent = resolved.label;
-        document.getElementById('ledgerActualMain').textContent = fmtMoney(curSummary.cached_equivalent_cost_usd, curSummary.cached_equivalent_cost_cny);
+        const afterMainTxt = fmtMoney(curSummary.cached_equivalent_cost_usd, curSummary.cached_equivalent_cost_cny);
+        const beforeMainTxt = fmtMoney(curSummary.equivalent_cost_usd, curSummary.equivalent_cost_cny);
+        const savedMainTxt = fmtMoney(curSummary.saved_cost_usd, curSummary.saved_cost_cny);
+        const mainEl = document.getElementById('ledgerActualMain');
+        mainEl.replaceChildren();
+        const mainAfterSpan = document.createElement('span');
+        mainAfterSpan.textContent = afterMainTxt;
+        const mainBeforeSpan = document.createElement('span');
+        mainBeforeSpan.className = 'hero-price-before';
+        mainBeforeSpan.textContent = '折算前 ' + beforeMainTxt;
+        mainEl.appendChild(mainAfterSpan);
+        mainEl.appendChild(mainBeforeSpan);
         const actualSubEl = document.getElementById('ledgerActualSub');
-        actualSubEl.textContent = '输入 / 缓存 / 输出单价折算';
-        actualSubEl.title = '按每轮新增输入、同对话缓存与回复输出参考单价折算（非网页真实扣费）';
+        actualSubEl.textContent = '折算后 ' + afterMainTxt + ' ｜ 折算前 ' + beforeMainTxt + '（缓存省 ' + savedMainTxt + '）';
+        actualSubEl.title = '同时展示同对话缓存折算后价格与无缓存折算前参考价格（非网页真实扣费）';
 
         const reqCount = Number(curSummary.requests || 0);
         const respCnt = (byTask.responses && byTask.responses.requests) || 0;
@@ -3935,7 +4137,7 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
             tr.appendChild(makeCell(errChip, 'num'));
             tr.appendChild(makeCell(fmtLedgerTok(tt.total), 'num'));
             tr.appendChild(makeCell(fmtLedgerTok(tt.input) + ' / ' + fmtLedgerTok(tt.output) + ' / ' + fmtLedgerTok(tt.cached)));
-            tr.appendChild(makeCell(fmtMoney(ts.cached_equivalent_cost_usd, ts.cached_equivalent_cost_cny), 'num'));
+            tr.appendChild(makeCell(makeDualPriceNode(ts, fx), 'num'));
             const fBtn = document.createElement('button');
             fBtn.type = 'button';
             fBtn.className = selectedTenant === tid ? 'btn sm primary' : 'btn sm soft';
@@ -3969,7 +4171,7 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
             tr.appendChild(makeCell(fmtLedgerTok(mt.total), 'num'));
             tr.appendChild(makeCell(fmtLedgerTok(mt.input) + ' / ' + fmtLedgerTok(mt.output) + ' / ' + fmtLedgerTok(mt.cached)));
             tr.appendChild(makeCell(specials.length ? specials.join(' · ') : '-'));
-            tr.appendChild(makeCell(fmtMoney(m.cached_equivalent_cost_usd, m.cached_equivalent_cost_cny), 'num'));
+            tr.appendChild(makeCell(makeDualPriceNode(m, fx), 'num'));
             modelBody.appendChild(tr);
           });
         }
@@ -4000,7 +4202,7 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
             tr.appendChild(makeCell(fmtLedgerTok(dt.total), 'num'));
             tr.appendChild(makeCell(fmtLedgerTok(dt.input) + ' / ' + fmtLedgerTok(dt.output) + ' / ' + fmtLedgerTok(dt.cached)));
             tr.appendChild(makeCell(specials.length ? specials.join(' · ') : '-'));
-            tr.appendChild(makeCell(fmtMoney(s.cached_equivalent_cost_usd, s.cached_equivalent_cost_cny), 'num'));
+            tr.appendChild(makeCell(makeDualPriceNode(s, fx), 'num'));
             dailyBody.appendChild(tr);
           });
           if (!dailyBody.children.length) renderEmptyRow(dailyBody, 6, '所选对象暂无按日记录');
@@ -4037,7 +4239,7 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
             tr.appendChild(makeCell(friendlyModel(r.display_name || r.model) + ' · ' + seatTxt));
             tr.appendChild(makeCell(friendlyStrategyBadge(r.context_strategy)));
             tr.appendChild(makeCell(fmtLedgerTok(rt.total) + '（' + fmtLedgerTok(rt.input) + ' / ' + fmtLedgerTok(rt.output) + ' / ' + fmtLedgerTok(rt.cached) + '）'));
-            tr.appendChild(makeCell(fmtMoney(r.cached_equivalent_cost_usd, r.cached_equivalent_cost_cny), 'num'));
+            tr.appendChild(makeCell(makeDualPriceNode(r, fx), 'num'));
             tr.appendChild(makeCell(((Number(r.duration_ms || 0)) / 1000).toFixed(1) + ' 秒', 'num'));
             recentBody.appendChild(tr);
           });
@@ -5617,9 +5819,25 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
             tr.appendChild(makeCell(pv));
 
             const rt = resolveTokenParts(r);
+            const fxAud = Number((lastUsageSnapshot && lastUsageSnapshot.usd_to_cny_rate) || 6.8);
             const tokBox = document.createElement('div');
-            tokBox.style.fontWeight = '600';
-            tokBox.textContent = rt.total > 0 ? (fmtLedgerTok(rt.total) + ' · ' + fmtMoney(r.cached_equivalent_cost_usd, r.cached_equivalent_cost_cny)) : '-';
+            tokBox.className = 'cell-two-line';
+            if (rt.total > 0) {
+              const cUsdA = Number(r.cached_equivalent_cost_usd || 0);
+              const cCnyA = r.cached_equivalent_cost_cny !== undefined ? Number(r.cached_equivalent_cost_cny) : (cUsdA * fxAud);
+              const uUsdA = Number(r.equivalent_cost_usd !== undefined ? r.equivalent_cost_usd : cUsdA);
+              const uCnyA = r.equivalent_cost_cny !== undefined ? Number(r.equivalent_cost_cny) : (uUsdA * fxAud);
+              const tokTop = document.createElement('div');
+              tokTop.className = 'line-main';
+              tokTop.textContent = fmtLedgerTok(rt.total) + ' · 折算后 ' + fmtMoney(cUsdA, cCnyA);
+              const tokSub = document.createElement('div');
+              tokSub.className = 'line-sub';
+              tokSub.textContent = '折算前 ' + fmtMoney(uUsdA, uCnyA);
+              tokBox.appendChild(tokTop);
+              tokBox.appendChild(tokSub);
+            } else {
+              tokBox.textContent = '-';
+            }
             tr.appendChild(makeCell(tokBox, 'nw'));
             tr.appendChild(makeCell(((Number(r.duration_ms || 0)) / 1000).toFixed(1) + ' 秒', 'num'));
             audBody.appendChild(tr);
@@ -5646,7 +5864,8 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
               const metaLine = document.createElement('div');
               metaLine.className = 'expand-detail-meta';
               metaLine.textContent = '会话: ' + (r.session_title || r.session_id || '-')
-                + '   |   输入 ' + fmtLedgerTok(rt.input) + ' / 输出 ' + fmtLedgerTok(rt.output) + ' / 缓存 ' + fmtLedgerTok(rt.cached);
+                + '   |   输入 ' + fmtLedgerTok(rt.input) + ' / 输出 ' + fmtLedgerTok(rt.output) + ' / 缓存 ' + fmtLedgerTok(rt.cached)
+                + (rt.total > 0 ? ('   |   折算后 ' + fmtMoney(r.cached_equivalent_cost_usd, r.cached_equivalent_cost_cny) + ' / 折算前 ' + fmtMoney(r.equivalent_cost_usd, r.equivalent_cost_cny)) : '');
               dCard.appendChild(metaLine);
               dtd.appendChild(dCard);
               dtr.appendChild(dtd);
@@ -5895,6 +6114,24 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
 </html>
 """
 
+def _inject_backfill_sidecar(html_tpl: str) -> str:
+    try:
+        import json as _json
+        from pathlib import Path as _Path
+
+        here = _Path(__file__).resolve().parent if "__file__" in globals() else _Path.cwd()
+        bf_file = here / ".cache" / "usage_backfill.json"
+        if bf_file.is_file():
+            raw_obj = _json.loads(bf_file.read_text(encoding="utf-8"))
+            if isinstance(raw_obj, dict) and isinstance(raw_obj.get("days"), dict):
+                safe_js = _json.dumps({"days": raw_obj["days"]}, ensure_ascii=False).replace("</", "<\\/")
+                return html_tpl.replace("/*__GEB_BACKFILL_JSON__*/null", safe_js, 1)
+    except Exception:
+        pass
+    return html_tpl
+
+
+DASHBOARD_HTML = _inject_backfill_sidecar(DASHBOARD_HTML)
 _CACHED_HTML = DASHBOARD_HTML
 _CACHED_MTIME_NS = 0
 
@@ -5903,13 +6140,14 @@ def get_dashboard_html() -> str:
     global _CACHED_HTML, _CACHED_MTIME_NS
     try:
         p = Path(__file__)
-        st = p.stat()
-        if st.st_mtime_ns != _CACHED_MTIME_NS:
-            ns: dict = {}
+        bf = p.resolve().parent / ".cache" / "usage_backfill.json"
+        combined_ns = p.stat().st_mtime_ns ^ (bf.stat().st_mtime_ns if bf.is_file() else 0)
+        if combined_ns != _CACHED_MTIME_NS:
+            ns: dict = {"__file__": str(p)}
             exec(compile(p.read_text(encoding="utf-8"), str(p), "exec"), ns)
             if isinstance(ns.get("DASHBOARD_HTML"), str):
                 _CACHED_HTML = ns["DASHBOARD_HTML"]
-                _CACHED_MTIME_NS = st.st_mtime_ns
+                _CACHED_MTIME_NS = combined_ns
     except Exception:
         pass
     return _CACHED_HTML

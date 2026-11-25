@@ -116,6 +116,13 @@ def test_dashboard_ui_structure_and_slot_reset_api(tmp_path: Path) -> None:
         assert "累计 Token" in html
         assert "缓存 0 / 总输入 0" in html
         assert "输入 0 / 输出 0 / 缓存 0" in html
+        assert "等效花费（折算后 / 折算前）" in html
+        assert "折算后 / 折算前花费" in html
+        assert "makeDualPriceNode" in html
+        assert "每日 Token 趋势（点击柱子可筛选当天）" in html
+        assert "每日花费趋势" not in html
+        assert "bar-seg-pre" not in html
+        assert "bar-val-dual" not in html
         assert "grid-template-columns: repeat(5, minmax(0, 1fr))" in html
         assert "grid-template-columns: repeat(4, minmax(0, 1fr))" in html
         assert "grid-template-columns: repeat(3, minmax(0, 1fr))" in html
@@ -599,3 +606,109 @@ def test_simplified_seat_cap_options_custom_input_and_no_unlimited(tmp_path: Pat
             assert res_zero.status_code == 400
             res_over = client.post("/api/seats/limit", json={"max_parallel_tabs": 201})
             assert res_over.status_code == 400
+
+
+def test_daily_bars_chart_plots_tokens_without_dual_prices(tmp_path: Path) -> None:
+    node = shutil.which("node")
+    assert node is not None
+    settings = BridgeSettings(auto_export_extension=False, generated_dir=str(tmp_path))
+    with TestClient(create_app(settings)) as client:
+        html = client.get("/").text
+
+    m_fmt = re.search(r"function fmtLedgerTok\(n\)\s*\{.*?\n      \}", html, re.S)
+    m_parts = re.search(r"function resolveTokenParts\(b\)\s*\{.*?\n      \}", html, re.S)
+    m_bars = re.search(r"function renderDailyBars\(usage, activeFilterDay\)\s*\{.*?\n      \}", html, re.S)
+    assert m_fmt and m_parts and m_bars
+
+    harness = f"""
+function makeEl(tag) {{
+  return {{
+    tag,
+    className: '',
+    textContent: '',
+    title: '',
+    style: {{}},
+    children: [],
+    listeners: {{}},
+    appendChild(ch) {{ this.children.push(ch); return ch; }},
+    replaceChildren() {{ this.children = []; }},
+    addEventListener(ev, fn) {{ this.listeners[ev] = fn; }},
+  }};
+}}
+const stageEl = makeEl('div');
+global.document = {{
+  getElementById(id) {{ return id === 'dailyBarsStage' ? stageEl : makeEl('div'); }},
+  createElement(tag) {{ return makeEl(tag); }},
+}};
+let selectedTenant = 'all';
+let selectedPeriod = 'all';
+let lastUsageSnapshot = null;
+let lastCtxSnapshot = null;
+function renderLedger() {{}}
+{m_fmt.group(0)}
+{m_parts.group(0)}
+{m_bars.group(0)}
+renderDailyBars({{
+  today_date: '2026-11-23',
+  daily: {{
+    '2026-11-22': {{
+      summary: {{
+        requests: 10,
+        prompt_tokens: 12000000,
+        cached_tokens: 11000000,
+        delta_prompt_tokens: 1000000,
+        completion_tokens: 500000,
+        total_tokens: 12500000,
+        equivalent_cost_usd: 999.0,
+        cached_equivalent_cost_usd: 88.0,
+        cache_hit_pct: 91.7,
+      }}
+    }},
+    '2026-11-23': {{
+      summary: {{
+        requests: 20,
+        prompt_tokens: 24000000,
+        cached_tokens: 22000000,
+        delta_prompt_tokens: 2000000,
+        completion_tokens: 1000000,
+        total_tokens: 25000000,
+        equivalent_cost_usd: 10.0,
+        cached_equivalent_cost_usd: 2.0,
+        cache_hit_pct: 91.7,
+      }}
+    }}
+  }}
+}}, '2026-11-23');
+console.log(JSON.stringify(stageEl.children.map(c => ({{
+  cls: c.className,
+  title: c.title,
+  val: c.children[0].textContent,
+  valCls: c.children[0].className,
+  segCount: c.children[1].children.length,
+  height: c.children[1].children[0].style.height,
+  lbl: c.children[2].textContent,
+}}))));
+"""
+    proc = subprocess.run(
+        [node, "-e", harness],
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        timeout=10,
+        check=True,
+    )
+    cols = json.loads(proc.stdout.strip())
+    by_lbl = {c["lbl"]: c for c in cols}
+    assert by_lbl["11-21"]["val"] == ""
+    assert by_lbl["11-21"]["height"] == "3.0%"
+    # Despite 11-22 having higher mock USD cost, 11-23 has 2x tokens so 11-23 is 100% and 11-22 is 50%
+    assert by_lbl["11-22"]["val"] == "12.5M"
+    assert by_lbl["11-22"]["valCls"] == "bar-val"
+    assert by_lbl["11-22"]["segCount"] == 1
+    assert by_lbl["11-22"]["height"] == "50.0%"
+    assert by_lbl["11-23"]["val"] == "25.0M"
+    assert by_lbl["11-23"]["height"] == "100.0%"
+    assert "selected" in by_lbl["11-23"]["cls"]
+    for c in cols:
+        assert "$" not in c["val"] and "¥" not in c["val"] and "前" not in c["val"]
+        assert "折算前" not in c["title"] and "折算后" not in c["title"]

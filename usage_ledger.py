@@ -461,6 +461,57 @@ def merge_group_into(dst: Dict[str, Any], src: Dict[str, Any]) -> None:
         merge_tenant_group_into(target_ten, tgroup)
 
 
+def _subtract_bucket(minuend: Dict[str, Any], subtrahend: Dict[str, Any]) -> Dict[str, Any]:
+    out = empty_bucket()
+    for k in _BUCKET_INT_KEYS:
+        out[k] = max(0, int(minuend.get(k) or 0) - int(subtrahend.get(k) or 0))
+    for fk in _BUCKET_FLOAT_KEYS:
+        out[fk] = round(max(0.0, float(minuend.get(fk) or 0.0) - float(subtrahend.get(fk) or 0.0)), 8)
+    return out
+
+
+def reconcile_unattributed_host_tenant(day_group: Dict[str, Any]) -> bool:
+    """Attribute pre-v1.5.0 unattributed daily usage remainder to the local `host` tenant."""
+    if not isinstance(day_group, dict):
+        return False
+    summary = sanitize_bucket(day_group.get("summary"))
+    if int(summary.get("requests") or 0) <= 0 and int(summary.get("total_tokens") or 0) <= 0:
+        return False
+    by_tenant = day_group.setdefault("by_tenant", {})
+    summed_summary = empty_bucket()
+    summed_models: Dict[str, Dict[str, Any]] = {}
+    summed_tasks: Dict[str, Dict[str, Any]] = {}
+    for tgroup in by_tenant.values():
+        if not isinstance(tgroup, dict):
+            continue
+        merge_bucket_into(summed_summary, sanitize_bucket(tgroup.get("summary")))
+        for mk, mb in (tgroup.get("by_model") or {}).items():
+            if isinstance(mb, dict):
+                merge_bucket_into(summed_models.setdefault(mk, empty_bucket()), sanitize_bucket(mb))
+        for tk, tb in (tgroup.get("by_task") or {}).items():
+            if isinstance(tb, dict):
+                merge_bucket_into(summed_tasks.setdefault(tk, empty_bucket()), sanitize_bucket(tb))
+    rem_summary = _subtract_bucket(summary, summed_summary)
+    if int(rem_summary.get("requests") or 0) <= 0 and int(rem_summary.get("total_tokens") or 0) <= 0:
+        return False
+    host_group = sanitize_tenant_group(by_tenant.get("host")) if isinstance(by_tenant.get("host"), dict) else empty_tenant_group("本机直连")
+    if not host_group.get("tenant_name"):
+        host_group["tenant_name"] = "本机直连"
+    by_tenant["host"] = host_group
+    merge_bucket_into(host_group["summary"], rem_summary)
+    for mk, mb in (day_group.get("by_model") or {}).items():
+        if isinstance(mb, dict):
+            rem_m = _subtract_bucket(sanitize_bucket(mb), summed_models.get(mk) or empty_bucket())
+            if int(rem_m.get("requests") or 0) > 0 or int(rem_m.get("total_tokens") or 0) > 0:
+                merge_bucket_into(host_group["by_model"].setdefault(mk, empty_bucket()), rem_m)
+    for tk, tb in (day_group.get("by_task") or {}).items():
+        if isinstance(tb, dict):
+            rem_t = _subtract_bucket(sanitize_bucket(tb), summed_tasks.get(tk) or empty_bucket())
+            if int(rem_t.get("requests") or 0) > 0 or int(rem_t.get("total_tokens") or 0) > 0:
+                merge_bucket_into(host_group["by_task"].setdefault(tk, empty_bucket()), rem_t)
+    return True
+
+
 def enrich_bucket(bucket: Dict[str, Any], usd_to_cny: float) -> Dict[str, Any]:
     uncached_usd = float(bucket.get("equivalent_cost_usd") or 0.0)
     cached_usd = float(bucket.get("cached_equivalent_cost_usd") or 0.0)
@@ -508,6 +559,8 @@ class UsageLedger:
         self._days: Dict[str, Dict[str, Any]] = {}
         self._session_days: Dict[str, Dict[str, Any]] = {}
         self._recent_requests: List[Dict[str, Any]] = []
+        self._disk_mtime_ns: int = 0
+        self._backfill_mtime_ns: int = 0
         self._load_from_disk()
 
     def _day_key(self, as_of_date: Optional[Union[date, datetime, str]] = None) -> str:
@@ -525,29 +578,93 @@ class UsageLedger:
         except Exception:
             return datetime.now().date().isoformat()
 
-    def _load_from_disk(self) -> None:
-        if self.storage_path is None or not self.storage_path.is_file():
-            return
-        try:
-            raw = json.loads(self.storage_path.read_text(encoding="utf-8"))
-            if not isinstance(raw, dict):
-                return
-            self._archived = sanitize_group(raw.get("archived"))
-            if isinstance(raw.get("days"), dict):
-                for dk, dv in raw["days"].items():
-                    if isinstance(dv, dict):
-                        self._days[str(dk)] = sanitize_group(dv)
-            if isinstance(raw.get("recent_requests"), list):
-                self._recent_requests = [
-                    x for x in raw["recent_requests"][-MAX_RECENT_REQUESTS:] if isinstance(x, dict)
-                ]
-        except Exception as exc:
-            logger.warning("读取本地账本 %s 失败（将重新初始化）: %s", self.storage_path, exc)
+    def _backfill_sidecar_path(self) -> Optional[Path]:
+        return (self.storage_path.parent / "usage_backfill.json") if self.storage_path else None
 
-    def _save_to_disk_unlocked(self) -> None:
+    def _merge_historical_days_unlocked(self, ext_days: Dict[str, Any]) -> bool:
+        changed = False
+        for dk, dv in (ext_days or {}).items():
+            if not isinstance(dv, dict):
+                continue
+            day_str = str(dk)
+            cand = sanitize_group(dv)
+            reconcile_unattributed_host_tenant(cand)
+            cand_reqs = int((cand.get("summary") or {}).get("requests") or 0)
+            if cand_reqs <= 0:
+                continue
+            cur = self._days.get(day_str)
+            cur_reqs = int(((cur or {}).get("summary") or {}).get("requests") or 0) if cur else 0
+            if cur is None or cand_reqs > cur_reqs:
+                self._days[day_str] = cand
+                changed = True
+            elif cur is not None and reconcile_unattributed_host_tenant(cur):
+                changed = True
+        return changed
+
+    def _sync_external_sources_unlocked(self) -> bool:
+        changed = False
+        if self.storage_path is not None and self.storage_path.is_file():
+            try:
+                st_ns = self.storage_path.stat().st_mtime_ns
+                if self._disk_mtime_ns and st_ns > self._disk_mtime_ns:
+                    raw = json.loads(self.storage_path.read_text(encoding="utf-8"))
+                    if isinstance(raw, dict) and isinstance(raw.get("days"), dict):
+                        if self._merge_historical_days_unlocked(raw["days"]):
+                            changed = True
+                    self._disk_mtime_ns = st_ns
+            except Exception as exc:
+                logger.debug("同步外部账本变更失败: %s", exc)
+        sidecar = self._backfill_sidecar_path()
+        if sidecar is not None and sidecar.is_file():
+            try:
+                bf_ns = sidecar.stat().st_mtime_ns
+                if bf_ns != self._backfill_mtime_ns:
+                    bf_raw = json.loads(sidecar.read_text(encoding="utf-8"))
+                    bf_days = bf_raw.get("days") if isinstance(bf_raw, dict) else None
+                    if isinstance(bf_days, dict) and self._merge_historical_days_unlocked(bf_days):
+                        changed = True
+                    self._backfill_mtime_ns = bf_ns
+            except Exception as exc:
+                logger.debug("读取历史回测账本 %s 失败: %s", sidecar, exc)
+        for dg in self._days.values():
+            if reconcile_unattributed_host_tenant(dg):
+                changed = True
+        return changed
+
+    def _load_from_disk(self) -> None:
+        dirty = False
+        if self.storage_path is not None and self.storage_path.is_file():
+            try:
+                st_ns = self.storage_path.stat().st_mtime_ns
+                raw = json.loads(self.storage_path.read_text(encoding="utf-8"))
+                if isinstance(raw, dict):
+                    self._archived = sanitize_group(raw.get("archived"))
+                    reconcile_unattributed_host_tenant(self._archived)
+                    if isinstance(raw.get("days"), dict):
+                        for dk, dv in raw["days"].items():
+                            if isinstance(dv, dict):
+                                grp = sanitize_group(dv)
+                                if reconcile_unattributed_host_tenant(grp):
+                                    dirty = True
+                                self._days[str(dk)] = grp
+                    if isinstance(raw.get("recent_requests"), list):
+                        self._recent_requests = [
+                            x for x in raw["recent_requests"][-MAX_RECENT_REQUESTS:] if isinstance(x, dict)
+                        ]
+                self._disk_mtime_ns = st_ns
+            except Exception as exc:
+                logger.warning("读取本地账本 %s 失败（将重新初始化）: %s", self.storage_path, exc)
+        if self._sync_external_sources_unlocked():
+            dirty = True
+        if dirty and self.storage_path is not None and self.storage_path.is_file():
+            self._save_to_disk_unlocked(skip_external_sync=True)
+
+    def _save_to_disk_unlocked(self, skip_external_sync: bool = False) -> None:
         if self.storage_path is None:
             return
         try:
+            if not skip_external_sync:
+                self._sync_external_sources_unlocked()
             self.storage_path.parent.mkdir(parents=True, exist_ok=True)
             if len(self._days) > MAX_STORED_DAYS:
                 sorted_keys = sorted(self._days.keys())
@@ -564,6 +681,8 @@ class UsageLedger:
                 "recent_requests": self._recent_requests[-MAX_RECENT_REQUESTS:],
             }
             atomic_write_json(self.storage_path, payload, mode=0o600, dir_mode=0o755)
+            if self.storage_path.is_file():
+                self._disk_mtime_ns = self.storage_path.stat().st_mtime_ns
         except Exception as exc:
             logger.warning("写入本地账本 %s 失败: %s", self.storage_path, exc)
 
@@ -930,6 +1049,7 @@ class UsageLedger:
         )
 
         with self._lock:
+            self._sync_external_sources_unlocked()
             total_group = empty_group()
             merge_group_into(total_group, self._archived)
             for dg in self._days.values():
@@ -1001,3 +1121,227 @@ class UsageLedger:
             if include_catalog:
                 result["pricing_catalog"] = list_pricing_catalog(overrides=self.price_overrides)
             return result
+
+
+def backfill_pre_update_usage(
+    ledger_path: Union[Path, str],
+    legacy_stats_path: Optional[Union[Path, str]] = None,
+    copilot_dir: Optional[Union[Path, str]] = None,
+    cutoff_day: str = "2026-11-17",
+    bridge_provider_ids: Sequence[str] = ("3126a75e-77bb-4baa-b663-6abcc2cdb5a7",),
+    excluded_provider_ids: Sequence[str] = (
+        "695be4fc-bb13-4327-8c59-6bd91242b42d",
+        "9877533f-9a89-4594-b562-9f70eea0ee41",
+    ),
+    price_overrides: Optional[Dict[str, Dict[str, Any]]] = None,
+) -> Dict[str, Any]:
+    """Backtest and persist lost pre-major-update usage from legacy stats & local BYOK history."""
+    import sqlite3
+
+    l_path = Path(ledger_path)
+    root_dir = l_path.resolve().parent.parent if l_path.parent.name == ".cache" else l_path.resolve().parent
+    us_path = Path(legacy_stats_path) if legacy_stats_path else (root_dir / "usage_stats.json")
+    cp_dir = Path(copilot_dir) if copilot_dir else (Path.home() / ".copilot")
+    tz_obj = resolve_timezone(DEFAULT_TIMEZONE)
+
+    reconstructed_days: Dict[str, Dict[str, Any]] = {}
+
+    # 1. Reconstruct turn-by-turn BYOK usage from local Copilot session store (< cutoff_day)
+    ss_db = cp_dir / "session-store.db"
+    data_db = cp_dir / "data.db"
+    sess_pid: Dict[str, Optional[str]] = {}
+    if data_db.is_file():
+        try:
+            con_d = sqlite3.connect(f"file:{data_db}?mode=ro", uri=True)
+            for sid, pid in con_d.execute("SELECT id, provider_id FROM sessions").fetchall():
+                sess_pid[str(sid)] = str(pid) if pid else None
+            con_d.close()
+        except Exception as exc:
+            logger.warning("读取 Copilot data.db 失败: %s", exc)
+
+    if ss_db.is_file():
+        try:
+            con_s = sqlite3.connect(f"file:{ss_db}?mode=ro", uri=True)
+            rows = con_s.execute(
+                """
+                SELECT session_id, created_at, model, api_endpoint, input_tokens, output_tokens
+                FROM assistant_usage_events
+                WHERE token_details_json IS NULL
+                  AND (total_nano_aiu IS NULL OR total_nano_aiu = 0)
+                  AND lower(COALESCE(model, '')) LIKE '%gemini%'
+                ORDER BY created_at, id
+                """
+            ).fetchall()
+            con_s.close()
+            excluded_set = set(excluded_provider_ids)
+            bridge_set = set(bridge_provider_ids)
+            sess_state: Dict[str, Dict[str, Any]] = {}
+            for sid_raw, ca_raw, m_raw, ep_raw, inp_raw, out_raw in rows:
+                sid = str(sid_raw or "")
+                pid = sess_pid.get(sid)
+                m_str = str(m_raw or "")
+                if pid in excluded_set:
+                    continue
+                if bridge_set and pid is not None and pid not in bridge_set and not m_str.lower().startswith("gemini-enterprise"):
+                    continue
+                s_ca = str(ca_raw or "").strip()
+                if not s_ca:
+                    continue
+                dt = datetime.fromisoformat((s_ca.replace("Z", "+00:00") if "T" in s_ca else s_ca + "+00:00")).astimezone(tz_obj)
+                dk = dt.strftime("%Y-%m-%d")
+                if dk >= cutoff_day:
+                    continue
+                ts = dt.timestamp()
+                p_tok = max(0, int(inp_raw or 0))
+                c_tok = max(0, int(out_raw or 0))
+                canon_m = resolve_canonical_billing_model(m_str)
+                task_k = "responses" if str(ep_raw or "").strip() == "/responses" else "chat"
+                prev = sess_state.get(sid)
+                if (
+                    prev
+                    and prev["model"] == canon_m
+                    and p_tok >= prev["p"] * 0.85
+                    and prev["ctx"] < DEFAULT_CONTEXT_WINDOW
+                    and (ts - prev["ts"]) <= 1800
+                ):
+                    eff_cached = min(p_tok, prev["ctx"])
+                    eff_delta = max(0, p_tok - eff_cached)
+                else:
+                    eff_cached = 0
+                    eff_delta = p_tok
+                sess_state[sid] = {"p": p_tok, "ctx": p_tok + c_tok, "ts": ts, "model": canon_m}
+                rate = get_model_pricing(canon_m, prompt_tokens=p_tok, overrides=price_overrides)
+                uncached_usd = (p_tok / 1_000_000.0) * rate.input_per_1m + (c_tok / 1_000_000.0) * rate.output_per_1m
+                cached_usd = (
+                    (eff_cached / 1_000_000.0) * rate.cached_input_per_1m
+                    + (eff_delta / 1_000_000.0) * rate.input_per_1m
+                    + (c_tok / 1_000_000.0) * rate.output_per_1m
+                )
+                delta_b = {
+                    "requests": 1,
+                    "prompt_tokens": p_tok,
+                    "cached_tokens": eff_cached,
+                    "delta_prompt_tokens": eff_delta,
+                    "completion_tokens": c_tok,
+                    "total_tokens": p_tok + c_tok,
+                    "images_generated": 0,
+                    "videos_generated": 0,
+                    "audio_requests": 0,
+                    "compactions": 0,
+                    "equivalent_cost_usd": round(uncached_usd, 8),
+                    "cached_equivalent_cost_usd": round(cached_usd, 8),
+                }
+                d_grp = reconstructed_days.setdefault(dk, empty_group())
+                merge_group_into(
+                    d_grp,
+                    {
+                        "summary": delta_b,
+                        "by_model": {canon_m: dict(delta_b)},
+                        "by_task": {task_k: dict(delta_b)},
+                        "by_tenant": {
+                            "host": {
+                                "tenant_name": "本机直连",
+                                "errors": 0,
+                                "summary": dict(delta_b),
+                                "by_model": {canon_m: dict(delta_b)},
+                                "by_task": {task_k: dict(delta_b)},
+                            }
+                        },
+                    },
+                )
+        except Exception as exc:
+            logger.warning("回测 Copilot 会话历史失败: %s", exc)
+
+    # 2. Overlay exact server-measured day buckets from legacy usage_stats.json where complete
+    if us_path.is_file():
+        try:
+            us_raw = json.loads(us_path.read_text(encoding="utf-8"))
+            us_by_day = (us_raw.get("by_day") or {}) if isinstance(us_raw, dict) else {}
+            us_by_model = (us_raw.get("by_model") or {}) if isinstance(us_raw, dict) else {}
+            for dk, us_b_raw in us_by_day.items():
+                if str(dk) >= cutoff_day or not isinstance(us_b_raw, dict):
+                    continue
+                us_b = sanitize_bucket(us_b_raw)
+                us_reqs = int(us_b.get("requests") or 0)
+                if us_reqs <= 0:
+                    continue
+                sim_grp = reconstructed_days.get(str(dk))
+                sim_reqs = int(((sim_grp or {}).get("summary") or {}).get("requests") or 0)
+                if sim_grp is None or us_reqs >= sim_reqs:
+                    # Preserve exact legacy day totals while keeping model/task split proportions
+                    new_grp = empty_group()
+                    new_grp["summary"] = dict(us_b)
+                    if sim_grp and sim_reqs > 0:
+                        # Preserve task split (e.g. /responses vs /chat/completions) scaled to exact us_b
+                        t_items = list((sim_grp.get("by_task") or {}).items())
+                        if len(t_items) == 1:
+                            new_grp["by_task"][t_items[0][0]] = dict(us_b)
+                        else:
+                            acc_t = empty_bucket()
+                            for idx, (tk, tb) in enumerate(t_items):
+                                if idx == len(t_items) - 1:
+                                    rem_tb = _subtract_bucket(us_b, acc_t)
+                                    new_grp["by_task"][tk] = rem_tb
+                                else:
+                                    ratio = int(tb.get("requests") or 0) / max(1, sim_reqs)
+                                    part = empty_bucket()
+                                    part["requests"] = int(tb.get("requests") or 0)
+                                    for k in ("prompt_tokens", "cached_tokens", "completion_tokens"):
+                                        part[k] = int(round(us_b[k] * ratio))
+                                    part["delta_prompt_tokens"] = max(0, part["prompt_tokens"] - part["cached_tokens"])
+                                    part["total_tokens"] = part["prompt_tokens"] + part["completion_tokens"]
+                                    part["equivalent_cost_usd"] = round(us_b["equivalent_cost_usd"] * ratio, 8)
+                                    part["cached_equivalent_cost_usd"] = round(us_b["cached_equivalent_cost_usd"] * ratio, 8)
+                                    new_grp["by_task"][tk] = part
+                                    merge_bucket_into(acc_t, part)
+                    else:
+                        new_grp["by_task"]["chat"] = dict(us_b)
+
+                    # Check if legacy flash/argon single probe belongs to this day
+                    flash_b = sanitize_bucket(us_by_model.get("gemini-3.8-flash")) if "gemini-3.8-flash" in us_by_model else None
+                    if str(dk) == "2026-11-16" and flash_b and int(flash_b.get("requests") or 0) == 1 and us_reqs > int(flash_b["requests"]):
+                        new_grp["by_model"]["gemini-3.8-flash"] = dict(flash_b)
+                        new_grp["by_model"]["gemini-4-carbon"] = _subtract_bucket(us_b, flash_b)
+                    else:
+                        new_grp["by_model"]["gemini-4-carbon"] = dict(us_b)
+                    reconcile_unattributed_host_tenant(new_grp)
+                    reconstructed_days[str(dk)] = new_grp
+        except Exception as exc:
+            logger.warning("合并旧版 usage_stats.json 失败: %s", exc)
+
+    sidecar_path = l_path.parent / "usage_backfill.json"
+    sidecar_path.parent.mkdir(parents=True, exist_ok=True)
+    sidecar_payload = {
+        "version": 1,
+        "generated_at": int(time.time()),
+        "cutoff_day": cutoff_day,
+        "days": {k: reconstructed_days[k] for k in sorted(reconstructed_days.keys())},
+    }
+    atomic_write_json(sidecar_path, sidecar_payload, mode=0o600, dir_mode=0o755)
+
+    ledger = UsageLedger(storage_path=l_path, price_overrides=price_overrides)
+    with ledger._lock:
+        ledger._merge_historical_days_unlocked(reconstructed_days)
+        ledger._save_to_disk_unlocked(skip_external_sync=True)
+    return {
+        "backfilled_days": sorted(reconstructed_days.keys()),
+        "sidecar_path": str(sidecar_path),
+        "ledger_path": str(l_path),
+        "snapshot_all_time": ledger.snapshot()["all_time"],
+    }
+
+
+if __name__ == "__main__":
+    import argparse
+
+    parser = argparse.ArgumentParser(description="UsageLedger maintenance & historical backfill")
+    parser.add_argument("--backfill", action="store_true", help="Backtest and merge pre-update usage history")
+    parser.add_argument(
+        "--ledger",
+        default=str(Path(__file__).resolve().parent / ".cache" / "usage_ledger.json"),
+        help="Path to usage_ledger.json",
+    )
+    args = parser.parse_args()
+    if args.backfill:
+        res = backfill_pre_update_usage(args.ledger)
+        print(json.dumps(res, ensure_ascii=False, indent=2))
